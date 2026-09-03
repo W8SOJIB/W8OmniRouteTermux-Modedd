@@ -3,7 +3,7 @@ set -e
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║     W8OmniRouteTermux-Moded — Quick Installer        ║"
+echo "║     W8OmniRouteTermux-Modedd — Quick Installer        ║"
 echo "║     Patched OmniRoute for Termux/Android             ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
@@ -209,7 +209,7 @@ omniroute --version 2>/dev/null || true
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║  ✅ W8OmniRouteTermux-Moded installed successfully!  ║"
+echo "║  ✅ W8OmniRouteTermux-Modedd installed successfully!  ║"
 echo "║                                                      ║"
 echo "║  Start the server:  omniroute serve                  ║"
 echo "║  Dashboard:         http://localhost:20128           ║"
