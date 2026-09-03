@@ -648,7 +648,7 @@ Auto-trigger by token threshold, flip on the adaptive dial, pin a named profile,
 
 - **Termux (Android) Quick Install:**
   ```bash
-  curl -fsSL "https://raw.githubusercontent.com/W8SOJIB/W8OmniRouteTermux-Moded/main/install.sh" | bash
+  curl -fsSL "https://raw.githubusercontent.com/W8SOJIB/W8OmniRouteTermux-Modedd/main/install.sh" | bash
   ```
 
 - **Global NPM Install (original/un-modded):**
