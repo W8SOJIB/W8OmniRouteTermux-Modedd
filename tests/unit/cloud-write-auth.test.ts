@@ -32,7 +32,7 @@ async function resetStorage() {
   process.env.API_KEY_SECRET = "cloud-write-auth-api-key-secret";
   core.resetDbInstance();
   localDb.resetApiKeyState();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
   await localDb.updateSettings({ requireLogin: true, password: "" });
 }
@@ -135,7 +135,7 @@ test.beforeEach(async () => {
 test.after(async () => {
   core.resetDbInstance();
   localDb.resetApiKeyState();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("PUT /api/cloud/credentials/update rejects valid API key without manage/admin scope and leaves credentials unchanged", async () => {

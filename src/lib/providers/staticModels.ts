@@ -8,6 +8,8 @@ import {
 } from "@omniroute/open-sse/config/audioRegistry.ts";
 import { ANTIGRAVITY_PUBLIC_MODELS } from "@omniroute/open-sse/config/antigravityModelAliases.ts";
 import { getStaticQoderModels } from "@omniroute/open-sse/services/qoderCli.ts";
+import { getSearchProvider } from "@omniroute/open-sse/config/searchRegistry.ts";
+import { BAILIAN_CODING_PLAN_MODELS } from "@omniroute/open-sse/config/providers/registry/bailian-coding-plan/index.ts";
 
 import { getModelsByProviderId } from "@/shared/constants/models";
 
@@ -34,6 +36,7 @@ const STATIC_MODEL_PROVIDERS: Record<string, () => Array<{ id: string; name: str
   antigravity: () => ANTIGRAVITY_PUBLIC_MODELS.map((model) => ({ ...model })),
   claude: () => [
     { id: "claude-fable-5", name: "Claude Fable 5" },
+    { id: "claude-opus-5", name: "Claude Opus 5" },
     { id: "claude-opus-4-8", name: "Claude Opus 4.8" },
     { id: "claude-opus-4-7", name: "Claude Opus 4.7" },
     { id: "claude-opus-4-6", name: "Claude Opus 4.6" },
@@ -50,21 +53,7 @@ const STATIC_MODEL_PROVIDERS: Record<string, () => Array<{ id: string; name: str
     { id: "sonar-reasoning-pro", name: "Sonar Reasoning Pro (Advanced CoT + Search)" },
     { id: "sonar-deep-research", name: "Sonar Deep Research (Expert Analysis)" },
   ],
-  "bailian-coding-plan": () => [
-    // Keep in lock-step with the registry entry
-    // (open-sse/config/providers/registry/bailian-coding-plan/index.ts);
-    // bailian-coding-plan-provider.test.ts asserts static↔registry parity.
-    { id: "qwen3.7-plus", name: "Qwen3.7 Plus(vision)" },
-    { id: "qwen3-coder-plus", name: "Qwen3 Coder Plus" },
-    { id: "qwen3-coder-next", name: "Qwen3 Coder Next" },
-    { id: "glm-4.7", name: "GLM 4.7" },
-    { id: "qwen3.6-plus", name: "Qwen3.6 Plus(vision)" },
-    { id: "qwen3.5-plus", name: "Qwen3.5 Plus(vision)" },
-    { id: "qwen3-max-2026-01-23", name: "Qwen3 Max" },
-    { id: "kimi-k2.5", name: "Kimi K2.5(vision)" },
-    { id: "glm-5", name: "GLM 5" },
-    { id: "MiniMax-M2.5", name: "MiniMax M2.5" },
-  ],
+  "bailian-coding-plan": () => BAILIAN_CODING_PLAN_MODELS.map(({ id, name }) => ({ id, name })),
   gitlab: () => [{ id: "gitlab-duo-code-suggestions", name: "GitLab Duo Code Suggestions" }],
   nlpcloud: () =>
     getModelsByProviderId("nlpcloud").map((model) => ({
@@ -78,6 +67,19 @@ const STATIC_MODEL_PROVIDERS: Record<string, () => Array<{ id: string; name: str
   jules: () => [
     // Google Labs async coding agent — single async session, no model selection.
     { id: "jules", name: "Jules (Google Labs coding agent)" },
+  ],
+  devin: () => [
+    // Cognition's Devin cloud-agent sessions don't expose per-request model
+    // selection like devin-cli's ACP models do — single non-selectable placeholder
+    // so the "Available Models" UI shows something instead of a hard failure (#6142).
+    { id: "devin", name: "Devin (Cognition cloud agent)" },
+  ],
+  "amazon-q": () => [
+    // Amazon Q Developer shares KiroExecutor + OAuth wiring with kiro but has no
+    // discovery config or registry catalog of its own — single non-selectable
+    // placeholder so the "Available Models" UI shows something instead of the
+    // hard "does not support models listing" failure (#7820).
+    { id: "amazon-q", name: "Amazon Q Developer" },
   ],
   "linkup-search": () => [
     // Linkup web search — the "model" is the search depth (docs.linkup.so #5571).
@@ -97,6 +99,15 @@ const STATIC_MODEL_PROVIDERS: Record<string, () => Array<{ id: string; name: str
     { id: "google_scholar", name: "Google Scholar" },
     { id: "duckduckgo", name: "DuckDuckGo" },
   ],
+  "v0-vercel-web": () => [
+    // v0-vercel-web web-cookie codegen provider — no upstream /v1/models endpoint,
+    // no registry `models` and no discovery config, so seed the current v0 lineup
+    // as a static catalog mirroring the v0-vercel API provider (shared.ts) so the
+    // model-import UI serves a list instead of the tail 400 (#10990).
+    { id: "v0-1.0-md", name: "V0 1.0 MD" },
+    { id: "v0-1.5-lg", name: "V0 1.5 LG" },
+    { id: "v0-1.5-md", name: "V0 1.5 MD" },
+  ],
   "venice-web": () => [
     // Venice.ai web-cookie provider — no upstream /v1/models endpoint, so seed the
     // current lineup as a static catalog (#6269). Venice rotates its catalog; keep
@@ -109,10 +120,47 @@ const STATIC_MODEL_PROVIDERS: Record<string, () => Array<{ id: string; name: str
   ],
 };
 
+const SEARCH_TYPE_LABELS: Record<string, string> = {
+  web: "Web Search",
+  news: "News Search",
+  x: "X Search",
+};
+
+function formatSearchTypeLabel(searchType: string): string {
+  return (
+    SEARCH_TYPE_LABELS[searchType] ??
+    `${searchType.charAt(0).toUpperCase()}${searchType.slice(1)} Search`
+  );
+}
+
+/**
+ * Search providers don't have "models" — a provider IS the model (see
+ * open-sse/config/searchRegistry.ts header doc). Any search provider without a
+ * dedicated literal entry above (custom depth/engine catalog, e.g.
+ * "linkup-search") still needs a non-empty static catalog so the "Available
+ * Models" / model-import UI shows a usable list instead of a 400 "does not
+ * support models listing" (#7529). Derive it generically from the registry's
+ * own `searchTypes` so any *future* search provider is covered automatically.
+ */
+function getSearchProviderFallbackCatalog(provider: string): LocalCatalogModel[] | undefined {
+  const searchProvider = getSearchProvider(provider);
+  if (!searchProvider || searchProvider.searchTypes.length === 0) return undefined;
+
+  return searchProvider.searchTypes.map((searchType) => ({
+    id: searchType,
+    name: formatSearchTypeLabel(searchType),
+  }));
+}
+
 export function getStaticModelsForProvider(provider: string): LocalCatalogModel[] | undefined {
   const staticModelsFn = STATIC_MODEL_PROVIDERS[provider];
   if (staticModelsFn) {
     return staticModelsFn();
+  }
+
+  const searchFallback = getSearchProviderFallbackCatalog(provider);
+  if (searchFallback) {
+    return searchFallback;
   }
 
   const specialtyModels: LocalCatalogModel[] = [];
@@ -146,24 +194,43 @@ export function getStaticModelsForProvider(provider: string): LocalCatalogModel[
     });
   }
 
+  // Image / video: only fold into the provider specialty list for *media-only*
+  // providers (no chat registry models). Chat+image providers (openai, lmarena,
+  // xai, …) keep image rows exclusively in IMAGE_PROVIDERS so the provider page
+  // chat catalog is not polluted with flux-* / dalle ids.
+  const chatRegistry = getModelsByProviderId(provider);
+  const hasChatRegistry = Array.isArray(chatRegistry) && chatRegistry.length > 0;
+
   const imageProvider = getImageProvider(provider);
-  if (imageProvider) {
-    appendModels(imageProvider.models);
+  if (imageProvider && !hasChatRegistry) {
+    appendModels(imageProvider.models, {
+      apiFormat: "images",
+      supportedEndpoints: ["images"],
+    });
   }
 
   const videoProvider = getVideoProvider(provider);
-  if (videoProvider) {
-    appendModels(videoProvider.models);
+  if (videoProvider && !hasChatRegistry) {
+    appendModels(videoProvider.models, {
+      apiFormat: "video",
+      supportedEndpoints: ["videos"],
+    });
   }
 
   const speechProvider = getSpeechProvider(provider);
   if (speechProvider) {
-    appendModels(speechProvider.models);
+    appendModels(speechProvider.models, {
+      apiFormat: "audio",
+      supportedEndpoints: ["audio-speech"],
+    });
   }
 
   const transcriptionProvider = getTranscriptionProvider(provider);
   if (transcriptionProvider) {
-    appendModels(transcriptionProvider.models);
+    appendModels(transcriptionProvider.models, {
+      apiFormat: "audio",
+      supportedEndpoints: ["audio-transcriptions"],
+    });
   }
 
   return specialtyModels.length > 0 ? specialtyModels : undefined;

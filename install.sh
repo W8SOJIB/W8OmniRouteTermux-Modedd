@@ -8,15 +8,25 @@ echo "║     Patched OmniRoute for Termux/Android             ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 
+# Target version: use argument $1 if provided, otherwise latest
+TARGET_VERSION="${1:-latest}"
+
+# Ensure ~/.cache exists for Next.js on Android/Termux
+mkdir -p "$HOME/.cache"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+
 # ── Step 1: Install requirements ──────────────────────────────────────────
 echo "[1/4] Checking Node.js, Git, and Esbuild..."
 pkg install -y nodejs git esbuild 2>/dev/null || true
 
 # ── Step 2: Install omniroute from npm (pre-built, fast) ──────────────────
-echo "[2/4] Installing OmniRoute from npm (pre-built, ~2 min)..."
+echo "[2/4] Installing OmniRoute ($TARGET_VERSION) from npm..."
 export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 export NODE_OPTIONS="--max-old-space-size=512"
-node --max-old-space-size=512 "$(npm root -g)/npm/bin/npm-cli.js" install -g omniroute@3.8.46 --global-style --ignore-scripts --no-audit --no-fund --omit=dev --prefer-offline
+
+node --max-old-space-size=512 "$(npm root -g)/npm/bin/npm-cli.js" install -g "omniroute@$TARGET_VERSION" \
+  --global-style --ignore-scripts --no-audit --no-fund --omit=dev --prefer-offline 2>/dev/null || \
+npm install -g "omniroute@$TARGET_VERSION" --global-style --ignore-scripts --no-audit --no-fund --omit=dev
 
 export OMNIROUTE_DIR
 OMNIROUTE_DIR="$(npm root -g)/omniroute"
@@ -29,7 +39,7 @@ OMNIROUTE_DIR="$OMNIROUTE_DIR" node << 'PATCHEOF'
 const fs   = require('fs');
 const path = require('path');
 
-const BASE   = process.env.OMNIROUTE_DIR;
+const BASE = process.env.OMNIROUTE_DIR;
 if (!BASE || !fs.existsSync(BASE)) {
   console.error('ERROR: Cannot find omniroute at: ' + BASE);
   process.exit(1);
@@ -38,12 +48,9 @@ if (!BASE || !fs.existsSync(BASE)) {
 const CHUNKS = path.join(BASE, 'dist', '.build', 'next', 'server', 'chunks');
 const SSR    = path.join(CHUNKS, 'ssr');
 
-let stats = { playwright: 0, bind: 0, instrumentation: 0, driverFactory: 0, skipped: 0 };
+let stats = { playwright: 0, bind: 0, instrumentation: 0, serve: 0, skipped: 0 };
 
-/* ─────────────────────────────────────────────────────────────────────────
-   PATCH A: Playwright → skip on Android
-   Target: files named *playwright*.js
-   ───────────────────────────────────────────────────────────────────────── */
+/* ── PATCH A: Playwright → skip on Android ─────────────────────────────── */
 function patchPlaywright(fp) {
   let c = fs.readFileSync(fp, 'utf8');
   if (c.includes("process.platform==='android'")) { stats.skipped++; return; }
@@ -57,15 +64,9 @@ function patchPlaywright(fp) {
   );
   fs.writeFileSync(fp, c);
   stats.playwright++;
-  console.log('  ✔ playwright: ' + path.basename(fp));
 }
 
-/* ─────────────────────────────────────────────────────────────────────────
-   PATCH B: sql.js named-parameter binding (TARGETED)
-   Only applies to the sqljsAdapter wrapper file (src_lib_*.js or similar)
-   that contains sql.js Statement lifecycle methods (prepare + free).
-   NEVER applies to node_modules_sql_js_dist_sql-wasm_*.js files (WASM code).
-   ───────────────────────────────────────────────────────────────────────── */
+/* ── PATCH B: sql.js named-parameter binding & no-op close ─────────────── */
 const BIND_HELPER = `
 function __w8bindParams(p){
   function sanitize(v) {
@@ -99,43 +100,30 @@ function __w8bindParams(p){
 `;
 
 function patchBind(fp, fileName) {
-  // NEVER patch sql.js WASM dist files — they use .bind() for WASM internals
   if (fileName.includes('sql-wasm') || fileName.startsWith('node_modules_sql_js')) return;
 
   let c = fs.readFileSync(fp, 'utf8');
   if (c.includes('__w8bindParams')) { stats.skipped++; return; }
 
-  // Only target files that are the sqljsAdapter wrapper:
-  // Must contain sql.js-specific adapter patterns AND be a source file
   const isSqljsAdapter = (
     (c.includes('sqljsAdapter') || c.includes('SqlJsAdapter') || c.includes('sql.js'))
-    && c.includes('.prepare(')   // sql.js Statement creation
-    && c.includes('.free()')     // sql.js Statement disposal
+    && c.includes('.prepare(')
+    && c.includes('.free()')
     && !fileName.startsWith('node_modules')
   );
   if (!isSqljsAdapter) return;
 
   c = BIND_HELPER + c;
-  // Only wrap .bind() calls that are immediately followed by a closing paren (named param binding)
   c = c.replace(/\.bind\((\w+)\)/g, '.bind(__w8bindParams($1))');
   
-  // W8Mod: prevent the adapter from being closed (no-op close)
-  const closeRegex = /close\s*\(\)\s*\{if\s*\(clearInterval\([\w$]+\),[\w$]+&&clearTimeout\([\w$]+\),[\w$]+\)try\{[\w$]+\(\)\}catch(?:\([\w$]+\))?\{\}try\{[\w$]+\.close\(\)\}catch(?:\([\w$]+\))?\{\}[\w$]+=\!1\}/g;
+  const closeRegex = /close\s*\(\)\s*\{\s*if\s*\(\s*clearInterval\([\w$]+\)\s*,\s*[\w$]+\s*&&\s*clearTimeout\([\w$]+\)\s*,\s*[\w$]+\s*\)\s*try\s*\{\s*[\w$]+\(\)\s*\}\s*catch(?:\([\w$]+\))?\s*\{\s*\}\s*try\s*\{\s*[\w$]+\.close\(\)\s*\}\s*catch(?:\([\w$]+\))?\s*\{\s*\}\s*[\w$]+\s*=\s*\!1\s*\}/g;
   c = c.replace(closeRegex, 'close(){}');
 
   fs.writeFileSync(fp, c);
   stats.bind++;
-  console.log('  ✔ sqljsAdapter bind & noop-close: ' + fileName);
 }
 
-function patchDriverFactory(fp) {
-  // W8Mod: Obsolete, handled inside patchBind on the sqljsAdapter chunk directly
-}
-
-/* ─────────────────────────────────────────────────────────────────────────
-   PATCH D: instrumentation-node → DB pre-init at registerNodejs start
-   Target: chunk containing registerNodejs + ensureDbInitialized
-   ───────────────────────────────────────────────────────────────────────── */
+/* ── PATCH C: instrumentation-node → DB pre-init at registerNodejs start ─ */
 function patchInstrumentation(fp) {
   let c = fs.readFileSync(fp, 'utf8');
   if (c.includes('__w8dbPreInit')) { stats.skipped++; return; }
@@ -146,7 +134,6 @@ function patchInstrumentation(fp) {
   );
   fs.writeFileSync(fp, c);
   stats.instrumentation++;
-  console.log('  ✔ instrumentation: ' + path.basename(fp));
 }
 
 /* ── Walk chunk directories ──────────────────────────────────────────── */
@@ -158,16 +145,14 @@ function walkDir(dir) {
     try {
       if (file.includes('playwright')) patchPlaywright(fp);
       patchBind(fp, file);
-      patchDriverFactory(fp);
       patchInstrumentation(fp);
-    } catch (e) { /* skip unreadable */ }
+    } catch (e) {}
   }
 }
 
 walkDir(CHUNKS);
 walkDir(SSR);
 
-// Also patch the main instrumentation.js entrypoint directly
 const INSTR_JS = path.join(BASE, 'dist', '.build', 'next', 'server', 'instrumentation.js');
 if (fs.existsSync(INSTR_JS)) {
   let c = fs.readFileSync(INSTR_JS, 'utf8');
@@ -175,34 +160,44 @@ if (fs.existsSync(INSTR_JS)) {
     c = "if(process.platform==='android'){try{Object.defineProperty(process,\'platform\',{value:\'linux\',configurable:true});}catch(e){}}\n" + c;
     fs.writeFileSync(INSTR_JS, c);
     stats.instrumentation++;
-    console.log('  ✔ patched main instrumentation entrypoint');
   }
 }
 
-// Patch serve.mjs to bypass better-sqlite3 compatibility check on Android
 const SERVE_MJS = path.join(BASE, 'bin', 'cli', 'commands', 'serve.mjs');
 if (fs.existsSync(SERVE_MJS)) {
   let c = fs.readFileSync(SERVE_MJS, 'utf8');
-  if (!c.includes("platform() !== \"android\"")) {
+  if (!c.includes('platform() !== "android"')) {
     c = c.replace(
       /if\s*\((\s*existsSync\(sqliteBinary\)\s*&&\s*!isNativeBinaryCompatible\(sqliteBinary\)\s*)\)/,
-      "if (platform() !== \"android\" && $1)"
+      'if (platform() !== "android" && $1)'
+    );
+    c = c.replace(
+      /if\s*\(\s*!process\.versions\.bun\s*&&\s*existsSync\(sqliteBinary\)\s*&&\s*!isNativeBinaryCompatible\(sqliteBinary\)\s*\)/,
+      'if (platform() !== "android" && !process.versions.bun && existsSync(sqliteBinary) && !isNativeBinaryCompatible(sqliteBinary))'
     );
     fs.writeFileSync(SERVE_MJS, c);
-    console.log('  ✔ patched serve.mjs to bypass better-sqlite3 check on Android');
+    stats.serve++;
   }
 }
 
-console.log('');
 console.log('  Patch summary:');
 console.log('    playwright fixes   : ' + stats.playwright);
 console.log('    sqljsAdapter bind  : ' + stats.bind);
-console.log('    driverFactory noop : ' + stats.driverFactory);
 console.log('    instrumentation    : ' + stats.instrumentation);
+console.log('    serve bypass       : ' + stats.serve);
 console.log('    already patched    : ' + stats.skipped);
 PATCHEOF
 
-# ── Step 4: Done ──────────────────────────────────────────────────────────
+# ── Step 4: Install omniroute-update helper in Termux ─────────────────────
+if [ -n "$PREFIX" ] && [ -d "$PREFIX/bin" ]; then
+  cat > "$PREFIX/bin/omniroute-update" << 'EOF'
+#!/bin/bash
+curl -fsSL "https://raw.githubusercontent.com/W8SOJIB/W8OmniRouteTermux-Modedd/main/update.sh" | bash -s -- "$@"
+EOF
+  chmod +x "$PREFIX/bin/omniroute-update" 2>/dev/null || true
+  echo "      Installed update tool: omniroute-update"
+fi
+
 echo ""
 echo "[4/4] Verifying install..."
 omniroute --version 2>/dev/null || true
@@ -211,7 +206,9 @@ echo ""
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║  ✅ W8OmniRouteTermux-Modedd installed successfully!  ║"
 echo "║                                                      ║"
-echo "║  Start the server:  omniroute serve                  ║"
+echo "║  Start server:      omniroute serve                  ║"
 echo "║  Dashboard:         http://localhost:20128           ║"
+echo "║  Update anytime:    omniroute-update                 ║"
+echo "║  Auto-update:       Also available in Web Dashboard  ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""

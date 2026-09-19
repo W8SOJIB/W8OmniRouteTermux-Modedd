@@ -35,8 +35,8 @@ export const orcarouterProvider: RegistryEntry = {
       maxOutputTokens: 128000,
     },
     {
-      id: "google/gemini-3.5-flash",
-      name: "Gemini 3.5 Flash",
+      id: "google/gemini-3.6-flash",
+      name: "Gemini 3.6 Flash",
       toolCalling: true,
       supportsReasoning: true,
       supportsVision: true,

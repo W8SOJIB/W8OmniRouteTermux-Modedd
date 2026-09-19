@@ -15,7 +15,7 @@ function makeReq(body: unknown) {
   });
 }
 test.beforeEach(() => core.resetDbInstance());
-test.after(() => { core.resetDbInstance(); rmSync(TEST_DATA_DIR, { recursive: true, force: true }); });
+test.after(() => { core.resetDbInstance(); rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
 
 test("fidelityGate flag is accepted (200) and preview still works", async () => {
   const res = await route.POST(makeReq({

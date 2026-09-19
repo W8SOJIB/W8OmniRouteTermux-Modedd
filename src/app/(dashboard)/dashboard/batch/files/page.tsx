@@ -6,8 +6,8 @@ import FilesListTab from "../FilesListTab";
 import FilesConceptCard from "../components/FilesConceptCard";
 import UploadFileModal from "../components/UploadFileModal";
 import { mapFileApiToRecord, mapBatchApiToRecord } from "../batch-utils";
-import { FileRecord } from "@/lib/db/files";
-import { BatchRecord } from "@/lib/db/batches";
+import type { FileRecord } from "@/lib/db/files";
+import type { BatchRecord } from "@/lib/db/batches";
 
 export default function BatchFilesPage() {
   const t = useTranslations("common");

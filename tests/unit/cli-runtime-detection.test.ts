@@ -9,7 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const { getCliRuntimeStatus, CLI_TOOL_IDS } =
+const { getCliRuntimeStatus, getKnownToolPaths, normalizeCliToolId, CLI_TOOL_IDS } =
   await import("../../src/shared/services/cliRuntime.ts");
 
 // ─── Helpers ──────────────────────────────────────────────────
@@ -21,6 +21,29 @@ function createTempDir() {
   }
   return fs.mkdtempSync(path.join(testRoot, "cli-test-"));
 }
+
+describe("Claude Code Windows known paths", () => {
+  it("should include the WinGet Anthropic.ClaudeCode install path", () => {
+    const localAppData = process.env.LOCALAPPDATA;
+    const expected = localAppData
+      ? path.join(
+          localAppData,
+          "Microsoft",
+          "WinGet",
+          "Packages",
+          "Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe",
+          "claude.exe"
+        )
+      : null;
+
+    if (process.platform !== "win32" || !expected) return;
+
+    assert.ok(
+      getKnownToolPaths("claude").includes(expected),
+      "Claude Code installed by WinGet should be discoverable without CLI_CLAUDE_BIN"
+    );
+  });
+});
 
 function createFile(dir, name, content) {
   const filePath = path.join(dir, name);
@@ -58,6 +81,16 @@ describe("CLI_TOOL_IDS", () => {
   });
 });
 
+describe("CLI tool id compatibility aliases", () => {
+  it("normalizes legacy binary names without creating duplicate ids", () => {
+    assert.equal(normalizeCliToolId("kilocode"), "kilo");
+    assert.equal(normalizeCliToolId("kilo-code"), "kilo");
+    assert.equal(normalizeCliToolId("openai-codex"), "codex");
+    assert.equal(normalizeCliToolId("cc"), "claude");
+    assert.equal(normalizeCliToolId("unknown-tool"), "unknown-tool");
+  });
+});
+
 // ─── Size Threshold (30 bytes) ────────────────────────────────
 
 describe("Size threshold — checkKnownPath", () => {
@@ -68,7 +101,7 @@ describe("Size threshold — checkKnownPath", () => {
   });
 
   after(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it("should detect files >= 30 bytes via env var", async () => {
@@ -131,7 +164,7 @@ describe("Healthcheck — checkRunnable", () => {
   });
 
   after(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it("should report runnable=true for a script that outputs version", async () => {
@@ -147,10 +180,32 @@ describe("Healthcheck — checkRunnable", () => {
       assert.ok(result.installed, `Expected installed=true, got reason=${result.reason}`);
       if (result.runnable) {
         assert.ok(result.reason === null, `Expected no reason, got ${result.reason}`);
+        assert.equal(result.version, "1.0.0");
       }
     } finally {
       if (prev !== undefined) process.env.CLI_CLINE_BIN = prev;
       else delete process.env.CLI_CLINE_BIN;
+    }
+  });
+
+  it("should detect Claude through an explicit read-only executable path", async () => {
+    const previousOverride = process.env.CLI_CLAUDE_BIN;
+    const script =
+      process.platform === "win32"
+        ? createFile(tmpDir, "claude.cmd", "@echo off\necho 2.1.211 (Claude Code)\n")
+        : createFile(tmpDir, "claude", "#!/bin/sh\necho '2.1.211 (Claude Code)'\n");
+    if (process.platform !== "win32") fs.chmodSync(script, 0o555);
+    process.env.CLI_CLAUDE_BIN = script;
+
+    try {
+      const result = await getCliRuntimeStatus("claude");
+      assert.equal(result.installed, true);
+      assert.equal(result.runnable, true);
+      assert.equal(result.commandPath, script);
+      assert.equal(result.version, "2.1.211 (Claude Code)");
+    } finally {
+      if (previousOverride === undefined) delete process.env.CLI_CLAUDE_BIN;
+      else process.env.CLI_CLAUDE_BIN = previousOverride;
     }
   });
 
@@ -185,13 +240,35 @@ describe("Unknown tool", () => {
   });
 });
 
-// ─── continue tool (requiresBinary: false) ────────────────────
+// ─── Continue CLI (`cn`) ──────────────────────────────────────
 
-describe("continue tool — no binary required", () => {
-  it("should report installed=true without checking binary", async () => {
-    const result = await getCliRuntimeStatus("continue");
-    assert.equal(result.installed, true);
-    assert.equal(result.reason, "not_required");
+describe("Continue CLI detection", () => {
+  it("should not report Continue as installed when the cn binary is absent", async () => {
+    const previousPath = process.env.PATH;
+    const previousOverride = process.env.CLI_CONTINUE_BIN;
+    process.env.PATH = "";
+    delete process.env.CLI_CONTINUE_BIN;
+
+    try {
+      const result = await getCliRuntimeStatus("continue");
+      assert.equal(result.installed, false);
+      assert.equal(result.runnable, false);
+      assert.equal(result.reason, "not_found");
+      assert.equal(result.requiresBinary, true);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousOverride === undefined) delete process.env.CLI_CONTINUE_BIN;
+      else process.env.CLI_CONTINUE_BIN = previousOverride;
+    }
+  });
+
+  it("should enumerate cn in Continue's known installation paths", () => {
+    const knownPaths = getKnownToolPaths("continue");
+    assert.ok(
+      knownPaths.some((knownPath) => /^cn(?:\.cmd)?$/i.test(path.basename(knownPath))),
+      "Continue detection should search for the cn executable"
+    );
   });
 });
 
@@ -254,5 +331,39 @@ describe("resolveOpencodeConfigPath — cross-platform", () => {
       "C:\\Users\\dev"
     );
     assert.equal(result, path.join("D:\\xdg", "opencode", "opencode.json"));
+  });
+
+  it("selects an existing opencode.jsonc instead of inventing opencode.json (#10227)", () => {
+    const xdgRoot = createTempDir();
+    const configDir = path.join(xdgRoot, "opencode");
+    const jsoncPath = path.join(configDir, "opencode.jsonc");
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(jsoncPath, "{\n  // native OpenCode config\n}\n");
+
+    const result = resolveOpencodeConfigPathFn(
+      process.platform,
+      { XDG_CONFIG_HOME: xdgRoot },
+      os.homedir()
+    );
+
+    assert.equal(result, jsoncPath);
+  });
+
+  it("prefers opencode.jsonc when both native filenames exist (#10227)", () => {
+    const xdgRoot = createTempDir();
+    const configDir = path.join(xdgRoot, "opencode");
+    const jsonPath = path.join(configDir, "opencode.json");
+    const jsoncPath = path.join(configDir, "opencode.jsonc");
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(jsonPath, "{}\n");
+    fs.writeFileSync(jsoncPath, "{}\n");
+
+    const result = resolveOpencodeConfigPathFn(
+      process.platform,
+      { XDG_CONFIG_HOME: xdgRoot },
+      os.homedir()
+    );
+
+    assert.equal(result, jsoncPath);
   });
 });

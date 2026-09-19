@@ -49,6 +49,59 @@ export function envHasExplicitHeapFlag(env) {
   return String(sourceEnv?.NODE_OPTIONS || "").includes(MAX_OLD_SPACE_FLAG);
 }
 
+/** Last `--max-old-space-size=` value in NODE_OPTIONS, or null if absent. */
+export function parseNodeOptionsHeapMb(nodeOptions) {
+  const matches = [...String(nodeOptions || "").matchAll(/--max-old-space-size=(\d+)/g)];
+  if (matches.length === 0) return null;
+  const parsed = Number.parseInt(matches[matches.length - 1][1], 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * True when OMNIROUTE_MEMORY_MB is an explicit in-range integer (not the
+ * unset/invalid fallback). Docker images set this; Compose may also set
+ * NODE_OPTIONS — #10353 needs to know both knobs were intentionally present.
+ */
+export function envHasExplicitOmnirouteMemoryMb(env) {
+  const sourceEnv = arguments.length === 0 ? process.env : env;
+  const parsed = Number.parseInt(String(sourceEnv?.OMNIROUTE_MEMORY_MB ?? ""), 10);
+  return Number.isFinite(parsed) && parsed >= 64 && parsed <= 16384;
+}
+
+/**
+ * Docker `run-standalone.mjs` appends `--max-old-space-size` from
+ * OMNIROUTE_MEMORY_MB. V8 last-flag semantics mean that appended value wins
+ * over an earlier NODE_OPTIONS heap. Warn once when both are set and disagree
+ * so env dumps stop looking like NODE_OPTIONS is in effect (#10353).
+ *
+ * @returns {boolean} true when a warn was emitted
+ */
+export function warnConflictingHeapLimits(env, omnirouteMb, log = console.warn) {
+  const nodeMb = parseNodeOptionsHeapMb(env?.NODE_OPTIONS);
+  if (nodeMb == null || !envHasExplicitOmnirouteMemoryMb(env)) return false;
+  if (nodeMb === omnirouteMb) return false;
+  log(
+    `[omniroute] heap limit conflict: OMNIROUTE_MEMORY_MB=${omnirouteMb} disagrees with NODE_OPTIONS --max-old-space-size=${nodeMb}. ` +
+      `run-standalone.mjs / Docker appends OMNIROUTE_MEMORY_MB last, so the effective V8 heap is ${omnirouteMb} MB. ` +
+      `Set only OMNIROUTE_MEMORY_MB (recommended) or make both values match.`
+  );
+  return true;
+}
+
+/**
+ * NODE_OPTIONS string for Docker / run-standalone.mjs.
+ * Explicit OMNIROUTE_MEMORY_MB always appends (wins). Otherwise keep an
+ * existing NODE_OPTIONS heap flag (#5238). Otherwise append the fallback.
+ */
+export function buildStandaloneNodeOptions(env = process.env, omnirouteMb) {
+  const existing = String(env?.NODE_OPTIONS || "").trim();
+  if (envHasExplicitOmnirouteMemoryMb(env)) {
+    return `${existing} ${MAX_OLD_SPACE_FLAG}=${omnirouteMb}`.trim();
+  }
+  if (existing.includes(MAX_OLD_SPACE_FLAG)) return existing;
+  return `${existing} ${MAX_OLD_SPACE_FLAG}=${omnirouteMb}`.trim();
+}
+
 /**
  * Assemble the NODE_OPTIONS string for the spawned server, preserving any flags
  * the user already exported. #5238: `omniroute serve` used to UNCONDITIONALLY
@@ -87,6 +140,20 @@ export function buildNodeHeapArgs(env = process.env, memoryLimit) {
 }
 
 /**
+ * Build the complete argument list for spawning the Node.js server runtime.
+ * Prefer IPv4 DNS results before starting the application so undici does not
+ * stall on hosts whose IPv6 route silently drops outbound connections.
+ *
+ * @param {NodeJS.ProcessEnv | Record<string, string | undefined>} [env]
+ * @param {number} memoryLimit — calibrated V8 heap ceiling (MB)
+ * @param {string} serverPath — standalone server entrypoint
+ * @returns {string[]}
+ */
+export function buildNodeRuntimeArgs(env = process.env, memoryLimit, serverPath) {
+  return ["--dns-result-order=ipv4first", ...buildNodeHeapArgs(env, memoryLimit), serverPath];
+}
+
+/**
  * @param {NodeJS.ProcessEnv | Record<string, string | undefined>} [fromEnv]
  *        Defaults to process.env. Pass bootstrap `merged` so project `.env` PORT applies before spawn.
  */
@@ -107,6 +174,7 @@ export function withRuntimePortEnv(env, runtimePorts) {
     PORT: String(dashboardPort),
     DASHBOARD_PORT: String(dashboardPort),
     API_PORT: String(apiPort),
+    HOSTNAME: env.OMNIROUTE_HOSTNAME || "0.0.0.0",
   };
 }
 

@@ -228,7 +228,7 @@ export async function handleComboChat(body, comboId): Promise<ChatResult> {
 }
 ```
 
-Supports **17 routing strategies** (see `src/shared/constants/routingStrategies.ts`):
+Supports **19 routing strategies** (see `src/shared/constants/routingStrategies.ts`):
 
 | Strategy            | Behavior                                                                  |
 | ------------------- | ------------------------------------------------------------------------- |
@@ -252,7 +252,7 @@ Supports **17 routing strategies** (see `src/shared/constants/routingStrategies.
 
 ### base.ts (1170 LOC)
 
-The **abstract executor** that all 67 executors extend. It contains:
+The **abstract executor** that all 101 executors extend. It contains:
 
 - `buildUrl()` — default URL construction (subclasses override for custom)
 - `buildHeaders()` — default headers (auth, content-type)
@@ -368,7 +368,7 @@ const result = await executor.execute({
 });
 ````
 
-The factory is generated from `config/providerRegistry.ts` which lists all 212+ providers and their executor class.
+Resolution goes through the `ExecutorRegistry` (`executors/registry.ts`): every specialized executor is declared in the built-in table of `executors/index.ts` and registered via `registerExecutor(alias, instance)` at module load; `getExecutor()` consults the registry and falls back to a memoized `DefaultExecutor` for any provider without a specialized entry. The full alias → executor mapping is characterized by the golden test `tests/unit/executor-map-golden.test.ts`.
 
 ---
 
@@ -408,7 +408,7 @@ Common translations:
 
 - **30+ tools** (provider management, combos, memory, cache, compression, 1proxy, skills)
 - **3 transports**: stdio, SSE, Streamable HTTP
-- **13 scopes** for fine-grained authorization
+- **31 scopes** for fine-grained authorization
 
 ### Tool Registration
 
@@ -487,7 +487,7 @@ This handles:
 
 | File                          | Purpose                           |
 | ----------------------------- | --------------------------------- |
-| `providerRegistry.ts`         | 212+ provider definitions         |
+| `providerRegistry.ts`         | 338 provider definitions          |
 | `providerModels.ts`           | Model aliases, format mapping     |
 | `constants.ts`                | Timeouts, limits, status codes    |
 | `defaultThinkingSignature.ts` | Default Claude thinking signature |

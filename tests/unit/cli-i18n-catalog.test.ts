@@ -10,6 +10,8 @@ const ROOT = join(__dirname, "..", "..");
 const require = createRequire(import.meta.url);
 const en = require("../../bin/cli/locales/en.json");
 const ptBR = require("../../bin/cli/locales/pt-BR.json");
+const zhCN = require("../../bin/cli/locales/zh-CN.json");
+const zhTW = require("../../bin/cli/locales/zh-TW.json");
 
 function flattenKeys(obj: Record<string, unknown>, prefix = ""): Set<string> {
   const keys = new Set<string>();
@@ -71,6 +73,14 @@ test("pt-BR.json tem todas as seções top-level de en.json", () => {
   const missing = enTop.filter((k) => !ptTop.has(k));
   assert.deepEqual(missing, [], `Seções top-level faltando em pt-BR.json: ${missing.join(", ")}`);
 });
+
+for (const [name, cat] of [["zh-CN", zhCN], ["zh-TW", zhTW]] as const) {
+  test(name + ".json tem paridade total de chaves com en.json", () => {
+    const catKeys = flattenKeys(cat as Record<string, unknown>);
+    const missing = [...enKeys].filter((k) => !catKeys.has(k));
+    assert.deepEqual(missing, [], name + ".json chaves faltando: " + missing.join(", "));
+  });
+}
 
 test("i18n.mjs detecta locale por OMNIROUTE_LANG", async () => {
   const { resetForTests, detectLocale } = await import("../../bin/cli/i18n.mjs");

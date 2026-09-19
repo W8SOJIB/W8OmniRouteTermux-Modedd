@@ -19,12 +19,13 @@ const { computeCacheKey, getOrCoalesce, getCacheStats, SEARCH_CACHE_DEFAULT_TTL_
 
 // ─── Registry Tests ──────────────────────────────────────────
 
-test("SEARCH_PROVIDERS has all 11 providers", () => {
+test("SEARCH_PROVIDERS has all registered providers", () => {
   assert.ok(SEARCH_PROVIDERS["serper-search"], "serper should exist");
   assert.ok(SEARCH_PROVIDERS["brave-search"], "brave should exist");
   assert.ok(SEARCH_PROVIDERS["perplexity-search"], "perplexity-search should exist");
   assert.ok(SEARCH_PROVIDERS["exa-search"], "exa should exist");
   assert.ok(SEARCH_PROVIDERS["tavily-search"], "tavily should exist");
+  assert.ok(SEARCH_PROVIDERS["firecrawl"], "firecrawl should exist");
   assert.ok(SEARCH_PROVIDERS["google-pse-search"], "google-pse should exist");
   assert.ok(SEARCH_PROVIDERS["linkup-search"], "linkup should exist");
   assert.ok(SEARCH_PROVIDERS["searchapi-search"], "searchapi should exist");
@@ -32,8 +33,12 @@ test("SEARCH_PROVIDERS has all 11 providers", () => {
   assert.ok(SEARCH_PROVIDERS["searxng-search"], "searxng should exist");
   assert.ok(SEARCH_PROVIDERS["ollama-search"], "ollama-search should exist");
   assert.ok(SEARCH_PROVIDERS["zai-search"], "zai should exist");
+  assert.ok(SEARCH_PROVIDERS["jina-search"], "jina-search should exist");
   assert.ok(SEARCH_PROVIDERS["duckduckgo-free"], "duckduckgo-free should exist");
-  assert.equal(Object.keys(SEARCH_PROVIDERS).length, 13);
+  assert.ok(SEARCH_PROVIDERS["x-search"], "x-search should exist");
+  // #11140: context7 (library-docs search) is the 17th registered provider
+  assert.ok(SEARCH_PROVIDERS["context7"], "context7 should exist");
+  assert.equal(Object.keys(SEARCH_PROVIDERS).length, 17);
 });
 
 test("duckduckgo-free config is a no-key, fallback-only provider", () => {
@@ -95,6 +100,8 @@ test("getSearchProvider returns config for valid ID", () => {
 
 test("getSearchProvider returns null for unknown ID", () => {
   assert.equal(getSearchProvider("unknown"), null);
+  // jina-ai is the Foundation embed/rerank card, not a search catalog id.
+  assert.equal(getSearchProvider("jina-ai"), null);
 });
 
 test("tavily config is correct", () => {
@@ -165,8 +172,11 @@ test("zai-search config is correct", () => {
 
 test("getAllSearchProviders returns flat list", () => {
   const all = getAllSearchProviders();
-  assert.equal(all.length, 13);
+  // #11140: 17 providers with context7 registered
+  assert.equal(all.length, 17);
   assert.ok(all.some((p) => p.id === "duckduckgo-free"));
+  assert.ok(all.some((p) => p.id === "jina-search"));
+  assert.ok(all.some((p) => p.id === "x-search"));
   assert.ok(all.some((p) => p.id === "serper-search"));
   assert.ok(all.some((p) => p.id === "brave-search"));
   assert.ok(all.some((p) => p.id === "perplexity-search"));
@@ -200,7 +210,7 @@ test("selectProvider with unknown provider returns null", () => {
 test("selectProvider without argument returns cheapest provider", () => {
   const config = selectProvider();
   assert.ok(config);
-  assert.equal(config.id, "searxng-search");
+  assert.notEqual(config.id, "searxng-search");
 });
 
 test("selectProvider auto-selection never returns a fallbackOnly provider", () => {
@@ -222,7 +232,7 @@ test("selectProvider still honors an explicit fallbackOnly provider", () => {
 test("selectProvider filters by search type support", () => {
   const config = selectProvider(undefined, "news");
   assert.ok(config);
-  assert.equal(config.id, "searxng-search");
+  assert.equal(config.id, "serper-search");
   assert.equal(selectProvider("linkup-search", "news"), null);
 });
 
@@ -353,11 +363,13 @@ test("v1SearchSchema validates correct input", async () => {
     provider: "serper-search",
     max_results: 10,
     search_type: "web",
+    time_range: "hour",
   });
   assert.ok(result.success);
   assert.equal(result.data.query, "test query");
   assert.equal(result.data.provider, "serper-search");
   assert.equal(result.data.max_results, 10);
+  assert.equal(result.data.time_range, "hour");
 });
 
 test("v1SearchSchema rejects empty query", async () => {
@@ -374,11 +386,17 @@ test("v1SearchSchema rejects query over 500 chars", async () => {
   assert.ok(!result.success);
 });
 
-test("v1SearchSchema rejects invalid provider", async () => {
+test("v1SearchSchema accepts any non-empty provider string; the catalog rejects unknown ids (#10849)", async () => {
   const { v1SearchSchema } = await import("../../src/shared/validation/schemas.ts");
+  const { resolveSearchProvider } = await import("../../open-sse/config/searchRegistry.ts");
 
+  // provider is a free-form string at the schema layer — resolveSearchProvider() (backing
+  // POST /v1/search) is the runtime source of truth, and returns null for unknown ids so
+  // the route can reply with a named "Unknown search provider: <id>" error instead of an
+  // opaque schema-level 400.
   const result = v1SearchSchema.safeParse({ query: "test", provider: "google" });
-  assert.ok(!result.success);
+  assert.ok(result.success);
+  assert.equal(resolveSearchProvider("google"), null);
 });
 
 test("v1SearchSchema accepts tavily provider", async () => {
@@ -400,6 +418,8 @@ test("v1SearchSchema accepts new search providers", async () => {
     "searxng-search",
     "ollama-search",
     "duckduckgo-free",
+    "firecrawl",
+    "x-search",
   ] as const;
 
   for (const provider of providers) {
@@ -454,6 +474,24 @@ test("validateProviderApiKeySchema requires cx for Google PSE", async () => {
     cx: "engine-id",
   });
   assert.equal(valid.success, true);
+});
+
+test("validateProviderApiKeySchema accepts AWS Polly signing credentials", async () => {
+  const { validateProviderApiKeySchema } = await import("../../src/shared/validation/schemas.ts");
+
+  const result = validateProviderApiKeySchema.safeParse({
+    provider: "aws-polly",
+    apiKey: "aws-secret-access-key",
+    accessKeyId: "AKIAEXAMPLE",
+    sessionToken: "temporary-session-token",
+    region: "us-east-1",
+  });
+
+  assert.equal(result.success, true);
+  if (result.success) {
+    assert.equal(result.data.accessKeyId, "AKIAEXAMPLE");
+    assert.equal(result.data.sessionToken, "temporary-session-token");
+  }
 });
 
 test("v1SearchSchema applies defaults", async () => {

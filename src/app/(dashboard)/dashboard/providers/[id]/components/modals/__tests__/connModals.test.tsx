@@ -31,6 +31,22 @@ function renderModal(node: React.ReactElement) {
   return container;
 }
 
+function setInputValue(input: HTMLInputElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  act(() => {
+    setter?.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+function setTextareaValue(textarea: HTMLTextAreaElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+  act(() => {
+    setter?.call(textarea, value);
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
 describe("conn-modals (Phase 1c extraction)", () => {
   beforeEach(() => {
     (
@@ -104,6 +120,205 @@ describe("conn-modals (Phase 1c extraction)", () => {
     );
     expect(presetInput?.placeholder).toBe("@preset/slug");
     expect(presetInput?.closest("#add-api-key-advanced-settings")).toBeNull();
+  });
+
+  it("AddApiKeyModal asks for the Qwen Cloud region before showing the API key form", () => {
+    const c = renderModal(
+      <AddApiKeyModal
+        isOpen={true}
+        provider="qwen-cloud"
+        providerName="Qwen Cloud"
+        isCompatible={false}
+        onSave={vi.fn().mockResolvedValue(undefined)}
+        onClose={vi.fn()}
+      />
+    );
+
+    expect(c.textContent).toContain("Which region are you using?");
+    expect(
+      Array.from(c.querySelectorAll<HTMLButtonElement>("[data-region]")).map(
+        (button) => button.dataset.region
+      )
+    ).toEqual(["china-beijing", "global-sg"]);
+    expect(c.querySelector('input[type="password"]')).toBeNull();
+    expect(c.querySelector("select")).toBeNull();
+  });
+
+  it("AddApiKeyModal persists the region selected before the Qwen Cloud API key form", async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve({
+          ok: true,
+          json: async () => ({ valid: true }),
+          text: async () => "",
+        } as Response)
+      )
+    );
+    const c = renderModal(
+      <AddApiKeyModal
+        isOpen={true}
+        provider="qwen-cloud"
+        providerName="Qwen Cloud"
+        isCompatible={false}
+        onSave={onSave}
+        onClose={vi.fn()}
+      />
+    );
+
+    const beijingButton = c.querySelector<HTMLButtonElement>('[data-region="china-beijing"]');
+    expect(beijingButton).not.toBeNull();
+    act(() => beijingButton!.click());
+
+    expect(c.textContent).not.toContain("Which region are you using?");
+    expect(c.querySelector("select")).toBeNull();
+    const apiKeyInput = c.querySelector<HTMLInputElement>('input[type="password"]');
+    expect(apiKeyInput).not.toBeNull();
+    setInputValue(apiKeyInput!, "sk-sp-test");
+
+    const saveButton = Array.from(c.querySelectorAll("button")).find(
+      (button) => button.textContent === "providers.save"
+    );
+    expect(saveButton).toBeDefined();
+    await act(async () => {
+      saveButton!.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(onSave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        apiKey: "sk-sp-test",
+        providerSpecificData: { region: "china-beijing" },
+      })
+    );
+  });
+
+  it("AddApiKeyModal applies Global to bulk Qwen Cloud additions", async () => {
+    const fetchMock = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: async () => ({ success: 1, failed: 0, total: 1, errors: [] }),
+        text: async () => "",
+      } as Response)
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const c = renderModal(
+      <AddApiKeyModal
+        isOpen={true}
+        provider="qwen-cloud"
+        providerName="Qwen Cloud"
+        isCompatible={false}
+        onSave={vi.fn().mockResolvedValue(undefined)}
+        onClose={vi.fn()}
+      />
+    );
+
+    const globalButton = c.querySelector<HTMLButtonElement>('[data-region="global-sg"]');
+    act(() => globalButton!.click());
+
+    const bulkTab = Array.from(c.querySelectorAll("button")).find(
+      (button) => button.textContent === "providers.bulkTabBulkAdd"
+    );
+    act(() => bulkTab!.click());
+    const bulkInput = c.querySelector<HTMLTextAreaElement>("textarea");
+    setTextareaValue(bulkInput!, "main|sk-global-test");
+    const submitButton = Array.from(c.querySelectorAll("button")).find(
+      (button) => button.textContent === "providers.bulkAddAllKeys"
+    );
+    await act(async () => {
+      submitButton!.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/providers/bulk",
+      expect.objectContaining({
+        body: expect.stringContaining('"region":"global-sg"'),
+      })
+    );
+  });
+
+  it("AddApiKeyModal remaps Kimi Code bulk API-key additions to the admitted provider id", async () => {
+    const fetchMock = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: async () => ({ success: 1, failed: 0, total: 1, errors: [] }),
+        text: async () => "",
+      } as Response)
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const c = renderModal(
+      <AddApiKeyModal
+        isOpen={true}
+        provider="kimi-coding"
+        providerName="Kimi Code"
+        isCompatible={false}
+        onSave={vi.fn().mockResolvedValue(undefined)}
+        onClose={vi.fn()}
+      />
+    );
+
+    const bulkTab = Array.from(c.querySelectorAll("button")).find(
+      (button) => button.textContent === "providers.bulkTabBulkAdd"
+    );
+    act(() => bulkTab!.click());
+    const bulkInput = c.querySelector<HTMLTextAreaElement>("textarea");
+    setTextareaValue(bulkInput!, "main|sk-kimi-test");
+    const submitButton = Array.from(c.querySelectorAll("button")).find(
+      (button) => button.textContent === "providers.bulkAddAllKeys"
+    );
+    await act(async () => {
+      submitButton!.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/providers/bulk",
+      expect.objectContaining({
+        body: expect.stringContaining('"provider":"kimi-coding-apikey"'),
+      })
+    );
+  });
+
+  it("AddApiKeyModal does not infer a regional provider selection", () => {
+    const c = renderModal(
+      <AddApiKeyModal
+        isOpen={true}
+        provider="alibaba"
+        providerName="Alibaba Cloud Model Studio"
+        isCompatible={false}
+        onSave={vi.fn().mockResolvedValue(undefined)}
+        onClose={vi.fn()}
+      />
+    );
+
+    expect(Array.from(c.querySelectorAll("h3")).map((heading) => heading.textContent)).toEqual([
+      "Beijing",
+      "Global",
+    ]);
+  });
+
+  it("AddApiKeyModal labels the Token Plan global endpoint as Singapore", () => {
+    const c = renderModal(
+      <AddApiKeyModal
+        isOpen={true}
+        provider="bailian-coding-plan"
+        providerName="Alibaba Token Plan"
+        isCompatible={false}
+        onSave={vi.fn().mockResolvedValue(undefined)}
+        onClose={vi.fn()}
+      />
+    );
+
+    expect(Array.from(c.querySelectorAll("h3")).map((heading) => heading.textContent)).toEqual([
+      "Beijing",
+      "Singapore",
+    ]);
+    expect(c.textContent).not.toContain("Global");
   });
 
   it("AddApiKeyModal returns null when provider is falsy", () => {
@@ -200,6 +415,29 @@ describe("conn-modals (Phase 1c extraction)", () => {
     expect(presetInput?.closest("#edit-connection-advanced-settings")).toBeNull();
   });
 
+  it("EditConnectionModal keeps legacy alibaba-cn connections on the Beijing default", () => {
+    const c = renderModal(
+      <EditConnectionModal
+        isOpen={true}
+        connection={{
+          id: "conn-alibaba-cn",
+          name: "Alibaba China",
+          provider: "alibaba-cn",
+          authType: "apikey",
+          priority: 1,
+        }}
+        providerId="alibaba"
+        onSave={vi.fn().mockResolvedValue(undefined)}
+        onClose={vi.fn()}
+      />
+    );
+
+    const regionSelect = Array.from(c.querySelectorAll("select")).find((select) =>
+      Array.from(select.options).some((option) => option.value === "china-beijing")
+    );
+    expect(regionSelect?.value).toBe("china-beijing");
+  });
+
   it("EditConnectionModal renders without ReferenceError for oauth connection", () => {
     const onSave = vi.fn().mockResolvedValue(undefined);
     const connection = {
@@ -222,5 +460,110 @@ describe("conn-modals (Phase 1c extraction)", () => {
         />
       )
     ).not.toThrow();
+  });
+
+  it("AddApiKeyModal allows saving a compatible connection without a Default Model", async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    const c = renderModal(
+      <AddApiKeyModal
+        isOpen={true}
+        provider="openai-compatible-test"
+        providerName="Test Compatible"
+        isCompatible={true}
+        onSave={onSave}
+        onClose={vi.fn()}
+      />
+    );
+    const saveButton = Array.from(c.querySelectorAll("button")).find(
+      (button) => button.textContent === "providers.save"
+    );
+    expect(saveButton).toBeDefined();
+    expect((saveButton as HTMLButtonElement).disabled).toBe(false);
+    await act(async () => {
+      saveButton!.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const payload = onSave.mock.calls[0][0] as Record<string, unknown>;
+    expect(payload).toHaveProperty("defaultModel");
+    expect(payload.defaultModel).toBeUndefined();
+  });
+
+  it("EditConnectionModal renders and prefills the Default Model for a compatible connection", () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    const connection = {
+      id: "conn-compat",
+      name: "Test Compat",
+      provider: "openai-compatible-test",
+      authType: "apikey",
+      priority: 1,
+      defaultModel: "gpt-4o-mini",
+    };
+    const c = renderModal(
+      <EditConnectionModal
+        isOpen={true}
+        connection={connection}
+        providerId="openai-compatible-test"
+        onSave={onSave}
+        onClose={vi.fn()}
+      />
+    );
+    const input = c.querySelector<HTMLInputElement>('[data-testid="compat-default-model-input"]');
+    expect(input).not.toBeNull();
+    expect(input?.value).toBe("gpt-4o-mini");
+  });
+
+  it("EditConnectionModal does not render Default Model for non-compatible connections", () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    const connection = {
+      id: "conn-openai",
+      name: "OpenAI",
+      provider: "openai",
+      authType: "apikey",
+      priority: 1,
+      defaultModel: "gpt-4o-mini",
+    };
+    const c = renderModal(
+      <EditConnectionModal
+        isOpen={true}
+        connection={connection}
+        providerId="openai"
+        onSave={onSave}
+        onClose={vi.fn()}
+      />
+    );
+    expect(c.querySelector('[data-testid="compat-default-model-input"]')).toBeNull();
+  });
+
+  it("EditConnectionModal sends defaultModel null when the field is cleared", async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    const connection = {
+      id: "conn-compat",
+      name: "Test Compat",
+      provider: "openai-compatible-test",
+      authType: "apikey",
+      priority: 1,
+      defaultModel: "gpt-4o-mini",
+    };
+    const c = renderModal(
+      <EditConnectionModal
+        isOpen={true}
+        connection={connection}
+        providerId="openai-compatible-test"
+        onSave={onSave}
+        onClose={vi.fn()}
+      />
+    );
+    const input = c.querySelector<HTMLInputElement>('[data-testid="compat-default-model-input"]');
+    setInputValue(input!, "");
+    const saveButton = Array.from(c.querySelectorAll("button")).find(
+      (button) => button.textContent === "providers.save"
+    );
+    await act(async () => {
+      saveButton!.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ defaultModel: null }));
   });
 });

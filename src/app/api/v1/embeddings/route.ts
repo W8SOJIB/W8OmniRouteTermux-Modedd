@@ -6,7 +6,6 @@ import { isRequireApiKeyEnabled } from "@/shared/utils/featureFlags";
 import { v1EmbeddingsSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
-import { getApiKeyMetadata } from "@/lib/localDb";
 import { createEmbeddingResponse, type EmbeddingHandlerOptions } from "@/lib/embeddings/service";
 import { extractApiKey, isValidApiKey } from "@/sse/services/auth";
 import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
@@ -55,12 +54,13 @@ async function postHandler(request, context) {
   }
   const body = validation.data;
 
-  // Auth check
+  // Auth check — when REQUIRE_API_KEY=false, ignore presented invalid keys
+  // so anonymous access works the same as all other client APIs (#7785).
   const apiKeyRaw = extractApiKey(request);
   if (isRequireApiKeyEnabled() && !apiKeyRaw) {
     return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Authentication required");
   }
-  if (apiKeyRaw && !(await isValidApiKey(apiKeyRaw))) {
+  if (isRequireApiKeyEnabled() && apiKeyRaw && !(await isValidApiKey(apiKeyRaw))) {
     return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
   }
 
@@ -69,7 +69,7 @@ async function postHandler(request, context) {
   if (policy.rejection) return policy.rejection;
 
   // Extract API key info for logging
-  const apiKeyMeta = apiKeyRaw ? await getApiKeyMetadata(apiKeyRaw) : null;
+  const apiKeyMeta = policy.apiKeyInfo;
 
   // Build client raw request for logging
   const clientRawRequest = {

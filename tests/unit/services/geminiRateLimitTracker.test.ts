@@ -39,17 +39,12 @@ test("getModelRpd returns 0 for empty string", () => {
 
 test("getModelRpd matches gemma-4-31b-it via suffix fallback", () => {
   // The JSON has "gemma-4-31b-it", and callers may pass "gemma-4-31b-it"
-  assert.equal(getModelRpd("gemma-4-31b-it"), 1500);
+  assert.equal(getModelRpd("gemma-4-31b-it"), 14400);
 });
 
 test("getModelRpd strips gemma- prefix correctly for gemma models", () => {
   // stripModelPrefix("gemini/gemma-4-31b-it") → "gemma-4-31b-it"
-  assert.equal(getModelRpd("gemini/gemma-4-31b-it"), 1500);
-});
-
-test("getModelRpd handles image-generation models (no RPM value, -1)", () => {
-  // RPD is 25 for imagen models; RPM is -1 in the JSON
-  assert.equal(getModelRpd("imagen-4-generate"), 25);
+  assert.equal(getModelRpd("gemini/gemma-4-31b-it"), 14400);
 });
 
 test("getModelRpd handles models with unlimited RPD (-1)", () => {
@@ -154,15 +149,15 @@ test("isRpdExhausted works with gemini/ prefix for the model", () => {
 
 // ── Integration: Gemma 4 RPM scenario ────────────────────────────────────────
 
-test("Gemma 4: 15 RPM hits never trigger quota_exhausted (RPD=1500)", () => {
-  // Gemma 4 has RPD=1500, so 15 RPM hits should not trigger RPD exhaustion
+test("Gemma 4: 15 RPM hits never trigger quota_exhausted (RPD=14400)", () => {
+  // Gemma 4 has RPD=14400, so 15 RPM hits should not trigger RPD exhaustion
   for (let i = 0; i < 15; i++) incrementRequestCount("gemini/gemma-4-31b-it");
   assert.equal(isRpdExhausted("gemini/gemma-4-31b-it"), false);
   assert.equal(getDailyRequestCount("gemini/gemma-4-31b-it"), 15);
 });
 
-test("Gemma 4: RPD exhaustion requires 1500 requests", () => {
-  for (let i = 0; i < 1499; i++) incrementRequestCount("gemini/gemma-4-31b-it");
+test("Gemma 4: RPD exhaustion requires 14400 requests", () => {
+  for (let i = 0; i < 14399; i++) incrementRequestCount("gemini/gemma-4-31b-it");
   assert.equal(isRpdExhausted("gemini/gemma-4-31b-it"), false);
 
   incrementRequestCount("gemini/gemma-4-31b-it");
@@ -207,8 +202,8 @@ test("getModelRpm returns 0 for empty string", () => {
   assert.equal(getModelRpm(""), 0);
 });
 
-test("getModelRpm returns 0 for models with RPM=-1 (imagen)", () => {
-  assert.equal(getModelRpm("imagen-4-generate"), 0);
+test("getModelRpm returns 0 for models with RPM=-1", () => {
+  assert.equal(getModelRpm("gemini-3.5-live-translate"), 0);
 });
 
 test("getModelRpm returns 0 for null input", () => {
@@ -288,9 +283,9 @@ test("isRpmExhausted returns false for unknown model", () => {
   assert.equal(isRpmExhausted("gemini/unknown-model"), false);
 });
 
-test("isRpmExhausted returns false for model with RPM=-1 (imagen)", () => {
-  incrementRequestCount("imagen-4-generate");
-  assert.equal(isRpmExhausted("imagen-4-generate"), false);
+test("isRpmExhausted returns false for model with RPM=-1", () => {
+  incrementRequestCount("gemini-3.5-live-translate");
+  assert.equal(isRpmExhausted("gemini-3.5-live-translate"), false);
 });
 
 test("isRpmExhausted works with gemini/ prefix", () => {
@@ -301,11 +296,11 @@ test("isRpmExhausted works with gemini/ prefix", () => {
 // ── Integration: RPM + RPD work independently ─────────────────────────────────
 
 test("RPM and RPD limits are tracked independently", () => {
-  // Gemma 4: RPM=15, RPD=1500
+  // Gemini 3.1 Flash Lite: RPM=15, RPD=500
   // After 15 requests, RPM is exhausted but RPD is not
-  for (let i = 0; i < 15; i++) incrementRequestCount("gemini/gemma-4-31b-it");
-  assert.equal(isRpmExhausted("gemini/gemma-4-31b-it"), true);
-  assert.equal(isRpdExhausted("gemini/gemma-4-31b-it"), false);
+  for (let i = 0; i < 15; i++) incrementRequestCount("gemini/gemini-3.1-flash-lite");
+  assert.equal(isRpmExhausted("gemini/gemini-3.1-flash-lite"), true);
+  assert.equal(isRpdExhausted("gemini/gemini-3.1-flash-lite"), false);
 });
 
 test("Gemini 2.5 Flash: RPM=5 always hits before RPD=20", () => {

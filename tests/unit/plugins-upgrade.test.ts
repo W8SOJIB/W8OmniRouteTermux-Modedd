@@ -69,7 +69,7 @@ function writePluginWithConfig(version: string, name = "upgrade-config-test") {
 const activeDirs: string[] = [];
 function cleanupDirs() {
   for (const dir of activeDirs) {
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
   }
   activeDirs.length = 0;
 }
@@ -84,7 +84,7 @@ test.beforeEach(() => {
 test.after(() => {
   core.resetDbInstance();
   cleanupDirs();
-  try { fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true }); } catch {}
+  try { fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
 });
 
 // ── Tests ──

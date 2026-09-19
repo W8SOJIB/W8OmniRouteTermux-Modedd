@@ -88,7 +88,7 @@ test.afterEach(() => {
   clearInflight();
   resetAllCircuitBreakers();
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 });
 
@@ -171,8 +171,9 @@ test("llama-cpp provider: alias matching works via model catalog prefix", async 
   assert.equal(json.choices[0].message.content, "42");
 });
 
-test("llama-cpp provider: returns 404 when no connection exists", async () => {
+test("llama-cpp provider: returns 401 when no connection exists", async () => {
   // Upstream port decolua/9router#336: 400 → 404 so combo routing can fall through.
+  // #10797: single-model (non-combo) no-credentials now remaps 404 → 401.
   const response = await handleChat(
     buildRequest({
       body: {
@@ -183,7 +184,7 @@ test("llama-cpp provider: returns 404 when no connection exists", async () => {
     })
   );
 
-  assert.equal(response.status, 404);
+  assert.equal(response.status, 401);
   const json = (await response.json()) as any;
   assert.match(json.error.message, /No active credentials for provider/);
 });

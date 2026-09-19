@@ -423,6 +423,32 @@ test("sanitizeResponsesApiResponse preserves native Responses payloads and usage
   assert.equal((sanitized as any).usage.output_tokens_details.reasoning_tokens, 3);
 });
 
+test("sanitizeResponsesApiResponse preserves native continuation reasoning state", () => {
+  const plaintext = {
+    id: "rs_plaintext",
+    type: "reasoning",
+    status: "completed",
+    summary: [],
+    content: [{ type: "reasoning_text", text: "Inspect before calling the tool." }],
+  };
+  const opaque = {
+    id: "rs_opaque",
+    type: "reasoning",
+    summary: [{ type: "summary_text", text: "Inspected the tool inputs." }],
+    encrypted_content: "provider-generated-state",
+    signature: "provider-signature",
+    format: "provider-format",
+  };
+  const sanitized = sanitizeResponsesApiResponse({
+    id: "resp_reasoning_state",
+    object: "response",
+    status: "completed",
+    output: [plaintext, opaque],
+  }) as Record<string, unknown>;
+
+  assert.deepEqual(sanitized.output, [plaintext, opaque]);
+});
+
 test("sanitizeStreamingChunk keeps only safe chunk fields and preserves readable reasoning aliases", () => {
   const sanitized = sanitizeStreamingChunk({
     id: "chunk_1",

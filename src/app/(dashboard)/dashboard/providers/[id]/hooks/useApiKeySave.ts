@@ -12,6 +12,7 @@
 
 import { useCallback } from "react";
 import type React from "react";
+import { providerUsesCuratedModelsOnly } from "@/lib/providers/modelListingCapability";
 import type { ProviderMessageTranslator } from "../providerPageHelpers";
 import type { ImportProgress } from "./useModelImportHandlers";
 
@@ -23,9 +24,26 @@ type UseApiKeySaveParams = {
   setShowImportModal: (open: boolean) => void;
   setShowAddApiKeyModal: (open: boolean) => void;
   setSiliconFlowInitialBaseUrl: (url: string | undefined) => void;
-  notify: { success: (msg: string) => void; error: (msg: string) => void; info?: (msg: string) => void };
+  notify: {
+    success: (msg: string) => void;
+    error: (msg: string) => void;
+    info?: (msg: string) => void;
+  };
   t: ProviderMessageTranslator;
 };
+
+// Issue #10096: the unified Kimi Code dashboard card shares one page/providerId
+// ("kimi-coding") between OAuth and API-key auth. "kimi-coding" is an
+// OAuth-primary managed id and is NOT an admitted API-key/dual-auth connection
+// id (see isManagedProviderConnectionId in src/lib/providers/catalog.ts), so
+// posting it here 400s with "Invalid provider". The dedicated managed
+// API-key id "kimi-coding-apikey" IS admitted — remap only the POST payload
+// so the saved connection lands under the correct managed id. The OAuth flow
+// (handleOAuthSuccess in ProviderDetailPageClient.tsx) does not go through
+// this hook, so it keeps posting "kimi-coding" unchanged.
+export function resolveApiKeySaveProviderId(providerId: string): string {
+  return providerId === "kimi-coding" ? "kimi-coding-apikey" : providerId;
+}
 
 export function useApiKeySave({
   providerId,
@@ -43,7 +61,10 @@ export function useApiKeySave({
         const res = await fetch("/api/providers", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ provider: providerId, ...formData }),
+          body: JSON.stringify({
+            provider: resolveApiKeySaveProviderId(providerId),
+            ...formData,
+          }),
         });
         if (res.ok) {
           const connectionData = await res.json();
@@ -52,9 +73,9 @@ export function useApiKeySave({
           setShowAddApiKeyModal(false);
           setSiliconFlowInitialBaseUrl(undefined);
 
-          // Universal: sync models from the provider endpoint on every new connection
-          // (was previously Gemini-only). Do NOT re-introduce a providerId guard here.
-          if (newConnection?.id) {
+          // Most providers sync their live catalog after connection creation. Curated-only
+          // providers intentionally use the registry list and must not show an import flow.
+          if (newConnection?.id && !providerUsesCuratedModelsOnly(providerId)) {
             setShowImportModal(true);
             setImportProgress({
               current: 0,
@@ -136,11 +157,17 @@ export function useApiKeySave({
           }
           return null;
         }
+        // Even if the server returned an error, the connection may have been
+        // persisted (e.g. post-commit housekeeping failed after the DB write).
+        // Refresh the list so the UI picks it up on next render.
+        void fetchConnections();
         const data = await res.json().catch(() => ({}));
         const errorMsg = data.error?.message || data.error || t("failedSaveConnection");
         return errorMsg;
       } catch (error) {
         console.log("Error saving connection:", error);
+        // The connection may still have been persisted despite the network error.
+        void fetchConnections();
         return t("failedSaveConnectionRetry");
       }
     },

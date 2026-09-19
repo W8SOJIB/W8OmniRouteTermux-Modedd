@@ -161,9 +161,25 @@ async function checkCertInstalledLinux(certPath: string): Promise<boolean> {
   }
 }
 
-async function checkCertInstalledWindows(_certPath: string): Promise<boolean> {
+/**
+ * Windows `certutil -store <storename> <certId>` accepts a serial number, a
+ * SHA-1 thumbprint, or a substring of the subject/friendly name as `certId`.
+ * Older code passed the literal legacy hostname `daily-cloudcode-pa.googleapis.com`
+ * here — it only "worked" because that happens to be the CA's own commonName
+ * today (`generate.ts` derives it from `ANTIGRAVITY_TARGET.hosts[0]`), a
+ * coincidence with no shared symbol coupling the two (#7275). Deriving the
+ * thumbprint from the actual `certPath` file — the same identity
+ * {@link checkCertInstalledMac} already keys off via {@link getCertFingerprint}
+ * — makes the Windows store lookup match the real generated CA regardless of
+ * any future rename/reorder in `generate.ts`.
+ */
+export function certutilThumbprint(certPath: string): string {
+  return getCertFingerprint(certPath).replace(/:/g, "");
+}
+
+async function checkCertInstalledWindows(certPath: string): Promise<boolean> {
   try {
-    await execFileText("certutil", ["-store", "Root", "daily-cloudcode-pa.googleapis.com"]);
+    await execFileText("certutil", ["-store", "Root", certutilThumbprint(certPath)]);
     return true;
   } catch {
     return false;
@@ -180,6 +196,15 @@ export async function installCert(sudoPassword: string, certPath: string): Promi
 
   const isInstalled = await checkCertInstalled(certPath);
   if (isInstalled) {
+    // #9442: the fingerprint matched, but a restrictive umask at install time
+    // may have left the system cert as 0600 — unreadable by non-root TLS
+    // clients (curl, reqwest, uv, Python requests). Repair the mode before
+    // the early return so re-running install fixes a previously wrong-mode
+    // cert instead of silently skipping it.
+    if (!IS_WIN && !IS_MAC) {
+      const config = getLinuxCertConfig();
+      await ensureSystemCertMode(`${config.dir}/${LINUX_CERT_NAME}`, sudoPassword);
+    }
     console.log("✅ Certificate already installed");
     return;
   }
@@ -298,6 +323,24 @@ export async function installCertResult(
   }
 }
 
+/**
+ * Install the persisted MITM root CA cert (`cert/rootCa.ts`) into the OS
+ * trust store. Named wrapper over {@link installCertResult} for call-site
+ * clarity — the underlying platform installers
+ * (`installCertLinux`/`installCertMac`/`installCertWindows`) are already
+ * cert-path-agnostic and keep writing to the same `omniroute-mitm.crt`
+ * trust-store slot the old single-leaf install used, so the CA cert simply
+ * supersedes the old leaf under that slot; no new slot, no dual-trust
+ * cleanup needed. Distinct from TPROXY's own `omniroute-tproxy-ca.crt` slot
+ * (`src/mitm/tproxy/caTrust.ts`), which this feature does not touch. #6684
+ */
+export async function installCaCert(
+  sudoPassword: string,
+  caCertPath: string
+): Promise<CertInstallResult> {
+  return installCertResult(sudoPassword, caCertPath);
+}
+
 async function installCertMac(sudoPassword: string, certPath: string): Promise<void> {
   try {
     await execFileWithPassword(
@@ -332,6 +375,10 @@ async function installCertLinux(sudoPassword: string, certPath: string): Promise
 
     await execFileWithPassword("sudo", ["-S", "mkdir", "-p", config.dir], sudoPassword);
     await execFileWithPassword("sudo", ["-S", "cp", certPath, destFile], sudoPassword);
+    // #9442: `cp` inherits the process umask. A restrictive umask (e.g. PM2
+    // UMask=0077) creates the system cert as 0600 root:root, unreadable by
+    // non-root TLS clients. Force the public cert to 0644 (world-readable).
+    await execFileWithPassword("sudo", ["-S", "chmod", "0644", destFile], sudoPassword);
     await execFileWithPassword("sudo", ["-S", config.cmd], sudoPassword);
 
     await updateNssDatabases(certPath, "add");
@@ -341,6 +388,29 @@ async function installCertLinux(sudoPassword: string, certPath: string): Promise
       ? "User canceled authorization"
       : "Certificate install failed";
     throw new Error(msg);
+  }
+}
+
+/**
+ * #9442 — ensure the system trust-store cert is world-readable (mode 0644).
+ *
+ * `installCertLinux()` now sets the mode explicitly after `cp`, but a cert
+ * installed by an older build (before the chmod was added) may still be 0600
+ * from a restrictive umask. `checkCertInstalledLinux()` only compares
+ * fingerprints, so {@link installCert}'s already-installed branch calls this
+ * helper to repair the mode on re-run. Best-effort: a stat/chmod failure
+ * (e.g. dest removed between the fingerprint check and here) is swallowed —
+ * the caller still reports "already installed" and a fresh install will run
+ * next time the fingerprint no longer matches.
+ */
+export async function ensureSystemCertMode(destFile: string, sudoPassword: string): Promise<void> {
+  try {
+    const mode = fs.statSync(destFile).mode & 0o777;
+    if (mode !== 0o644) {
+      await execFileWithPassword("sudo", ["-S", "chmod", "0644", destFile], sudoPassword);
+    }
+  } catch {
+    // best-effort: if stat/chmod fails, the mode repair is skipped
   }
 }
 
@@ -381,7 +451,7 @@ export async function uninstallCert(sudoPassword: string, certPath: string): Pro
   }
 
   if (IS_WIN) {
-    await uninstallCertWindows();
+    await uninstallCertWindows(certPath);
   } else if (IS_MAC) {
     await uninstallCertMac(sudoPassword, certPath);
   } else {
@@ -431,10 +501,20 @@ async function uninstallCertLinux(sudoPassword: string, certPath: string): Promi
   }
 }
 
-async function uninstallCertWindows(): Promise<void> {
-  await runElevatedPowerShell(`
-    $proc = Start-Process certutil -ArgumentList @('-delstore','Root','daily-cloudcode-pa.googleapis.com') -Verb RunAs -Wait -PassThru;
+/**
+ * Pure builder for the elevated `certutil -delstore` script, extracted so the
+ * regression test can assert the argv it embeds without spawning a real
+ * `powershell`/UAC prompt (mirrors {@link buildCertManualGuide} /
+ * {@link buildElevatedScriptWrapper}, already tested the same way).
+ */
+export function buildWindowsDelstoreScript(thumbprint: string): string {
+  return `
+    $proc = Start-Process certutil -ArgumentList @('-delstore','Root',${quotePowerShell(thumbprint)}) -Verb RunAs -Wait -PassThru;
     if ($proc.ExitCode -ne 0) { throw "certutil exited with code $($proc.ExitCode)" }
-  `);
+  `;
+}
+
+async function uninstallCertWindows(certPath: string): Promise<void> {
+  await runElevatedPowerShell(buildWindowsDelstoreScript(certutilThumbprint(certPath)));
   console.log("✅ Uninstalled certificate from Windows Root store");
 }

@@ -5,6 +5,15 @@ const { claudeToGeminiRequest } =
   await import("../../open-sse/translator/request/claude-to-gemini.ts");
 const { DEFAULT_SAFETY_SETTINGS } =
   await import("../../open-sse/translator/helpers/geminiHelper.ts");
+const {
+  buildGeminiThoughtSignatureKey,
+  storeGeminiThoughtSignature,
+  clearGeminiThoughtSignatures,
+} = await import("../../open-sse/services/geminiThoughtSignatureStore.ts");
+
+test.beforeEach(() => {
+  clearGeminiThoughtSignatures();
+});
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -34,6 +43,10 @@ function getFunctionResponse(part: unknown) {
 }
 
 test("Claude -> Gemini maps system, thinking, tool use, tool result and tools", () => {
+  // Native functionCall requires a cached thoughtSignature (#8979 / #3688).
+  const ns = "conn-claude-gemini-map";
+  storeGeminiThoughtSignature(buildGeminiThoughtSignatureKey(ns, "tu_1"), "SIG_MAP_WEATHER");
+
   const result = claudeToGeminiRequest(
     "gemini-2.5-pro",
     {
@@ -72,7 +85,8 @@ test("Claude -> Gemini maps system, thinking, tool use, tool result and tools", 
       top_p: 0.8,
       thinking: { type: "enabled", budget_tokens: 512 },
     },
-    false
+    false,
+    { _signatureNamespace: ns }
   );
 
   assert.deepEqual(result.systemInstruction, {
@@ -82,6 +96,7 @@ test("Claude -> Gemini maps system, thinking, tool use, tool result and tools", 
   assert.equal(result.contents[0].role, "model");
   assert.deepEqual(result.contents[0].parts[0] as any, { thought: true, text: "need tool" });
   assert.deepEqual(result.contents[0].parts[1] as any, {
+    thoughtSignature: "SIG_MAP_WEATHER",
     functionCall: { id: "tu_1", name: "weather", args: { city: "Tokyo" } },
   });
   assert.deepEqual(result.contents[1].parts[0] as any, {
@@ -162,7 +177,10 @@ test("Claude -> Gemini converts text and base64 images to Gemini parts", () => {
   ]);
 });
 
-test("Claude -> Gemini injects a fallback thoughtSignature on tool-call batches without thinking", () => {
+test("Claude -> Gemini omits unsigned functionCall instead of injecting a fake thoughtSignature (#8979)", () => {
+  // After #1410 / #8979: never inject a fake signature. Without a cached
+  // thoughtSignature, native functionCall parts are omitted (context mode)
+  // so Gemini 3+ does not return HTTP 400.
   const result = claudeToGeminiRequest(
     "gemini-2.5-flash",
     {
@@ -176,15 +194,30 @@ test("Claude -> Gemini injects a fallback thoughtSignature on tool-call batches 
     false
   );
 
-  assert.equal(result.contents.length, 1);
-  assert.equal(result.contents[0].role, "model");
-  assert.equal((result.contents[0].parts[0] as any).functionCall.name, "read_file");
-  assert.equal((result.contents[0].parts[0] as any).thoughtSignature, undefined);
+  assert.equal(result.contents.length, 0);
+  assert.equal(
+    JSON.stringify(result).includes('"functionCall"'),
+    false,
+    "signature-less tool_use must not become a native functionCall"
+  );
+  assert.equal(
+    JSON.stringify(result).includes('"thoughtSignature"'),
+    false,
+    "the translator must not synthesize a fake thought signature"
+  );
+  assert.equal(
+    JSON.stringify(result).includes("read_file"),
+    false,
+    "the omitted unsigned call must not leak its tool payload elsewhere"
+  );
 });
 
 test("Claude -> Gemini sanitizes long tool names and exposes a restore map", () => {
   const longToolName =
     "mcp__filesystem__read_multiple_files_with_validation_and_metadata_bundle_v2";
+  const ns = "conn-claude-gemini-long";
+  storeGeminiThoughtSignature(buildGeminiThoughtSignatureKey(ns, "tu_long_1"), "SIG_LONG_TOOL");
+
   const result = claudeToGeminiRequest(
     "gemini-2.5-pro",
     {
@@ -214,7 +247,8 @@ test("Claude -> Gemini sanitizes long tool names and exposes a restore map", () 
         },
       ],
     },
-    false
+    false,
+    { _signatureNamespace: ns }
   );
 
   const sanitizedToolName = (result as any).tools[0].functionDeclarations[0].name as string;
@@ -239,12 +273,18 @@ test("Claude -> Gemini handles empty bodies without producing invalid content", 
 });
 
 test("Claude -> Gemini maps output_config.effort to thinkingConfig when thinking absent", () => {
+  // NOTE: max/xhigh previously asserted 131072, but that locked in the OLD
+  // no-cap behavior — gemini-2.5-pro is unregistered, so the raw budget sailed
+  // to the upstream and 400'd ("thinking_budget must be in the range"). The
+  // gemini-substring fallback in capThinkingBudget now clamps unregistered
+  // Gemini models to the pro-tier ceiling 32768, which is what the upstream
+  // actually accepts. low/medium/high are below the cap and stay unchanged.
   const cases: Array<{ effort: string; expected: number }> = [
     { effort: "low", expected: 1024 },
     { effort: "medium", expected: 10240 },
     { effort: "high", expected: 32768 },
-    { effort: "max", expected: 131072 },
-    { effort: "xhigh", expected: 131072 },
+    { effort: "max", expected: 32768 },
+    { effort: "xhigh", expected: 32768 },
   ];
 
   for (const { effort, expected } of cases) {
@@ -310,4 +350,131 @@ test("Claude -> Gemini skips thinkingConfig for output_config.effort=none", () =
   );
 
   assert.equal((result.generationConfig as any).thinkingConfig, undefined);
+});
+
+// Regression for #3842: thinking.budget_tokens must be capped by the model's
+// thinkingBudgetCap, matching the output_config.effort path behavior.
+test("Claude -> Gemini thinking.budget_tokens is capped by model thinkingBudgetCap (#3842)", () => {
+  // gemini-2.5-flash has thinkingBudgetCap: 24576
+  const result = claudeToGeminiRequest(
+    "gemini-2.5-flash",
+    {
+      messages: [{ role: "user", content: [{ type: "text", text: "think hard" }] }],
+      thinking: { type: "enabled", budget_tokens: 50000 },
+    },
+    false
+  );
+  assert.deepEqual(result.generationConfig.thinkingConfig, {
+    thinkingBudget: 24576,
+    includeThoughts: true,
+  });
+});
+
+// #6813: an explicit `budget_tokens: 0` on this path is the client's dynamic-thinking
+// sentinel, not an off-switch — includeThoughts must stay true even after capping (see
+// tests/unit/claude-to-gemini-budget-tokens-zero-6813.test.ts for the canonical
+// regression). This mirrors that contract for a model with an explicit
+// thinkingBudgetCap.
+test("Claude -> Gemini thinking.budget_tokens=0 preserves dynamic-thinking sentinel after cap (#6813)", () => {
+  const result = claudeToGeminiRequest(
+    "gemini-2.5-flash",
+    {
+      messages: [{ role: "user", content: [{ type: "text", text: "no thinking" }] }],
+      thinking: { type: "enabled", budget_tokens: 0 },
+    },
+    false
+  );
+  assert.deepEqual(result.generationConfig.thinkingConfig, {
+    thinkingBudget: 0,
+    includeThoughts: true,
+  });
+});
+
+// Guard: models with thinkingBudgetCap=0 (e.g. gemini-3-flash) must NOT
+// receive thinkingConfig even when the caller explicitly sends budget_tokens.
+test("Claude -> Gemini skips thinkingConfig for model with thinkingBudgetCap=0", () => {
+  const result = claudeToGeminiRequest(
+    "gemini-3-flash",
+    {
+      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      thinking: { type: "enabled", budget_tokens: 5000 },
+    },
+    false
+  );
+  assert.equal(
+    (result.generationConfig as any).thinkingConfig,
+    undefined,
+    "gemini-3-flash (thinkingBudgetCap:0) must not receive thinkingConfig"
+  );
+});
+
+// Guard: models with thinkingBudgetCap=0 must not receive thinkingConfig
+// via the output_config.effort path either.
+test("Claude -> Gemini skips effort thinkingConfig for model with thinkingBudgetCap=0", () => {
+  const result = claudeToGeminiRequest(
+    "gemini-3-flash",
+    {
+      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      output_config: { effort: "high" },
+    },
+    false
+  );
+  assert.equal(
+    (result.generationConfig as any).thinkingConfig,
+    undefined,
+    "gemini-3-flash (thinkingBudgetCap:0) must not receive effort thinkingConfig"
+  );
+});
+
+// Guard: models not in MODEL_SPECS (thinkingBudgetCap=undefined) default to allowed.
+test("Claude -> Gemini allows thinkingConfig for unknown model (no spec)", () => {
+  const result = claudeToGeminiRequest(
+    "some-unknown-gemini-model",
+    {
+      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      thinking: { type: "enabled", budget_tokens: 5000 },
+    },
+    false
+  );
+  assert.deepEqual(result.generationConfig.thinkingConfig, {
+    thinkingBudget: 5000,
+    includeThoughts: true,
+  });
+});
+
+// Effort budgets must be capped by the model's thinkingBudgetCap.
+// gemini-2.5-flash has thinkingBudgetCap:24576; effort "high" sends 32768
+// which must be capped to 24576.
+test("Claude -> Gemini effort budget is capped by thinkingBudgetCap", () => {
+  const result = claudeToGeminiRequest(
+    "gemini-2.5-flash",
+    {
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      output_config: { effort: "high" },
+    },
+    false
+  );
+  assert.deepEqual(result.generationConfig.thinkingConfig, {
+    thinkingBudget: 24576,
+    includeThoughts: true,
+  });
+});
+
+// Non-numeric budget_tokens (e.g. string "auto") must fall through to the
+// effort path, not be treated as a numeric budget.
+test("Claude -> Gemini non-numeric budget_tokens falls through to effort path", () => {
+  const result = claudeToGeminiRequest(
+    "gemini-2.5-flash",
+    {
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      thinking: { type: "enabled", budget_tokens: "auto" as any },
+      output_config: { effort: "low" },
+    },
+    false
+  );
+  // Should use effort "low" (1024) instead of trying to use "auto" as budget
+  assert.deepEqual(result.generationConfig.thinkingConfig, {
+    thinkingBudget: 1024,
+    includeThoughts: true,
+  });
 });

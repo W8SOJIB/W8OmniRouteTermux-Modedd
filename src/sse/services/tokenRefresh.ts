@@ -11,7 +11,6 @@ import {
   refreshAccessToken as _refreshAccessToken,
   refreshClaudeOAuthToken as _refreshClaudeOAuthToken,
   refreshGoogleToken as _refreshGoogleToken,
-  refreshQwenToken as _refreshQwenToken,
   refreshCodexToken as _refreshCodexToken,
   refreshQoderToken as _refreshQoderToken,
   refreshGitHubToken as _refreshGitHubToken,
@@ -68,11 +67,6 @@ export const refreshGoogleToken = async (
   return _refreshGoogleToken(refreshToken, clientId, clientSecret, log, proxy);
 };
 
-export const refreshQwenToken = async (refreshToken: string, credentials?: any) => {
-  const proxy = await resolveProxyForCredentials("qwen", credentials);
-  return _refreshQwenToken(refreshToken, log, proxy);
-};
-
 export const refreshCodexToken = async (refreshToken: string, credentials?: any) => {
   const proxy = await resolveProxyForCredentials("codex", credentials);
   return _refreshCodexToken(refreshToken, log, proxy);
@@ -88,10 +82,33 @@ export const refreshGitHubToken = async (refreshToken: string, credentials?: any
   return _refreshGitHubToken(refreshToken, log, proxy);
 };
 
-export const refreshCopilotToken = async (githubAccessToken: string, credentials?: any) => {
+export const refreshCopilotToken = async (
+  githubAccessToken: string,
+  credentials?: any,
+  baseUrl?: string
+) => {
   const proxy = await resolveProxyForCredentials("github", credentials);
-  return _refreshCopilotToken(githubAccessToken, log, proxy);
+  return baseUrl
+    ? _refreshCopilotToken(githubAccessToken, log, proxy, baseUrl)
+    : _refreshCopilotToken(githubAccessToken, log, proxy);
 };
+
+/**
+ * Resolve the Copilot token endpoint base URL for a provider/credentials pair.
+ * github.com Copilot always uses api.github.com; GHE Copilot uses its own
+ * per-enterprise host stored in providerSpecificData.gheUrl at connect time.
+ */
+export function resolveCopilotTokenBaseUrl(
+  provider: string,
+  credentials?: any
+): string | undefined {
+  if (provider !== "ghe-copilot") return undefined;
+  const gheUrl = credentials?.providerSpecificData?.gheUrl;
+  if (typeof gheUrl === "string" && gheUrl.trim().length > 0) {
+    return `${gheUrl.trim().replace(/\/+$/, "")}/api/v3`;
+  }
+  return undefined;
+}
 
 export const getAccessToken = async (
   provider: string,
@@ -119,6 +136,24 @@ export async function updateProviderCredentials(connectionId: string, newCredent
 
     if (newCredentials.accessToken) {
       updates.accessToken = newCredentials.accessToken;
+      // #6352: a successful refresh proves the connection is reachable and its
+      // refresh_token is valid again — clear any stale auth-failure state
+      // (testStatus/lastError*) left over from a prior expired/invalid refresh
+      // token or an upstream 401/403. Without this, a genuinely successful
+      // rotating-refresh (e.g. Codex/OpenAI) persisted the new access/refresh
+      // token while leaving the dashboard showing "Auth Failed" forever,
+      // because the error metadata was never reset here — only the health-check
+      // sweep (tokenHealthCheck.ts::checkConnection) did this clearing, so any
+      // OTHER caller of updateProviderCredentials (the manual refresh route,
+      // the reactive per-request refresh in chat.ts) looked like it "didn't
+      // pick up" the refreshed token. Explicit `newCredentials.testStatus`
+      // below still wins for callers that need a specific terminal state.
+      updates.testStatus = "active";
+      updates.lastError = null;
+      updates.lastErrorAt = null;
+      updates.lastErrorType = null;
+      updates.lastErrorSource = null;
+      updates.errorCode = null;
     }
     if (newCredentials.refreshToken) {
       updates.refreshToken = newCredentials.refreshToken;
@@ -218,8 +253,15 @@ export async function checkAndRefreshToken(provider: string, credentials: any) {
     }
   }
 
-  // Check GitHub copilot token expiry
-  if (provider === "github" && updatedCredentials.providerSpecificData?.copilotTokenExpiresAt) {
+  // Check GitHub/GHE Copilot token expiry. Both github.com Copilot and GHE
+  // Copilot (device-code flow against an enterprise host) issue a short-lived
+  // sub-token separate from the OAuth access token, stored the same way in
+  // providerSpecificData.copilotTokenExpiresAt — only the token endpoint host
+  // differs (resolveCopilotTokenBaseUrl picks it via providerSpecificData.gheUrl).
+  if (
+    (provider === "github" || provider === "ghe-copilot") &&
+    updatedCredentials.providerSpecificData?.copilotTokenExpiresAt
+  ) {
     const copilotExpiresAt = updatedCredentials.providerSpecificData.copilotTokenExpiresAt * 1000;
     const now = Date.now();
 
@@ -231,9 +273,10 @@ export async function checkAndRefreshToken(provider: string, credentials: any) {
 
       const copilotToken = await refreshCopilotToken(
         updatedCredentials.accessToken,
-        updatedCredentials
+        updatedCredentials,
+        resolveCopilotTokenBaseUrl(provider, updatedCredentials)
       );
-      if (copilotToken) {
+      if (copilotToken?.token) {
         await updateProviderCredentials(updatedCredentials.connectionId, {
           providerSpecificData: {
             ...updatedCredentials.providerSpecificData,
@@ -261,7 +304,7 @@ export async function refreshGitHubAndCopilotTokens(credentials: any) {
   const newGitHubCredentials = await refreshGitHubToken(credentials.refreshToken, credentials);
   if (newGitHubCredentials?.accessToken) {
     const copilotToken = await refreshCopilotToken(newGitHubCredentials.accessToken, credentials);
-    if (copilotToken) {
+    if (copilotToken?.token) {
       return {
         ...newGitHubCredentials,
         providerSpecificData: {

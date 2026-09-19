@@ -17,7 +17,8 @@ const core = await import("../../../src/lib/db/core.ts");
 const settingsDb = await import("../../../src/lib/db/settings.ts");
 const providersDb = await import("../../../src/lib/db/providers.ts");
 const autopilot = await import("../../../src/lib/monitoring/providerHealthAutopilot.ts");
-const actionsRoute = await import("../../../src/app/api/providers/health-autopilot/actions/route.ts");
+const actionsRoute =
+  await import("../../../src/app/api/providers/health-autopilot/actions/route.ts");
 const reportRoute = await import("../../../src/app/api/providers/health-autopilot/route.ts");
 const routeGuard = await import("../../../src/server/authz/routeGuard.ts");
 const authzPipeline = await import("../../../src/server/authz/pipeline.ts");
@@ -27,7 +28,7 @@ const PROVIDER = "autopilot-test-provider";
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -69,7 +70,7 @@ test.beforeEach(async () => {
 test.after(async () => {
   accountFallback.clearProviderFailure(PROVIDER);
   await resetStorage();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 
   if (ORIGINAL_DATA_DIR === undefined) delete process.env.DATA_DIR;
   else process.env.DATA_DIR = ORIGINAL_DATA_DIR;
@@ -110,6 +111,59 @@ test("provider health autopilot reports actionable cooldown and model lockout is
     assert.equal(provider.signals.modelLockouts, 1);
   } finally {
     accountFallback.clearModelLock(PROVIDER, String(connection.id), "locked-model");
+  }
+});
+
+test("provider health autopilot canonicalizes alias-keyed signals while preserving raw breaker actions", async () => {
+  const canonicalProvider = "nous-research";
+  const aliasProvider = "nous";
+  const connection = await createCooldownConnection(canonicalProvider);
+  for (let failure = 0; failure < 20; failure += 1) {
+    accountFallback.recordProviderFailure(aliasProvider);
+  }
+  accountFallback.lockModel(
+    aliasProvider,
+    String(connection.id),
+    "alias-locked-model",
+    "quota",
+    60_000,
+    {}
+  );
+
+  try {
+    const report = await autopilot.buildProviderHealthAutopilotReport({
+      provider: aliasProvider,
+      includeHealthy: true,
+    });
+    assert.equal(report.providers.length, 1);
+    const provider = report.providers[0];
+    assert.equal(provider.provider, canonicalProvider);
+    assert.equal(provider.signals.connections.total, 1);
+    assert.equal(provider.signals.modelLockouts, 1);
+
+    const clearBreaker = findAction(report, "clear_provider_breaker");
+    assert.ok(clearBreaker);
+    assert.equal(clearBreaker.target.provider, aliasProvider);
+
+    const applied = await autopilot.executeProviderHealthAutopilotAction({
+      type: clearBreaker.type,
+      target: clearBreaker.target,
+      preconditionsHash: clearBreaker.preconditionsHash,
+      confirm: true,
+    });
+    assert.equal(applied.status, 200);
+
+    const afterReset = await autopilot.buildProviderHealthAutopilotReport({
+      provider: aliasProvider,
+      includeHealthy: true,
+    });
+    assert.equal(
+      afterReset.providers[0].issues.some((issue) => issue.kind === "provider_circuit_open"),
+      false
+    );
+  } finally {
+    accountFallback.clearModelLock(aliasProvider, String(connection.id), "alias-locked-model");
+    accountFallback.clearProviderFailure(aliasProvider);
   }
 });
 
@@ -215,6 +269,48 @@ test("provider health autopilot action rejects cross-site mutations", async () =
     unknown
   >;
   assert.ok(unchanged.rateLimitedUntil);
+});
+
+test("provider health autopilot action accepts LAN dashboard requests (#6277)", async () => {
+  // #6277: Docker/LAN deployments (accessed via LAN IP, not localhost) got a
+  // spurious 403 "Invalid request origin" clicking "remove cooldown". Root
+  // cause: this route carried a DUPLICATE per-route validateBrowserMutationOrigin
+  // check re-added by the v3.8.42 release squash after PR #5278 centralized
+  // origin enforcement in the authz pipeline. The pipeline's centralized check
+  // (src/server/authz/pipeline.ts) strips PEER_IP_HEADER before forwarding the
+  // request to the route handler, so by the time this handler runs the peer
+  // stamp is gone — exactly what a real post-middleware request looks like.
+  // The route must trust the pipeline's verdict and NOT re-validate origin
+  // itself; without PEER_IP_HEADER, the per-route check cannot resolve the LAN
+  // "direct-local-host" candidate and rejects a same-origin-but-LAN mutation.
+  await enableManagementAuth();
+  const connection = await createCooldownConnection();
+  const report = await autopilot.buildProviderHealthAutopilotReport({
+    provider: PROVIDER,
+    includeHealthy: true,
+  });
+  const action = findAction(report, "clear_connection_cooldown");
+  assert.ok(action);
+
+  const request = await makeManagementSessionRequest(
+    "http://localhost/api/providers/health-autopilot/actions",
+    {
+      method: "POST",
+      headers: { origin: "http://192.168.1.50:20128", "sec-fetch-site": "same-origin" },
+      body: {
+        type: action.type,
+        target: action.target,
+        preconditionsHash: action.preconditionsHash,
+        confirm: true,
+      },
+    }
+  );
+  assert.equal(request.headers.get("x-omniroute-peer-ip"), null);
+
+  const response = await actionsRoute.POST(request);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.success, true);
 });
 
 test("provider health autopilot action rejects malformed JSON", async () => {

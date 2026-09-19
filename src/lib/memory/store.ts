@@ -122,6 +122,17 @@ function safeMarkNeedsReindex(id: string, needs: boolean): void {
 function scheduleVectorUpsert(id: string, content: string): void {
   setImmediate(async () => {
     try {
+      // The upsert is fire-and-forget and embeddings are slow (potion loads
+      // lazily). Health-check verification (and user deletes) can remove the
+      // memory before this callback runs — skip quietly instead of spamming
+      // "memory not found" warnings every sweep interval.
+      const db = getDbInstance();
+      const exists = db.prepare("SELECT rowid FROM memories WHERE id = ?").get(id);
+      if (!exists) {
+        log.debug("memory.vec.upsert.skipped_deleted", { id });
+        return;
+      }
+
       const settings = await getMemorySettings();
       const resolution = resolveEmbeddingSource(settings);
       if (!resolution.source) return;
@@ -350,8 +361,7 @@ export async function updateMemory(
 
   // Fetch current state to detect content/key change (needed for vector re-gen)
   const currentRow = db.prepare("SELECT content, key FROM memories WHERE id = ?").get(id) as
-    | { content: string; key: string | null }
-    | undefined;
+    { content: string; key: string | null } | undefined;
 
   // Build dynamic update query
   const fields: string[] = [];
@@ -396,8 +406,7 @@ export async function updateMemory(
   invalidateMemoryCache(id);
 
   // Regenerate vector if content or key changed (fire-and-forget)
-  const contentChanged =
-    updates.content !== undefined && updates.content !== currentRow?.content;
+  const contentChanged = updates.content !== undefined && updates.content !== currentRow?.content;
   const keyChanged = updates.key !== undefined && updates.key !== currentRow?.key;
 
   if (contentChanged || keyChanged) {
@@ -586,10 +595,7 @@ export function recordMemoryAccess(ids: string[]): void {
  * predicates read (no content/metadata), ordered oldest-first and bounded by `limit`, so a
  * sweep never materializes whole memories or scans unboundedly.
  */
-export function listMemoriesForDecay(filters: {
-  apiKeyId?: string;
-  limit: number;
-}): {
+export function listMemoriesForDecay(filters: { apiKeyId?: string; limit: number }): {
   id: string;
   type: MemoryType;
   accessCount: number;

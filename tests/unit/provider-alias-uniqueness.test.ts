@@ -4,14 +4,14 @@
  * Before this guard, three aliases collided in the registry and the LAST entry in
  * iteration order silently won, emitting a startup warning and shadowing a real
  * provider:
- *   - "qw"   → qwen-web (shadowed qwen)
  *   - "kimi" → kimi-web (shadowed the kimi provider that gained a dedicated executor)
- *   - "hc"   → hackclub (shadowed huggingchat)
+ *   - "hc"   → the provider that held it shadowed huggingchat (it was later
+ *     removed entirely, #11176; huggingchat keeps its own id as alias)
  *
  * The decision: the primary provider keeps the short alias; the web/secondary
  * variant takes its own id as alias. This test pins both the global uniqueness
  * invariant (so future additions can't silently re-collide) and the specific
- * resolutions for the six affected providers, across BOTH alias sources
+ * resolutions for the affected providers, across BOTH alias sources
  * (open-sse registry + src/shared providers map).
  */
 import test from "node:test";
@@ -43,29 +43,41 @@ test("no two provider IDs share the same alias in the open-sse registry", () => 
   );
 });
 
-test("primary providers keep the short alias; web/secondary variants use their own id", () => {
+test("primary providers keep the short alias; web variants use their own id", () => {
   // open-sse registry (source of the startup warning + chat routing)
-  assert.equal(PROVIDER_ID_TO_ALIAS.qwen, "qw");
   assert.equal(PROVIDER_ID_TO_ALIAS["qwen-web"], "qwen-web");
   assert.equal(PROVIDER_ID_TO_ALIAS.kimi, "kimi");
   assert.equal(PROVIDER_ID_TO_ALIAS["kimi-web"], "kimi-web");
-  assert.equal(PROVIDER_ID_TO_ALIAS.hackclub, "hc");
   assert.equal(PROVIDER_ID_TO_ALIAS.huggingchat, "huggingchat");
 });
 
 test("src/shared providers map resolves the same aliases unambiguously", () => {
   // alias → id
-  assert.equal(resolveProviderId("qw"), "qwen");
   assert.equal(resolveProviderId("kimi"), "kimi");
-  assert.equal(resolveProviderId("hc"), "hackclub");
   // id used as alias for the secondary variants
   assert.equal(resolveProviderId("qwen-web"), "qwen-web");
   assert.equal(resolveProviderId("kimi-web"), "kimi-web");
   assert.equal(resolveProviderId("huggingchat"), "huggingchat");
   // id → alias
-  assert.equal(getProviderAlias("qwen"), "qw");
   assert.equal(getProviderAlias("kimi"), "kimi");
-  assert.equal(getProviderAlias("hackclub"), "hc");
+});
+
+// #6673: hailuo-web must not collide with the paid API-key minimax/minimax-cn
+// providers — it uses its own id as alias, per the secondary-variant convention.
+test("hailuo-web resolves to its own id/alias and does not collide with minimax", () => {
+  assert.equal(PROVIDER_ID_TO_ALIAS["hailuo-web"], "hailuo-web");
+  assert.equal(resolveProviderId("hailuo-web"), "hailuo-web");
+  assert.equal(getProviderAlias("hailuo-web"), "hailuo-web");
+  assert.equal(resolveProviderId("minimax"), "minimax");
+  assert.equal(resolveProviderId("minimax-cn"), "minimax-cn");
+});
+
+test("freepik is the Magnific Mystic legacy alias, not a second provider id", () => {
+  assert.equal(resolveProviderId("freepik"), "magnific");
+  assert.equal(resolveProviderId("magnific"), "magnific");
+  assert.equal(getProviderAlias("magnific"), "freepik");
+  assert.ok("magnific" in APIKEY_PROVIDERS);
+  assert.ok(!("freepik" in APIKEY_PROVIDERS));
 });
 
 test("no provider id is registered in both the API-key and web-cookie catalogs", () => {

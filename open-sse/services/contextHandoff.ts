@@ -230,7 +230,10 @@ function formatMessagesForPrompt(messages: MessageLike[]): string {
     .join("\n\n");
 }
 
-export function selectMessagesForSummary(messages: MessageLike[], maxMessages: number): MessageLike[] {
+export function selectMessagesForSummary(
+  messages: MessageLike[],
+  maxMessages: number
+): MessageLike[] {
   const validMessages = messages.filter((m) => m && typeof m === "object");
   const system = validMessages.filter(
     (m) => typeof m.role === "string" && (m.role === "system" || m.role === "developer")
@@ -602,6 +605,69 @@ export function shouldGenerateUniversalHandoff(options: {
   return "generate";
 }
 
+// #11552 — universal-handoff regeneration backoff.
+//
+// A universal handoff whose summary comes back unparseable persists NOTHING, so
+// `shouldGenerateUniversalHandoff` keeps answering "generate" and the very next
+// model switch in the same session re-issues the same full-history
+// summarization call and throws the answer away again. With a switch-heavy
+// strategy (weighted, random, round-robin, p2c) the models alternate on almost
+// every turn, so that becomes an extra discarded upstream call on a large
+// fraction of requests — real money on a paid provider, real quota on a metered
+// one. Back off per (session, combo) instead of hammering.
+//
+// Scope is deliberately narrow: only the "responded, but the content is not a
+// usable handoff" outcome is tracked. A transient upstream failure
+// (`!response.ok`) is NOT — that one is worth retrying on the next switch, and
+// the context-relay path relies on exactly that behavior
+// (tests/unit/context-handoff.test.ts → "allows a new attempt after a failed
+// in-flight generation").
+const HANDOFF_UNPARSEABLE_BASE_COOLDOWN_MS = 5 * 60 * 1000;
+const HANDOFF_UNPARSEABLE_MAX_COOLDOWN_MS = 60 * 60 * 1000;
+const MAX_TRACKED_HANDOFF_COOLDOWNS = 500;
+
+type HandoffCooldownState = { consecutive: number; retryAfter: number };
+const universalHandoffCooldowns = new Map<string, HandoffCooldownState>();
+
+type UniversalHandoffOutcome = "generated" | "unparseable" | "unavailable";
+
+function isUniversalHandoffCoolingDown(key: string): boolean {
+  const entry = universalHandoffCooldowns.get(key);
+  if (!entry) return false;
+  return Date.now() < entry.retryAfter;
+}
+
+function pruneUniversalHandoffCooldowns(): void {
+  if (universalHandoffCooldowns.size <= MAX_TRACKED_HANDOFF_COOLDOWNS) return;
+  const now = Date.now();
+  for (const [key, entry] of universalHandoffCooldowns) {
+    if (entry.retryAfter <= now) universalHandoffCooldowns.delete(key);
+  }
+  // Map iterates in insertion order, so this evicts the least recently touched
+  // keys first (every record re-inserts its key at the tail).
+  while (universalHandoffCooldowns.size > MAX_TRACKED_HANDOFF_COOLDOWNS) {
+    const oldest = universalHandoffCooldowns.keys().next();
+    if (oldest.done) break;
+    universalHandoffCooldowns.delete(oldest.value);
+  }
+}
+
+function recordUniversalHandoffUnparseable(key: string): void {
+  const consecutive = (universalHandoffCooldowns.get(key)?.consecutive ?? 0) + 1;
+  const cooldownMs = Math.min(
+    HANDOFF_UNPARSEABLE_BASE_COOLDOWN_MS * 2 ** (consecutive - 1),
+    HANDOFF_UNPARSEABLE_MAX_COOLDOWN_MS
+  );
+  universalHandoffCooldowns.delete(key);
+  universalHandoffCooldowns.set(key, { consecutive, retryAfter: Date.now() + cooldownMs });
+  pruneUniversalHandoffCooldowns();
+}
+
+/** Test seam: drop all universal-handoff regeneration cooldowns. */
+export function resetUniversalHandoffCooldowns(): void {
+  universalHandoffCooldowns.clear();
+}
+
 /**
  * Generate a universal handoff summary for any model/provider switch.
  */
@@ -616,13 +682,13 @@ async function generateUniversalHandoffAsync(options: {
   maxMessages: number;
   providerAllowlist: string[];
   handleSingleModel: (body: Record<string, unknown>, modelStr: string) => Promise<Response>;
-}): Promise<void> {
+}): Promise<UniversalHandoffOutcome> {
   const selectedMessages = selectMessagesForSummary(
     Array.isArray(options.messages) ? options.messages : [],
     options.maxMessages
   );
   const historyText = formatMessagesForPrompt(selectedMessages);
-  if (!historyText) return;
+  if (!historyText) return "unavailable";
 
   const summaryPrompt = HANDOFF_PROMPT_TEMPLATE.replace("{HISTORY}", historyText);
   const summaryModel = options.handoffModel || options.currModel;
@@ -637,7 +703,7 @@ async function generateUniversalHandoffAsync(options: {
   };
 
   const response = await options.handleSingleModel(summaryBody, summaryModel);
-  if (!response.ok) return;
+  if (!response.ok) return "unavailable";
 
   let content = "";
   try {
@@ -652,7 +718,7 @@ async function generateUniversalHandoffAsync(options: {
   }
 
   const parsed = parseHandoffJSON(content);
-  if (!parsed) return;
+  if (!parsed) return "unparseable";
 
   upsertHandoff({
     sessionId: options.sessionId,
@@ -669,6 +735,7 @@ async function generateUniversalHandoffAsync(options: {
     generatedAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + options.ttlMs).toISOString(),
   });
+  return "generated";
 }
 
 export function maybeGenerateUniversalHandoff(options: {
@@ -692,6 +759,10 @@ export function maybeGenerateUniversalHandoff(options: {
   if (!options.sessionId) return;
 
   const inflightKey = getInflightKey(options.sessionId, options.comboName);
+  // #11552: the previous attempt for this session/combo answered with something
+  // that is not a usable handoff. Re-asking on every model switch just burns an
+  // upstream call whose response is discarded — wait out the backoff instead.
+  if (isUniversalHandoffCoolingDown(inflightKey)) return;
   if (inflightHandoffGenerations.has(inflightKey)) return;
   inflightHandoffGenerations.add(inflightKey);
 
@@ -710,6 +781,10 @@ export function maybeGenerateUniversalHandoff(options: {
       providerAllowlist: options.universalConfig.providerAllowlist,
       handleSingleModel: options.handleSingleModel,
     })
+      .then((outcome) => {
+        if (outcome === "unparseable") recordUniversalHandoffUnparseable(inflightKey);
+        else if (outcome === "generated") universalHandoffCooldowns.delete(inflightKey);
+      })
       .catch((err) => {
         if (process.env.NODE_ENV !== "test") {
           console.warn("[universal-handoff] Generation failed:", err?.message || err);

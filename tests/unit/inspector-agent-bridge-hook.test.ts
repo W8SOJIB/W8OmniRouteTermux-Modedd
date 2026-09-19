@@ -27,7 +27,7 @@ const { recordRequestStart } = await import(
 
 async function resetStorage() {
   resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
   getDbInstance();
 }
@@ -46,7 +46,7 @@ test.beforeEach(async () => {
 
 test.after(() => {
   resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("recordRequestStart: custom-host entry → source=custom-host, agent=undefined", async () => {

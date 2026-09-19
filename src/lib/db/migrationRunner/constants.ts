@@ -69,6 +69,116 @@ export const RENAMED_MIGRATION_COMPATIBILITY = [
     toVersion: "059",
     toName: "manifest_routing",
   },
+  {
+    fromVersion: "123",
+    fromName: "windsurf_to_devin_desktop",
+    toVersion: "151",
+    toName: "windsurf_to_devin_desktop",
+  },
+  {
+    fromVersion: "124",
+    fromName: "windsurf_to_devin_desktop",
+    toVersion: "151",
+    toName: "windsurf_to_devin_desktop",
+  },
+  {
+    fromVersion: "125",
+    fromName: "windsurf_to_devin_desktop",
+    toVersion: "151",
+    toName: "windsurf_to_devin_desktop",
+  },
+  {
+    fromVersion: "126",
+    fromName: "windsurf_to_devin_desktop",
+    toVersion: "151",
+    toName: "windsurf_to_devin_desktop",
+  },
+  {
+    fromVersion: "127",
+    fromName: "windsurf_to_devin_desktop",
+    toVersion: "151",
+    toName: "windsurf_to_devin_desktop",
+  },
+  {
+    fromVersion: "128",
+    fromName: "windsurf_to_devin_desktop",
+    toVersion: "151",
+    toName: "windsurf_to_devin_desktop",
+  },
+  {
+    fromVersion: "131",
+    fromName: "windsurf_to_devin_desktop",
+    toVersion: "151",
+    toName: "windsurf_to_devin_desktop",
+  },
+  {
+    // 133 collided with 133_call_logs_session_tag once that landed on release.
+    fromVersion: "133",
+    fromName: "windsurf_to_devin_desktop",
+    toVersion: "151",
+    toName: "windsurf_to_devin_desktop",
+  },
+  {
+    // 135 and 136 are canonical release migrations now.
+    fromVersion: "135",
+    fromName: "windsurf_to_devin_desktop",
+    toVersion: "151",
+    toName: "windsurf_to_devin_desktop",
+  },
+  {
+    fromVersion: "136",
+    fromName: "windsurf_to_devin_desktop",
+    toVersion: "151",
+    toName: "windsurf_to_devin_desktop",
+  },
+  {
+    // 139 and 140 are occupied by CCR and connection runtime state.
+    fromVersion: "139",
+    fromName: "windsurf_to_devin_desktop",
+    toVersion: "151",
+    toName: "windsurf_to_devin_desktop",
+  },
+  {
+    fromVersion: "140",
+    fromName: "windsurf_to_devin_desktop",
+    toVersion: "151",
+    toName: "windsurf_to_devin_desktop",
+  },
+  {
+    // 143 is the API-key cache mode; 144–145 are the stacked Radar caches.
+    fromVersion: "143",
+    fromName: "windsurf_to_devin_desktop",
+    toVersion: "151",
+    toName: "windsurf_to_devin_desktop",
+  },
+  {
+    // 144 was published by this PR before the Radar reservation landed.
+    fromVersion: "144",
+    fromName: "windsurf_to_devin_desktop",
+    toVersion: "151",
+    toName: "windsurf_to_devin_desktop",
+  },
+  {
+    fromVersion: "134",
+    fromName: "ccr_blocks",
+    toVersion: "139",
+    toName: "ccr_blocks",
+  },
+  {
+    fromVersion: "139",
+    fromName: "job_registry",
+    toVersion: "146",
+    toName: "job_registry",
+  },
+  {
+    // The cumulative Radar branch used 143 before 143_api_key_cache_default_mode
+    // landed on release/v3.8.50. Rehome already-applied Radar rows to the next
+    // free slot so the canonical API-key migration can still run.
+    fromVersion: "143",
+    fromName: "radar_local_model_state",
+    toVersion: "153",
+    toName: "radar_local_model_state",
+  },
 ] as const;
 
 export const LEGACY_VERSION_SLOT_MIGRATIONS = [

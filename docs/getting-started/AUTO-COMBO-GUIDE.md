@@ -1,3 +1,9 @@
+---
+title: "Auto-Combo: Let OmniRoute Pick the Best AI for You"
+version: 3.8.50
+lastUpdated: 2026-08-06
+---
+
 # Auto-Combo: Let OmniRoute Pick the Best AI for You
 
 > **TL;DR**: Set your model to `auto` and OmniRoute automatically picks the best AI provider for each request. No configuration needed.
@@ -183,7 +189,7 @@ Use `auto/smart` when you want the best quality and are okay with occasional exp
 
 ### "Can I force a specific provider?"
 
-Yes! Use a combo with `priority` strategy instead of `auto`. See the [Technical Reference](../routing/AUTO-COMBO.md) for details.
+Yes! Use a combo with `priority` strategy instead of `auto`, then send the combo's **exact name** as the `model` field (e.g. `model: "my-combo"` — not `auto`). See the [Technical Reference](../routing/AUTO-COMBO.md) for details.
 
 ### "How is this different from round-robin?"
 
@@ -195,7 +201,7 @@ Round-robin cycles through providers in order. Auto-combo **scores each provider
 
 - **[Connect a Provider](./PROVIDERS-GUIDE.md)** — Add your first AI provider
 - **[Free Tiers Guide](./FREE-TIERS-GUIDE.md)** — Get free AI with no credit card
-- **[Troubleshooting](./TROUBLESHOOTING.md)** — Fix common issues
+- **[Troubleshooting](../guides/TROUBLESHOOTING.md)** — Fix common issues
 - **[Technical Reference](../routing/AUTO-COMBO.md)** — Deep dive into the scoring algorithm
 
 ---
@@ -203,7 +209,7 @@ Round-robin cycles through providers in order. Auto-combo **scores each provider
 ## Learn More
 
 For developers and contributors, see the [Auto-Combo Technical Reference](../routing/AUTO-COMBO.md) for:
-- Full 12-factor scoring algorithm
+- Full 13-factor scoring algorithm
 - Mode pack weight tables
 - Implementation file paths
 - API endpoints

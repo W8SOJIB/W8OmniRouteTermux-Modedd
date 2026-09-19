@@ -48,7 +48,7 @@ function req(headers: Record<string, string>) {
 }
 
 test.after(() => {
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("#3503 — authenticated session + key-id header resolves the key secret server-side", async () => {

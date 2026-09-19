@@ -18,7 +18,7 @@ const ORIGINAL_JWT_SECRET = process.env.JWT_SECRET;
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
   delete process.env.INITIAL_PASSWORD;
   delete process.env.JWT_SECRET;
@@ -50,7 +50,7 @@ test.beforeEach(async () => {
 
 test.after(async () => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 
   if (ORIGINAL_INITIAL_PASSWORD === undefined) {
     delete process.env.INITIAL_PASSWORD;
@@ -99,4 +99,33 @@ test("POST /api/acp/agents rejects unsafe version commands for authenticated ses
 
   assert.equal(response.status, 400);
   assert.match(body.error, /Invalid versionCommand/i);
+});
+
+test("POST /api/acp/agents rejects an interpreter eval payload (GHSA-jphr-2gw7-xrwp)", async () => {
+  // Exact shape of the advisory PoC: binary + versionCommand both name `node`,
+  // so the binary-match check passes, but the `-e` eval argument must still be
+  // refused before it can reach execFileSync("node", ["-e", ...]).
+  process.env.JWT_SECRET = "acp-agents-jwt-secret";
+  await localDb.updateSettings({ requireLogin: true, password: "hashed-password" });
+  const token = await createSessionToken();
+
+  const response = await routeModule.POST(
+    makeRequest(
+      "POST",
+      {
+        id: "anonrce",
+        name: "anonrce",
+        binary: "node",
+        versionCommand: 'node -e "process.exit(1)"',
+        providerAlias: "anonrce",
+        spawnArgs: [],
+        protocol: "stdio",
+      },
+      token
+    )
+  );
+  const body = (await response.json()) as { error?: string };
+
+  assert.equal(response.status, 400);
+  assert.match(body.error ?? "", /Invalid versionCommand/i);
 });

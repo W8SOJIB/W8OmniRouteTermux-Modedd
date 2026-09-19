@@ -32,12 +32,6 @@ const BUILT_IN_ALIASES: Record<string, string> = {
   "claude-3-5-sonnet-latest": "claude-sonnet-4-20250514",
   "claude-3-5-haiku-latest": "claude-3-5-sonnet-20241022",
 
-  // OpenAI legacy → current
-  "gpt-4-turbo-preview": "gpt-4-turbo",
-  "gpt-4-0125-preview": "gpt-4-turbo",
-  "gpt-4-1106-preview": "gpt-4-turbo",
-  "gpt-3.5-turbo-0125": "gpt-3.5-turbo",
-
   // Kimi/Moonshot — Fireworks long-path aliases (#265)
   "accounts/fireworks/models/kimi-k2p5": "moonshotai/Kimi-K2.5",
   "fireworks/accounts/fireworks/models/kimi-k2p5": "moonshotai/Kimi-K2.5",
@@ -45,6 +39,13 @@ const BUILT_IN_ALIASES: Record<string, string> = {
   "accounts/fireworks/models/kimi-k2": "moonshotai/Kimi-K2",
   "fireworks/accounts/fireworks/models/kimi-k2": "moonshotai/Kimi-K2",
   "kimi-k2": "moonshotai/Kimi-K2",
+
+  // Qwen — the model ships only under the `-preview` id (bailian-coding-plan, qoder,
+  // qwen-cloud-token-plan, qwen-web). Without this, the bare id missed MODEL_SPECS and
+  // the context preflight fell back to contextManager's `default: 128000`, rejecting
+  // prompts the model's real 1M window accepts. Drop this line if Alibaba ever ships a
+  // distinct GA `qwen3.8-max` — it would no longer be the same model.
+  "qwen3.8-max": "qwen3.8-max-preview",
 
   // Mistral short aliases
   "mistral-large": "mistral-large-latest",
@@ -70,10 +71,7 @@ const BUILT_IN_ALIASES: Record<string, string> = {
 // root cause (both instances read/write one store), mirroring the #5312 pattern already
 // applied to thinkingBudget.ts and backgroundTaskDetector.ts (and systemPrompt.ts #2470).
 const CUSTOM_ALIASES_GLOBAL_KEY = "__omniroute_customAliases__";
-const _aliasStore = globalThis as unknown as Record<
-  string,
-  Record<string, string> | undefined
->;
+const _aliasStore = globalThis as unknown as Record<string, Record<string, string> | undefined>;
 
 function customAliases(): Record<string, string> {
   if (!_aliasStore[CUSTOM_ALIASES_GLOBAL_KEY]) {

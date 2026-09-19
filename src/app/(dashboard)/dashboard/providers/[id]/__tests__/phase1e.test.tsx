@@ -83,14 +83,10 @@ describe("providerPageHelpers — model-compat pure functions", () => {
     expect(isModelHiddenFn("unknown-model", customMap, overrideMap)).toBe(false);
   });
 
-  it("isModelHiddenFn ignores deleted tombstones when reading visibility", () => {
+  it("isModelHiddenFn reads hidden compatibility overrides", () => {
     const customMap = buildCompatMap([]);
-    const overrideMap = buildCompatMap([
-      { id: "gpt-4o-2024-11-20", isHidden: true, isDeleted: true },
-      { id: "gpt-5-mini", isHidden: true },
-    ]);
+    const overrideMap = buildCompatMap([{ id: "gpt-5-mini", isHidden: true }]);
 
-    expect(isModelHiddenFn("gpt-4o-2024-11-20", customMap, overrideMap)).toBe(false);
     expect(isModelHiddenFn("gpt-5-mini", customMap, overrideMap)).toBe(true);
   });
 
@@ -224,6 +220,68 @@ describe("PassthroughModelRow — render smoke test", () => {
     });
 
     expect(container.textContent).toContain("openrouter/some-model");
+  });
+});
+
+describe("PassthroughModelsSection — catalog model fallback", () => {
+  let container: HTMLElement;
+  let root: ReturnType<typeof createRoot>;
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(() => {
+    act(() => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
+  it("renders built-in catalog models even when no models were imported", async () => {
+    const { default: PassthroughModelsSection } =
+      await import("../components/PassthroughModelsSection");
+
+    await act(async () => {
+      root.render(
+        <PassthroughModelsSection
+          providerAlias="synthetic"
+          providerId="synthetic"
+          connectionId=""
+          modelAliases={{}}
+          catalogModels={[
+            {
+              id: "hf:zai-org/GLM-5.2",
+              name: "zai-org/GLM-5.2",
+              aliases: ["syn:large:text"],
+            },
+          ]}
+          availableModels={[]}
+          customModels={[]}
+          description="Synthetic accepts provider-native model IDs."
+          inputLabel="Model ID"
+          inputPlaceholder="hf:zai-org/GLM-5.2"
+          copied={undefined}
+          onCopy={vi.fn()}
+          onSetAlias={vi.fn().mockResolvedValue(undefined)}
+          onDeleteAlias={vi.fn()}
+          t={(k) => k}
+          effectiveModelNormalize={() => false}
+          effectiveModelPreserveDeveloper={() => true}
+          getUpstreamHeadersRecord={() => ({})}
+          saveModelCompatFlags={vi.fn().mockResolvedValue(undefined)}
+          isModelHidden={() => false}
+          onToggleHidden={vi.fn().mockResolvedValue(undefined)}
+          onBulkToggleHidden={vi.fn().mockResolvedValue(undefined)}
+        />
+      );
+    });
+
+    expect(container.textContent).toContain("synthetic/syn:large:text");
+    expect(container.textContent).toContain("syn:large:text");
+    expect(container.textContent).toContain("Built-in");
   });
 });
 

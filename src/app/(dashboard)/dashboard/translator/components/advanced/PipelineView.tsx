@@ -24,52 +24,53 @@ export interface PipelineViewProps extends Omit<AdvancedAccordionProps, "slug"> 
 }
 
 /** Default demo steps shown when no real pipeline is running. */
-const DEMO_STEPS: PipelineStep[] = [
+const DEMO_STEP_CONTENT: Array<
+  Pick<PipelineStep, "id" | "format" | "content" | "status"> & { translationKey: string }
+> = [
   {
     id: "1",
-    name: "Client Request",
-    description: "Request received in client format",
+    translationKey: "pipelineStepClientRequest",
     format: "claude",
-    content: '{\n  "model": "claude-sonnet-4-20250514",\n  "messages": [\n    { "role": "user", "content": "Hello!" }\n  ]\n}',
+    content:
+      '{\n  "model": "claude-sonnet-4-20250514",\n  "messages": [\n    { "role": "user", "content": "Hello!" }\n  ]\n}',
     status: "done",
   },
   {
     id: "2",
-    name: "Format Detected",
-    description: "Auto-detected source format",
+    translationKey: "pipelineStepFormatDetected",
     format: "claude",
     content: '{\n  "detectedFormat": "claude",\n  "confidence": "high"\n}',
     status: "done",
   },
   {
     id: "3",
-    name: "OpenAI Intermediate",
-    description: "Translated to OpenAI hub format",
+    translationKey: "pipelineStepOpenAIIntermediate",
     format: "openai",
-    content: '{\n  "model": "claude-sonnet-4-20250514",\n  "messages": [\n    { "role": "user", "content": "Hello!" }\n  ],\n  "stream": true\n}',
+    content:
+      '{\n  "model": "claude-sonnet-4-20250514",\n  "messages": [\n    { "role": "user", "content": "Hello!" }\n  ],\n  "stream": true\n}',
     status: "pending",
   },
   {
     id: "4",
-    name: "Provider Format",
-    description: "Translated to provider target format",
+    translationKey: "pipelineStepProviderFormat",
     format: "gemini",
-    content: '{\n  "model": "gemini-2.5-flash",\n  "contents": [\n    { "role": "user", "parts": [{ "text": "Hello!" }] }\n  ]\n}',
+    content:
+      '{\n  "model": "gemini-2.5-flash",\n  "contents": [\n    { "role": "user", "parts": [{ "text": "Hello!" }] }\n  ]\n}',
     status: "pending",
   },
   {
     id: "5",
-    name: "Provider Response",
-    description: "Streaming response from provider",
+    translationKey: "pipelineStepProviderResponse",
     format: "openai",
-    content: "data: {\"choices\":[{\"delta\":{\"content\":\"Hello! How can I help you today?\"}}]}\ndata: [DONE]",
+    content:
+      'data: {"choices":[{"delta":{"content":"Hello! How can I help you today?"}}]}\ndata: [DONE]',
     status: "pending",
   },
 ];
 
 /** Maps step status to badge variant. */
 function statusVariant(
-  status: PipelineStep["status"],
+  status: PipelineStep["status"]
 ): "default" | "primary" | "success" | "error" | "warning" | "info" {
   switch (status) {
     case "active":
@@ -130,10 +131,12 @@ export default function PipelineView({
 
   // Sync forceOpen changes from parent after mount.
   useEffect(() => {
-    if (forceOpen && !open) {
+    if (!forceOpen || open) return;
+    const openFromDeepLink = setTimeout(() => {
       setOpen(true);
       setHasOpened(true);
-    }
+    }, 0);
+    return () => clearTimeout(openFromDeepLink);
   }, [forceOpen, open]);
 
   const handleOpenChange = useCallback(
@@ -142,10 +145,16 @@ export default function PipelineView({
       if (next) setHasOpened(true);
       onOpenChange?.(next);
     },
-    [onOpenChange],
+    [onOpenChange]
   );
 
-  const steps = pipelineSteps ?? DEMO_STEPS;
+  const steps =
+    pipelineSteps ??
+    DEMO_STEP_CONTENT.map((step) => ({
+      ...step,
+      name: t(step.translationKey as Parameters<typeof t>[0]),
+      description: t(`${step.translationKey}Desc` as Parameters<typeof t>[0]),
+    }));
 
   const tr = (key: string, fallback: string): string => {
     try {
@@ -181,23 +190,24 @@ export default function PipelineView({
             {/* Demo badge when showing placeholder data */}
             {!pipelineSteps && (
               <div className="flex items-center gap-2 text-xs text-text-muted px-1">
-                <span
-                  className="material-symbols-outlined text-[14px]"
-                  aria-hidden="true"
-                >
+                <span className="material-symbols-outlined text-[14px]" aria-hidden="true">
                   info
                 </span>
                 <span>
                   {tr(
                     "pipelineVisualizationHint",
-                    "Envie um request pelo Chat Tester para ver o pipeline em tempo real. Abaixo: exemplo estático.",
+                    "Envie um request pelo Chat Tester para ver o pipeline em tempo real. Abaixo: exemplo estático."
                   )}
                 </span>
               </div>
             )}
 
             {/* Step list */}
-            <div className="space-y-1" role="list" aria-label="Pipeline steps">
+            <div
+              className="space-y-1"
+              role="list"
+              aria-label={tr("pipelineStepsAria", "Pipeline steps")}
+            >
               {steps.map((step, i) => {
                 const meta = (step.format && FORMAT_META[step.format]) ?? {
                   label: step.format ?? "unknown",

@@ -11,6 +11,7 @@
 
 import { spawn, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
+import { hasRegisteredAgent } from "./registry";
 
 export interface AcpSession {
   /** Unique session ID */
@@ -47,10 +48,17 @@ export class AcpManager extends EventEmitter {
     args: string[] = [],
     env: Record<string, string> = {}
   ): AcpSession {
-    const ALLOWED_AGENTS = ["claude", "codex", "gemini", "qwen"];
-    if (!ALLOWED_AGENTS.includes(agentId)) {
+    const normalizedAgentId = String(agentId || "")
+      .trim()
+      .toLowerCase();
+    if (!hasRegisteredAgent(normalizedAgentId)) {
       throw new Error(`Unknown agent: ${agentId}`);
     }
+
+    // Keep session ids and telemetry stable when a caller uses a registry
+    // alias/custom spelling. The registry remains the source of truth for
+    // which ACP-capable IDs may be spawned.
+    agentId = normalizedAgentId;
 
     const sessionId = `acp-${agentId}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
 

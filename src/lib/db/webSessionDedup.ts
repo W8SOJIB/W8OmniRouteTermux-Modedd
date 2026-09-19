@@ -55,3 +55,43 @@ export function parseProviderSpecificData(raw: unknown): Record<string, unknown>
   }
   return null;
 }
+
+/** Trimmed non-empty string, else null — local to avoid a cross-module import for one coercion. */
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+/**
+ * Two-sided disambiguator match: `true` when both sides agree, `false` when
+ * both carry a value and it differs, `undefined` when the field can't decide
+ * (at most one side carries it) — the caller then defers to other fields.
+ */
+function fieldMatch(incoming: string | null, existing: string | null): boolean | undefined {
+  if (incoming && existing) return incoming === existing;
+  if (incoming || existing) return false;
+  return undefined;
+}
+
+/**
+ * Decide whether `row` (an existing `provider_connections` record) is the
+ * same OAuth identity as an incoming connection carrying `incomingUsername`
+ * and `incomingProfileArn` (#10815).
+ *
+ * Two independent disambiguators, either of which can prove "different
+ * account": `providerSpecificData.username` (Raycast-style IdP dedup) and
+ * `providerSpecificData.profileArn` (Kiro/AWS profile dedup — Kiro never
+ * sets `username`). A field only rules a match IN/OUT when both the
+ * incoming and existing record carry it; when neither carries either field
+ * the legacy bare-email match still applies unchanged.
+ */
+export function isMatchingOauthIdentity(
+  row: { provider_specific_data?: unknown },
+  incomingUsername: string | null,
+  incomingProfileArn: string | null
+): boolean {
+  const existingPsd = parseProviderSpecificData(row.provider_specific_data);
+  const usernameMatch = fieldMatch(incomingUsername, nonEmptyString(existingPsd?.username));
+  const profileArnMatch = fieldMatch(incomingProfileArn, nonEmptyString(existingPsd?.profileArn));
+  if (usernameMatch === false || profileArnMatch === false) return false;
+  return true;
+}

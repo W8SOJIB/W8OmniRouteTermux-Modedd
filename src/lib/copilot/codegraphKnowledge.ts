@@ -11,6 +11,7 @@
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isNextBuildPhase } from "../buildPhase";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -36,8 +37,17 @@ export interface CodeGraphNode {
 // ---------------------------------------------------------------------------
 
 let _db: unknown = null;
+let dbPathOverride: string | null | undefined;
+
+/** Override the index path for deterministic tests and embedded callers. */
+export function setCodeGraphPathForTest(path: string | null | undefined): void {
+  dbPathOverride = path;
+  _db = null;
+}
 
 function getDbPath(): string | null {
+  if (dbPathOverride !== undefined) return dbPathOverride;
+
   // Try project root first (dev), then cwd, then DATA_DIR
   const candidates = [
     join(process.cwd(), ".codegraph", "codegraph.db"),
@@ -83,6 +93,12 @@ function queryDb(query: string, params: unknown[] = []): CodeGraphQueryResult {
 
       // Use better-sqlite3 if available
       try {
+        // Never load the native better-sqlite3 addon during the Next.js build:
+        // its Statement destructor aborts with SIGABRT at build-worker teardown
+        // (node::RemoveEnvironmentCleanupHook). This path is not exercised during
+        // build, so failing closed to "not available" is safe. (#10060)
+        if (isNextBuildPhase()) throw new Error("Skip better-sqlite3 during build");
+
         const Database = require("better-sqlite3");
         _db = new Database(dbPath, { readonly: true });
       } catch {

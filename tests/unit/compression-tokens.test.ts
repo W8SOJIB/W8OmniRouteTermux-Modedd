@@ -93,6 +93,6 @@ test("tokensCompressed round-trips through saveCallLog → getCallLogs", async (
     assert.equal(logComp.tokens?.in, 1000);
     assert.equal(logComp.tokens?.out, 500);
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });

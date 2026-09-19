@@ -23,6 +23,7 @@ export const NAMED_OPENAI_STYLE_PROVIDERS = new Set([
   "openadapter",
   "dit",
   "tokenrouter",
+  "token-kiosk",
   // provider-model-sweep (2026-06-19): same class as #3976/#4202/#4249 — keyed
   // openai-style providers with a real live `<baseUrl>/models` catalog, served
   // their small hardcoded seed because unclassified. Seed stays as offline fallback.
@@ -42,6 +43,7 @@ export const NAMED_OPENAI_STYLE_PROVIDERS = new Set([
   "ovhcloud",
   "sambanova",
   "orcarouter",
+  "unorouter",
   "uncloseai",
   "opencode-go",
   "baseten",
@@ -64,6 +66,40 @@ export const NAMED_OPENAI_STYLE_PROVIDERS = new Set([
   // it proxies many upstream models (DeepSeek, Claude, Kimi...) behind one key, so the
   // full catalog is discovered live from https://api.qnaigc.com/v1/models.
   "qiniu",
+  // OpenVecta (https://openvecta.com/) is an OpenAI-compatible AI inference gateway
+  // hosting LLMs (GLM, Claude, DeepSeek, GPT OSS, Llama, Kimi, Nemotron…) plus
+  // text-embedding-* models behind a single Bearer key. The full catalog is
+  // discovered live from https://api.openvecta.com/v1/models; the registry seed
+  // (registry/openvecta) covers the most-used LLMs as the offline fallback.
+  "openvecta",
+  // Openference (https://openference.com/) — OAuth JWT or API key on the same
+  // OpenAI-compatible gateway. Live catalog from api.openference.com/v1/models.
+  "openference",
+  "openference-api",
+  // Typhoon (SCB 10X, Thailand) and Inception Labs (Mercury diffusion models) are
+  // OpenAI-compatible providers whose /v1/models endpoint exists and is used for
+  // catalog discovery/key validation (verified 2026-07-22).
+  "typhoon",
+  "inception",
+  // Sarvam AI (India), Writer Palmyra, and PLaMo (Preferred Networks, Japan) are
+  // OpenAI-compatible providers whose /v1/models endpoint exists and is used for
+  // catalog discovery/key validation (verified 2026-07-22).
+  "sarvam",
+  "writer",
+  "plamo",
+  // frontier-providers-tier1 sweep: clova-studio, internlm, ant-ling each carry a
+  // live `<baseUrl>/models` endpoint confirmed 401 (exists + keyed) by curl smoke
+  // test. Live fetch keeps their catalogs fresh; the registry seed remains the
+  // offline fallback.
+  "clova-studio",
+  "internlm",
+  "ant-ling",
+  "nanogpt",
+  // Logfare (https://logfare.ai) — free OpenAI-compatible gateway live-verified
+  // 2026-08-21: GET https://logfare.ai/v1/models returns a real 20-model catalog
+  // (11 chat-capable). Live fetch keeps it fresh; the registry seed stays as the
+  // offline fallback.
+  "logfare",
 ]);
 
 export function isNamedOpenAIStyleProvider(provider: string): boolean {

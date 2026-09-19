@@ -87,6 +87,10 @@ describe("GLM Coding provider registry surfaces", () => {
     expect(PROVIDER_ID_TO_ALIAS.glm).toBe("glm");
     expect(byProviderId).toEqual(byAlias);
     expect(byProviderId.map((model) => model.id)).toEqual([
+      "glm-5.3",
+      "glm-5.3-high",
+      "glm-5.3-low",
+      "glm-5.3-max",
       "glm-5.2",
       "glm-5.2-high",
       "glm-5.2-max",
@@ -101,6 +105,30 @@ describe("GLM Coding provider registry surfaces", () => {
       "glm-4.5",
       "glm-4.5-air",
     ]);
+  });
+
+  it("declares exact GLM reasoning-effort tiers across every shared GLM provider", () => {
+    const routedTiers = new Map<string, readonly string[]>([
+      ["glm-5.3", ["low", "high", "max"]],
+      ["glm-5.3-high", ["high"]],
+      ["glm-5.3-low", ["low"]],
+      ["glm-5.3-max", ["max"]],
+      ["glm-5.2", ["high", "max"]],
+      ["glm-5.2-high", ["high"]],
+      ["glm-5.2-max", ["max"]],
+    ]);
+
+    for (const provider of ["glm", "glm-cn", "glmt"]) {
+      for (const model of getModelsByProviderId(provider)) {
+        expect(model.supportedThinkingEfforts, `${provider}/${model.id} effort tiers`).toEqual(
+          routedTiers.get(model.id) ?? []
+        );
+      }
+    }
+
+    for (const model of getModelsByProviderId("zcode")) {
+      expect(model.supportedThinkingEfforts, `zcode/${model.id} effort tiers`).toEqual([]);
+    }
   });
 
   it("registers GLM-5.2 with correct specs and effort tier aliases", () => {

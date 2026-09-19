@@ -14,6 +14,7 @@ interface EmptyConnectionsPlaceholderProps {
   isCompatible: boolean;
   isCommandCode: boolean;
   providerId: string;
+  supportsDualAuth: boolean;
   providerSupportsPat: boolean;
   commandCodeAuthState: CommandCodeAuthState;
   gateConnectionFlow: (callback: () => void) => void;
@@ -33,6 +34,7 @@ export default function EmptyConnectionsPlaceholder({
   isCompatible,
   isCommandCode,
   providerId,
+  supportsDualAuth,
   providerSupportsPat,
   commandCodeAuthState,
   gateConnectionFlow,
@@ -55,16 +57,21 @@ export default function EmptyConnectionsPlaceholder({
       <p className="text-sm text-text-muted mb-4">{t("addFirstConnectionHint")}</p>
       {!isCompatible && (
         <div className="flex items-center justify-center gap-2">
-          {isCommandCode ? (
+          {isCommandCode || supportsDualAuth ? (
             <>
               <Button
                 icon="open_in_new"
                 loading={
-                  commandCodeAuthState.phase === "starting" ||
-                  commandCodeAuthState.phase === "polling" ||
-                  commandCodeAuthState.phase === "applying"
+                  isCommandCode &&
+                  (commandCodeAuthState.phase === "starting" ||
+                    commandCodeAuthState.phase === "polling" ||
+                    commandCodeAuthState.phase === "applying")
                 }
-                onClick={() => gateConnectionFlow(handleOpenCommandCodeConnect)}
+                onClick={() =>
+                  gateConnectionFlow(
+                    isCommandCode ? handleOpenCommandCodeConnect : openPrimaryAddFlow
+                  )
+                }
               >
                 Connect
               </Button>

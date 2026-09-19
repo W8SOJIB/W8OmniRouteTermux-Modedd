@@ -30,7 +30,7 @@ OmniRoute 常见问题及解决方案。
 | "401 Unauthorized"      | 凭据有误                  | 检查 API 密钥或通过 OAuth 重新认证                                                                |
 | "429 Too Many Requests" | 触发速率限制              | 等待 1 分钟，或接入更多服务商                                                                     |
 
-**还是不行？** 请参阅下方的[详细故障排除](#详细故障排除)，或前往 [Discord](https://discord.gg/EkzRkpzKYt) 提问。
+**还是不行？** 请参阅下方的[详细故障排除](#详细故障排除)，或前往 [Discord](https://discord.gg/U47eFqAXCn) 提问。
 
 ---
 
@@ -381,25 +381,6 @@ curl http://localhost:20128/api/monitoring/health
 ## v3.8.0 已知问题
 
 v3.8.0 版本特有的问题及其当前临时方案。如果后续补丁中得到了修复，对应条目将更新或移除。
-
-### Windsurf OAuth 流程报 401
-
-**症状：**
-
-- 从仪表盘完成 Windsurf OAuth 流程时出现 "401 unauthorized"
-- OAuth 回调后 Windsurf 服务商卡片持续显示"需要重新连接"状态
-
-**原因：**
-
-- `WINDSURF_FIREBASE_API_KEY` 环境变量缺失或为空
-- `WINDSURF_API_KEY` 配置错误或指向了过期的 Token
-- 本地防火墙/代理阻止了 OAuth 回调
-
-**修复：**
-
-1. 验证 `.env` 中已设置 `WINDSURF_FIREBASE_API_KEY` 和 `WINDSURF_API_KEY`
-2. 重启 OmniRoute 使新的环境变量生效
-3. 从 **仪表盘 → Providers → Windsurf → Reconnect** 重新运行 OAuth 流程
 
 ### Devin CLI 认证失败
 

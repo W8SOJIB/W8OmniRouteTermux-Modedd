@@ -2,6 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 
 import { getStainlessTimeoutSeconds } from "@/shared/utils/runtimeTimeouts";
 import { ANTHROPIC_VERSION_HEADER } from "../config/anthropicHeaders.ts";
+import {
+  CLAUDE_CODE_COMPATIBLE_STAINLESS_PACKAGE_VERSION,
+  CLAUDE_CODE_COMPATIBLE_STAINLESS_RUNTIME_VERSION,
+  CLAUDE_CODE_COMPATIBLE_USER_AGENT,
+} from "../config/claudeCodeCompatibleIdentity.ts";
 import { supportsClaudeMaxEffort, supportsXHighEffort } from "../config/providerModels.ts";
 import { prepareClaudeRequest } from "../translator/helpers/claudeHelper.ts";
 import { signRequestBody } from "./claudeCodeCCH.ts";
@@ -16,6 +21,7 @@ import { applyClaudeCodeCompatibleThinkingDisplay } from "./claudeCodeCompatible
 import { obfuscateInBody } from "./claudeCodeObfuscation.ts";
 import { applySystemTransformPipeline, PROVIDER_CC_BRIDGE } from "./systemTransforms.ts";
 import { usesCcWireImage } from "./ccWireImageBuiltins.ts";
+import { collectClaudeMediaBlocks, convertOpenAiMediaBlock } from "./ccOpenAiMediaBlocks.ts";
 import {
   fixToolPairs,
   fixToolAdjacency,
@@ -42,10 +48,7 @@ export {
   CLAUDE_CODE_COMPATIBLE_REDACT_THINKING_BETA,
   resolveClaudeCodeCompatibleAnthropicBeta,
 } from "./claudeCodeCompatibleBeta.ts";
-export const CLAUDE_CODE_COMPATIBLE_VERSION = "2.1.195";
-export const CLAUDE_CODE_COMPATIBLE_USER_AGENT = "claude-cli/2.1.195 (external, sdk-cli)";
-export const CLAUDE_CODE_COMPATIBLE_STAINLESS_PACKAGE_VERSION = "0.94.0";
-export const CLAUDE_CODE_COMPATIBLE_STAINLESS_RUNTIME_VERSION = "v24.3.0";
+export * from "../config/claudeCodeCompatibleIdentity.ts";
 export const CONTEXT_1M_BETA_HEADER = "context-1m-2025-08-07";
 const CLAUDE_CODE_COMPATIBLE_DEFAULT_SYSTEM_BLOCKS = [
   {
@@ -53,17 +56,9 @@ const CLAUDE_CODE_COMPATIBLE_DEFAULT_SYSTEM_BLOCKS = [
     text: "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
   },
 ];
-const CONTEXT_1M_SUPPORTED_MODELS = [
-  "claude-fable-5",
-  "claude-sonnet-5",
-  "claude-opus-4-8",
-  "claude-opus-4-7",
-  "claude-opus-4-6",
-];
 export const CLAUDE_CODE_COMPATIBLE_STAINLESS_TIMEOUT_SECONDS = getStainlessTimeoutSeconds(
   process.env
 );
-
 type HeaderLike =
   | Headers
   | Record<string, string | undefined>
@@ -165,16 +160,9 @@ export function appendAnthropicBetaHeader(
   }
 }
 
-export function modelSupportsContext1mBeta(model: string | null | undefined): boolean {
-  const normalizedModel = String(model || "")
-    .trim()
-    .toLowerCase()
-    .replace(/-\d{8}$/, "");
-
-  return CONTEXT_1M_SUPPORTED_MODELS.some(
-    (supported) => normalizedModel === supported || normalizedModel.startsWith(`${supported}-`)
-  );
-}
+// Re-exported from the shared context1m module so existing importers of this
+// helper (base.ts) keep working; the eligibility list now has one source of truth.
+export { modelSupportsContext1mBeta } from "../config/context1m.ts";
 
 export function buildClaudeCodeCompatibleHeaders(
   apiKey: string,
@@ -516,13 +504,13 @@ function buildClaudeCodeCompatibleMessages(messages: MessageLike[]) {
         message
       ): message is {
         role: "user" | "assistant";
-        content: Array<{ type: string; text: string }>;
+        content: Array<Record<string, unknown>>;
       } => !!message && message.content.length > 0
     );
 
   const merged: Array<{
     role: "user" | "assistant";
-    content: Array<{ type: string; text: string }>;
+    content: Array<Record<string, unknown>>;
   }> = [];
 
   for (const message of converted) {
@@ -718,12 +706,12 @@ function convertClaudeCodeCompatibleMessage(message: MessageLike | null | undefi
   if (!role) return null;
 
   const text = contentToText(message?.content);
-  if (!text) return null;
+  // #7777: keep the user-turn media parts that contentToText() above drops.
+  const media = role === "user" ? collectClaudeMediaBlocks(message?.content) : [];
+  const content = [...(text ? [{ type: "text", text }] : []), ...media];
+  if (content.length === 0) return null;
 
-  return {
-    role,
-    content: [{ type: "text", text }],
-  };
+  return { role, content };
 }
 
 function buildClaudeCodeCompatibleTools(
@@ -976,7 +964,7 @@ function normalizeClaudeContentBlock(block: unknown) {
     };
   }
 
-  return record;
+  return convertOpenAiMediaBlock(record) ?? record;
 }
 
 function convertClaudeCodeCompatibleClaudeMessage(

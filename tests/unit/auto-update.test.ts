@@ -396,7 +396,7 @@ test("launchAutoUpdate returns validation failures and starts detached update sc
     assert.equal(spawnCalls[0].unrefCalled, true);
     assert.match(spawnCalls[0].args[1], /git cherry-pick --keep-redundant-commits 'abc123'/);
   } finally {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -404,7 +404,7 @@ test("resolveProjectRoot walks up from start dir to nearest package.json or .git
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-root-"));
   const subDir = path.join(tempRoot, "sub", "deep");
   fs.mkdirSync(subDir, { recursive: true });
-  fs.writeFileSync(path.join(tempRoot, "package.json"), "{}");
+  fs.writeFileSync(path.join(tempRoot, "package.json"), JSON.stringify({ name: "omniroute" }));
 
   try {
     // Walking up from a deep subdir that does not have markers must find the real root.
@@ -419,6 +419,6 @@ test("resolveProjectRoot walks up from start dir to nearest package.json or .git
     const lonelyResult = autoUpdate.resolveProjectRoot("/my-fallback", lonely);
     assert.equal(lonelyResult, "/my-fallback");
   } finally {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });

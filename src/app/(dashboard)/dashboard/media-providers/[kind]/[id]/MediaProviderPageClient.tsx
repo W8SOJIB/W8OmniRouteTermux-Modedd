@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import Link from "next/link";
 import { useTranslations } from "next-intl";
 import { Button } from "@/shared/components";
 import MediaProviderHeader from "../../components/MediaProviderHeader";
@@ -36,7 +37,14 @@ interface MediaProviderPageClientProps {
   freeNote?: string;
 }
 
-function renderPlayground(kind: MediaKind, providerId: string) {
+function renderPlayground(
+  kind: MediaKind,
+  providerId: string,
+  bridgeCopy: {
+    imageToText: { title: string; description: React.ReactNode; cta: string };
+    sttCta: string;
+  }
+) {
   switch (kind) {
     case "embedding":
       return <EmbeddingExampleCard providerId={providerId} />;
@@ -45,7 +53,17 @@ function renderPlayground(kind: MediaKind, providerId: string) {
     case "tts":
       return <TtsExampleCard providerId={providerId} />;
     case "stt":
-      return <SttExampleCard providerId={providerId} />;
+      return (
+        <div className="flex flex-col gap-3">
+          <SttExampleCard providerId={providerId} />
+          <Link
+            href="/dashboard/settings/modality-bridge?tab=audio"
+            className="text-xs text-primary hover:underline"
+          >
+            {bridgeCopy.sttCta}
+          </Link>
+        </div>
+      );
     case "webSearch":
       return <WebSearchExampleCard providerId={providerId} />;
     case "webFetch":
@@ -62,15 +80,15 @@ function renderPlayground(kind: MediaKind, providerId: string) {
         <div className="flex flex-col gap-2 border border-dashed border-border rounded-xl p-6">
           <div className="flex items-center gap-2 text-text-muted">
             <span className="material-symbols-outlined text-[20px]">image_search</span>
-            <h3 className="text-sm font-medium">Image to Text</h3>
+            <h3 className="text-sm font-medium">{bridgeCopy.imageToText.title}</h3>
           </div>
-          <p className="text-xs text-text-muted">
-            Inline playground for Image-to-Text will be available when{" "}
-            <code className="font-mono bg-bg-subtle px-1 rounded">
-              /api/v1/images/understanding
-            </code>{" "}
-            is implemented.
-          </p>
+          <p className="text-xs text-text-muted">{bridgeCopy.imageToText.description}</p>
+          <Link
+            href="/dashboard/settings/modality-bridge?tab=vision"
+            className="text-xs text-primary hover:underline"
+          >
+            {bridgeCopy.imageToText.cta}
+          </Link>
         </div>
       );
     default:
@@ -117,6 +135,14 @@ export default function MediaProviderPageClient({
 
   return (
     <div className="flex flex-col gap-6">
+      {activeKind === "stt" && providerId === "openrouter" && (
+        <div className="text-xs text-text-muted border border-border rounded-lg p-3 flex items-start gap-2">
+          <span className="material-symbols-outlined text-[16px] text-blue-500 mt-0.5">info</span>
+          <span>
+            <strong>{t("existingConnection")}:</strong> {t("openrouterSttDescription")}
+          </span>
+        </div>
+      )}
       <MediaProviderHeader
         providerId={providerId}
         providerName={providerName}
@@ -179,7 +205,7 @@ export default function MediaProviderPageClient({
                 <span className="text-sm font-medium flex-1 truncate">{conn.name ?? conn.id}</span>
                 {conn.isActive === false && (
                   <span className="text-[10px] px-1.5 py-0.5 rounded bg-bg-subtle border border-border text-text-muted">
-                    disabled
+                    {t("disabled")}
                   </span>
                 )}
               </div>
@@ -189,7 +215,16 @@ export default function MediaProviderPageClient({
       </div>
 
       {/* Playground */}
-      {renderPlayground(activeKind, providerId)}
+      {renderPlayground(activeKind, providerId, {
+        imageToText: {
+          title: t("imageToText"),
+          description: t.rich("imageToTextBridgeAvailable", {
+            code: (chunks) => <code className="rounded bg-bg-subtle px-1 font-mono">{chunks}</code>,
+          }),
+          cta: t("imageToTextBridgeCta"),
+        },
+        sttCta: t("sttBridgeCta"),
+      })}
     </div>
   );
 }

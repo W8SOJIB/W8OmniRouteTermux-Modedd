@@ -47,8 +47,19 @@ test("rate-limited / timeout failures show 'error' but are NOT auto-hidden", () 
     status: "error",
     shouldHide: false,
   });
+  assert.deepEqual(evaluateTestAllEntry({ status: "error", isTransient: true }, true), {
+    status: "error",
+    shouldHide: false,
+  });
   // Toggle off → still not hidden, of course.
   assert.deepEqual(evaluateTestAllEntry({ status: "error", rateLimited: true }, false), {
+    status: "error",
+    shouldHide: false,
+  });
+});
+
+test("slow batch probes remain visible and unconfirmed", () => {
+  assert.deepEqual(evaluateTestAllEntry({ status: "slow", isTimeout: true }, true), {
     status: "error",
     shouldHide: false,
   });
@@ -60,4 +71,42 @@ test("missing / null / empty entry is treated as a failure", () => {
     assert.equal(out.status, "error", `entry=${JSON.stringify(entry)} → error`);
     assert.equal(out.shouldHide, true);
   }
+});
+
+// ---------------------------------------------------------------------------
+// #9511 — isQuota errors are NOT auto-hidden (quota-exhausted / insufficient_balance)
+// ---------------------------------------------------------------------------
+
+test("quota-exhausted entry is NOT auto-hidden even when autoHideFailed is on", () => {
+  // Credits-exhausted (terminal) — isQuota but NOT isTransient
+  assert.deepEqual(evaluateTestAllEntry({ status: "error", isQuota: true }, true), {
+    status: "error",
+    isQuota: true,
+    shouldHide: false,
+  });
+  // Daily-quota (transient) — isQuota + isTransient
+  assert.deepEqual(
+    evaluateTestAllEntry({ status: "error", isQuota: true, isTransient: true }, true),
+    {
+      status: "error",
+      isQuota: true,
+      shouldHide: false,
+    }
+  );
+});
+
+test("quota-exhausted entry with autoHideFailed off is also not hidden", () => {
+  assert.deepEqual(evaluateTestAllEntry({ status: "error", isQuota: true }, false), {
+    status: "error",
+    isQuota: true,
+    shouldHide: false,
+  });
+});
+
+test("regression: non-quota error is still auto-hidden when autoHideFailed is on", () => {
+  // A plain error without isQuota/isTransient/rateLimited/isTimeout should still hide
+  assert.deepEqual(evaluateTestAllEntry({ status: "error" }, true), {
+    status: "error",
+    shouldHide: true,
+  });
 });

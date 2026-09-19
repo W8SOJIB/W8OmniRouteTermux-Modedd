@@ -14,7 +14,6 @@ import {
 } from "@/shared/constants/upstreamHeaders";
 import { MAX_TIMER_TIMEOUT_MS } from "@/shared/utils/runtimeTimeouts";
 
-
 export function isHttpUrl(value: string): boolean {
   try {
     const parsed = new URL(value);
@@ -24,7 +23,14 @@ export function isHttpUrl(value: string): boolean {
   }
 }
 
-export const CODEX_REASONING_EFFORT_VALUES = new Set(["none", "low", "medium", "high", "xhigh"]);
+export const CODEX_REASONING_EFFORT_VALUES = new Set([
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
 
 export const REQUEST_DEFAULT_SERVICE_TIER_VALUES = new Set(["default", "priority", "fast", "flex"]);
 
@@ -102,7 +108,7 @@ export const resetStatsActionSchema = z.object({
   action: z.literal("reset-stats"),
 });
 
-export const ipFilterModeSchema = z.enum(["blacklist", "whitelist"]);
+export const ipFilterModeSchema = z.enum(["blacklist", "whitelist", "whitelist-priority"]);
 
 export const tempBanSchema = z.object({
   ip: z.string().trim().min(1),
@@ -201,3 +207,8 @@ export const confirmedAccountSchema = z.object({
 });
 
 export type ConfirmedAccount = z.infer<typeof confirmedAccountSchema>;
+
+export const paginationSchema = z.object({
+  offset: z.coerce.number().int().min(0).optional(),
+  limit: z.coerce.number().int().min(0).max(200).optional(),
+});

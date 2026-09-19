@@ -17,12 +17,55 @@ export const GPT_5_5_PRICING = {
   cache_creation: 5.0,
 };
 
+export const GPT_5_6_SOL_PRICING = {
+  input: 5.0,
+  output: 30.0,
+  cached: 0.5,
+  reasoning: 30.0,
+  cache_creation: 6.25,
+};
+
+export const GPT_5_6_TERRA_PRICING = {
+  input: 2.5,
+  output: 15.0,
+  cached: 0.25,
+  reasoning: 15.0,
+  cache_creation: 3.125,
+};
+
+export const GPT_5_6_LUNA_PRICING = {
+  input: 1.0,
+  output: 6.0,
+  cached: 0.1,
+  reasoning: 6.0,
+  cache_creation: 1.25,
+};
+
+// Gemini 3.7 Flash introductory pricing through 2026-12-31. Google and
+// GitHub Copilot both publish the same current token rates; standard pricing
+// becomes $1.50/$7.50/$0.15 (input/output/cached input) on 2027-01-01.
+export const GEMINI_3_7_FLASH_PROMO_PRICING = {
+  input: 0.75,
+  output: 3.75,
+  cached: 0.075,
+  reasoning: 3.75,
+  cache_creation: 0.75,
+};
+
 export const CLAUDE_FABLE_5_PRICING = {
   input: 15.0,
   output: 75.0,
   cached: 7.5,
   reasoning: 112.5,
   cache_creation: 15.0,
+};
+
+export const CLAUDE_OPUS_5_PRICING = {
+  input: 5.0,
+  output: 25.0,
+  cached: 0.5,
+  reasoning: 25.0,
+  cache_creation: 6.25,
 };
 
 export const CLAUDE_OPUS_4_PRICING = {
@@ -68,6 +111,37 @@ export const CLAUDE_SONNET_5_PRICING = {
 };
 
 export const GLM_PRICING = {
+  // GLM-5.3 (2026-08-14): Z.ai hasn't published 5.3 rates yet — mirrored from
+  // GLM-5.2 (same base model; 5.1 and 5.2 also share identical rates).
+  // Correct when https://docs.z.ai/guides/overview/pricing lists glm-5.3.
+  "glm-5.3": {
+    input: 1.2,
+    output: 5,
+    cached: 0.3,
+    reasoning: 5,
+    cache_creation: 1.2,
+  },
+  "glm-5.3-high": {
+    input: 1.2,
+    output: 5,
+    cached: 0.3,
+    reasoning: 5,
+    cache_creation: 1.2,
+  },
+  "glm-5.3-low": {
+    input: 1.2,
+    output: 5,
+    cached: 0.3,
+    reasoning: 5,
+    cache_creation: 1.2,
+  },
+  "glm-5.3-max": {
+    input: 1.2,
+    output: 5,
+    cached: 0.3,
+    reasoning: 5,
+    cache_creation: 1.2,
+  },
   "glm-5.2": {
     input: 1.2,
     output: 5,

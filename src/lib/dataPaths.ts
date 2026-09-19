@@ -83,11 +83,53 @@ export function resolveDataDir({ isCloud = false }: { isCloud?: boolean } = {}):
  * Use this only at the single startup site that owns directory creation
  * (currently `db/core.ts`); everywhere else keep using the pure resolver.
  */
+/**
+ * #10428: true when this process looks like a test run rather than a server start.
+ *
+ * `NODE_TEST_CONTEXT` is set by `node --test` in every spawned test process, `VITEST` by
+ * vitest, and `NODE_ENV=test` by the npm scripts — between them they cover both runners
+ * plus the AGENTS.md single-file command, which does NOT load
+ * `tests/_setup/isolateDataDir.ts`.
+ */
+function isTestContext(): boolean {
+  return (
+    process.env.NODE_ENV === "test" ||
+    !!process.env.VITEST ||
+    !!process.env.NODE_TEST_CONTEXT ||
+    process.execArgv.includes("--test") ||
+    process.argv.includes("--test")
+  );
+}
+
+/** Process-wide redirect target, so repeated calls share one DB instead of one per call. */
+let testContextDataDir: string | null = null;
+
 export function resolveWritableDataDir({ isCloud = false }: { isCloud?: boolean } = {}): string {
   const resolved = resolveDataDir({ isCloud });
 
   // Cloud/serverless never owns a writable home dir; leave its sentinel alone.
   if (isCloud) return resolved;
+
+  // #10428: a test/ad-hoc run that never chose a DATA_DIR would otherwise open the
+  // OPERATOR'S REAL database (~/.omniroute/storage.sqlite — live provider credentials).
+  // Redirect to a throwaway dir instead of throwing: the documented single-file command
+  // (`node --import tsx/esm --test tests/unit/x.test.ts`) does not load the isolation
+  // setup, and a hard failure there would only teach people to disable the guard.
+  // `OMNIROUTE_ALLOW_DEFAULT_DATA_DIR=1` opts back in, so the intent is recorded.
+  if (
+    !process.env.DATA_DIR &&
+    isTestContext() &&
+    process.env.OMNIROUTE_ALLOW_DEFAULT_DATA_DIR !== "1"
+  ) {
+    if (!testContextDataDir) {
+      testContextDataDir = fs.mkdtempSync(path.join(os.tmpdir(), `${APP_NAME}-testctx-`));
+      console.warn(
+        `[DATA_DIR] test context without DATA_DIR → using '${testContextDataDir}' instead of ` +
+          `'${resolved}'. Set DATA_DIR explicitly (or load tests/_setup/isolateDataDir.ts) to silence this.`
+      );
+    }
+    return testContextDataDir;
+  }
 
   // No explicit override → already the default user dir; nothing to fall back to.
   const configured = normalizeConfiguredPath(process.env.DATA_DIR);

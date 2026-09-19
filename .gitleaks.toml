@@ -74,3 +74,27 @@
 #       '''tests/unit/''',
 #     ]
 #
+
+[[rules]]
+  # Falsos-positivos comprovados do generic-api-key — zerados em 2026-07-13 (WS6/D3,
+  # plano v3.8.49). Revisar em v3.9.0. Nenhum é credencial: dois são NOMES DE CAMPO
+  # de métricas de latência; o terceiro é o valor PÚBLICO de um beta header da API
+  # da Anthropic (documentado publicamente, não é segredo).
+  id = "generic-api-key"
+  [rules.allowlist]
+    description = "Field names + public Anthropic beta-header value (não são segredos)"
+    regexes = [
+      '''latencyP\d{2}Ms''',
+      '''interleaved-thinking-2025-05-14''',
+      # v3.8.49 pre-flight (2026-07-28). Nenhum dos dois e credencial:
+      # - chave de localStorage do banner de patrocinio (#8723; #10200 bumpou v1->v2,
+      #   generalizado para -v\d+ no round 3 de base-reds #9985), so um identificador de UI;
+      # - x-api-key PUBLICO do Firefly web (documentado em open-sse/utils/publicCreds.ts:207);
+      #   as duas ocorrencias sinalizadas estao em COMENTARIOS JSDoc, o runtime le de resolvePublicCred().
+      '''omniroute-kimi-sponsor-banner-dismissed-v\d+''',
+      # CheaperInference sponsor banner localStorage key (upstream #11196 /
+      # eb5797370). Same UI-identifier pattern as the kimi banner above, not a
+      # credential; the generic-api-key rule flags the long hyphenated string.
+      '''omniroute-cheaperinference-sponsor-banner-dismissed-v\d+''',
+      '''SunbreakWebUI1''',
+    ]

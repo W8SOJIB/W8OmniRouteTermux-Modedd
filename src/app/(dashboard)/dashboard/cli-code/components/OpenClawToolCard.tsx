@@ -94,7 +94,9 @@ export default function OpenClawToolCard({
         }
         // (#523) Keys from /api/keys are masked (first 8 + "****" + last 4).
         // Match by prefix/suffix instead of exact comparison.
-        if (provider.apiKey) {
+        // apiKey may be a structured secret reference (object) rather than a
+        // plaintext string, e.g. OpenClaw SecretRefs. Only match on strings.
+        if (typeof provider.apiKey === "string" && provider.apiKey) {
           const fileKeyPrefix = provider.apiKey.slice(0, 8);
           const fileKeySuffix = provider.apiKey.slice(-4);
           const matchedKey = apiKeys?.find(
@@ -282,7 +284,7 @@ export default function OpenClawToolCard({
         <div className="flex items-center gap-3">
           <div className="size-8 flex items-center justify-center shrink-0">
             <Image
-              src="/providers/openclaw.png"
+              src="/providers/openclaw.svg"
               alt={tool.name}
               width={32}
               height={32}
@@ -345,11 +347,7 @@ export default function OpenClawToolCard({
                 deployments where the CLI lives on the user's machine,
                 not on the server. Upstream report: #579.
               */}
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setShowManualConfigModal(true)}
-              >
+              <Button variant="ghost" size="sm" onClick={() => setShowManualConfigModal(true)}>
                 <span className="material-symbols-outlined text-[14px] mr-1">content_copy</span>
                 {t("manualConfig")}
               </Button>

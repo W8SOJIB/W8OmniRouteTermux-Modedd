@@ -4,6 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { useDecollidedMigrationsDir } from "./helpers/decollidedMigrationsDir.ts";
+
+useDecollidedMigrationsDir();
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-calllogs-artifacts-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
 process.env.CALL_LOG_RETENTION_DAYS = "3650";
@@ -18,7 +21,7 @@ const providersDb = await import("../../src/lib/db/providers.ts");
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -85,7 +88,7 @@ test.beforeEach(async () => {
 test.after(() => {
   restorePipelineEnv();
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("saveCallLog stores only summary metadata in SQLite and writes detailed artifact", async () => {
@@ -163,7 +166,10 @@ test("saveCallLog stores only summary metadata in SQLite and writes detailed art
   assert.equal(typeof (summaryRow as any).artifact_relpath, "string");
 
   const artifactPath = path.join(TEST_DATA_DIR, "call_logs", detail.artifactRelPath);
-  const artifact = JSON.parse(fs.readFileSync(artifactPath, "utf8"));
+  const serializedArtifact = fs.readFileSync(artifactPath, "utf8");
+  const artifact = JSON.parse(serializedArtifact);
+  assert.equal(Buffer.byteLength(serializedArtifact), detail.artifactSizeBytes);
+  assert.match(detail.artifactSha256 || "", /^[0-9a-f]{8}$/);
   assert.equal(artifact.summary.id, logId);
   assert.equal(artifact.summary.requestedModel, "openai/gpt-5");
   assert.equal(artifact.summary.comboExecutionKey, "combo-a:0:step-openai-a");

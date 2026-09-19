@@ -5,7 +5,7 @@ import {
 } from "@/lib/localDb";
 import { AGY_CONFIG } from "@/lib/oauth/constants/oauth";
 import {
-  getAntigravityHeaders,
+  getAntigravityContentHeaders,
   getAntigravityLoadCodeAssistMetadata,
 } from "@omniroute/open-sse/services/antigravityHeaders.ts";
 import { extractCodeAssistOnboardTierId } from "@omniroute/open-sse/services/codeAssistSubscription.ts";
@@ -140,7 +140,7 @@ export async function enrichWithAntigravityBackend(
   const loadController = new AbortController();
   const loadTimer = setTimeout(() => loadController.abort(), 8000);
   try {
-    const headers = getAntigravityHeaders("loadCodeAssist", parsed.accessToken);
+    const headers = getAntigravityContentHeaders("cli", parsed.accessToken);
     const metadata = getAntigravityLoadCodeAssistMetadata();
     for (const endpoint of AGY_CONFIG.loadCodeAssistEndpoints) {
       try {
@@ -214,8 +214,10 @@ export async function createConnectionFromAgyToken(
           resolvedEmail ||
           "Antigravity CLI (imported)",
         testStatus: "active",
+        isActive: true,
         providerSpecificData: {
           ...toRecord(existing.providerSpecificData),
+          clientProfile: "cli",
           tokenType: enriched.tokenType,
           authMethod: enriched.authMethod,
           projectId: enriched.projectId ?? toRecord(existing.providerSpecificData).projectId,
@@ -247,6 +249,7 @@ export async function createConnectionFromAgyToken(
     isActive: true,
     testStatus: "active",
     providerSpecificData: {
+      clientProfile: "cli",
       tokenType: enriched.tokenType,
       authMethod: enriched.authMethod,
       projectId: enriched.projectId,

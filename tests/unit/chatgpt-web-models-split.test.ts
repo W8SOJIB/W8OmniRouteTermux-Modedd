@@ -5,16 +5,16 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 // Split-guard for the chatgpt-web model-mapping extraction.
-// The static model maps + pure thinking-effort resolvers live in the pure leaf
-// chatgpt-web/models.ts (no module state). Host imports the two it uses back.
+// The static model maps + pure model resolver live in the pure leaf
+// chatgpt-web/models.ts (no module state). Host imports it back.
 const HERE = dirname(fileURLToPath(import.meta.url));
 const EXE = join(HERE, "../../open-sse/executors");
 const HOST = join(EXE, "chatgpt-web.ts");
 const LEAF = join(EXE, "chatgpt-web/models.ts");
 
-test("leaf hosts the model maps + resolvers and does not import the host", () => {
+test("leaf hosts the model maps + resolver and does not import the host", () => {
   const src = readFileSync(LEAF, "utf8");
-  for (const sym of ["MODEL_MAP", "resolveChatGptModel", "resolveThinkingEffort"]) {
+  for (const sym of ["MODEL_MAP", "MODEL_FORCED_EFFORT", "resolveChatGptModel"]) {
     assert.match(src, new RegExp(`export (const|function) ${sym}\\b`));
   }
   assert.doesNotMatch(src, /from "\.\.\/chatgpt-web\.ts"/);

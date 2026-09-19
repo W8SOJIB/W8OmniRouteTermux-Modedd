@@ -13,7 +13,7 @@ const contextHandoff = await import("../../open-sse/services/contextHandoff.ts")
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -33,7 +33,7 @@ test.beforeEach(async () => {
 
 test.after(async () => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("buildHandoffSystemMessage and injectHandoffIntoBody preserve existing history", () => {
@@ -46,7 +46,7 @@ test("buildHandoffSystemMessage and injectHandoffIntoBody preserve existing hist
     taskProgress: "Need to finish tests",
     activeEntities: ["combo.ts", "chat.ts"],
     messageCount: 42,
-    model: "codex/gpt-5.4",
+    model: "codex/gpt-5.6-sol",
     warningThresholdPct: 0.85,
     generatedAt: "2099-04-08T12:00:00.000Z",
     expiresAt: "2099-04-08T17:00:00.000Z",
@@ -79,7 +79,7 @@ test("injectHandoffIntoBody preserves Responses API shape for native Codex reque
     taskProgress: "Need to carry state across account switches",
     activeEntities: ["chat.ts", "contextHandoff.ts"],
     messageCount: 8,
-    model: "codex/gpt-5.4",
+    model: "codex/gpt-5.6-sol",
     warningThresholdPct: 0.85,
     generatedAt: "2099-04-08T12:00:00.000Z",
     expiresAt: "2099-04-08T17:00:00.000Z",
@@ -139,7 +139,7 @@ test("maybeGenerateHandoff skips below the warning threshold", async () => {
     connectionId: "conn-low",
     percentUsed: 0.7,
     messages: [{ role: "user", content: "hello" }],
-    model: "codex/gpt-5.4",
+    model: "codex/gpt-5.6-sol",
     expiresAt: null,
     handleSingleModel: async () => {
       called = true;
@@ -164,7 +164,7 @@ test("maybeGenerateHandoff persists a structured handoff once the threshold is r
       { role: "user", content: "Please continue wiring the combo" },
       { role: "assistant", content: "Working on it" },
     ],
-    model: "codex/gpt-5.4",
+    model: "codex/gpt-5.6-sol",
     expiresAt: "2099-04-08T17:00:00.000Z",
     handleSingleModel: async (body, modelStr) => {
       calls.push({ body, modelStr });
@@ -197,7 +197,7 @@ test("maybeGenerateHandoff persists a structured handoff once the threshold is r
   assert.equal(saved.summary, "Relay summary generated");
   assert.deepEqual(saved.keyDecisions, ["Use context-relay"]);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].modelStr, "codex/gpt-5.4");
+  assert.equal(calls[0].modelStr, "codex/gpt-5.6-sol");
   assert.equal(calls[0].body._omnirouteSkipContextRelay, true);
   assert.equal(calls[0].body._omnirouteInternalRequest, "context-handoff");
 });
@@ -215,7 +215,7 @@ test("maybeGenerateHandoff deduplicates concurrent in-flight generations for the
     connectionId: "conn-dedupe",
     percentUsed: 0.89,
     messages: [{ role: "user", content: "Generate once" }],
-    model: "codex/gpt-5.4",
+    model: "codex/gpt-5.6-sol",
     expiresAt: "2099-01-01T00:00:00.000Z",
     handleSingleModel: async () => {
       calls.push("summary");
@@ -265,7 +265,7 @@ test("maybeGenerateHandoff allows a new attempt after a failed in-flight generat
     connectionId: "conn-retry",
     percentUsed: 0.9,
     messages: [{ role: "user", content: "Retry after failure" }],
-    model: "codex/gpt-5.4",
+    model: "codex/gpt-5.6-sol",
     expiresAt: "2099-01-01T00:00:00.000Z",
     handleSingleModel: async () => {
       calls += 1;
@@ -316,7 +316,7 @@ test("maybeGenerateHandoff respects explicit empty handoffProviders and skips ge
     connectionId: "conn-disabled",
     percentUsed: 0.92,
     messages: [{ role: "user", content: "Do not generate" }],
-    model: "codex/gpt-5.4",
+    model: "codex/gpt-5.6-sol",
     expiresAt: null,
     config: { handoffProviders: [] },
     handleSingleModel: async () => {
@@ -340,7 +340,7 @@ test("context handoff DB module upserts and deletes active handoffs", () => {
     taskProgress: "step one",
     activeEntities: ["a.ts"],
     messageCount: 3,
-    model: "codex/gpt-5.4",
+    model: "codex/gpt-5.6-sol",
     warningThresholdPct: 0.85,
     generatedAt: "2099-04-08T10:00:00.000Z",
     expiresAt: "2099-01-01T00:00:00.000Z",
@@ -354,7 +354,7 @@ test("context handoff DB module upserts and deletes active handoffs", () => {
     taskProgress: "step two",
     activeEntities: ["b.ts"],
     messageCount: 4,
-    model: "codex/gpt-5.4",
+    model: "codex/gpt-5.6-sol",
     warningThresholdPct: 0.86,
     generatedAt: "2099-04-08T11:00:00.000Z",
     expiresAt: "2099-01-01T00:00:00.000Z",
@@ -385,7 +385,7 @@ test("selectMessagesForSummary filters falsy values and preserves system/develop
     messages as contextHandoff.MessageLike[],
     2
   );
-  
+
   assert.equal(selected.length, 4);
   assert.equal(selected[0].role, "system");
   assert.equal(selected[1].role, "developer");
@@ -419,4 +419,107 @@ test("selectMessagesForSummary with no system messages and oversized single rema
     .filter(Boolean)
     .join("\n\n");
   assert.ok(historyText.length > 0, "historyText must be non-empty so the handoff is generated");
+});
+
+// ── #11552: universal-handoff regeneration backoff ───────────────────────────
+// A switch-heavy combo strategy (weighted / random / round-robin) alternates
+// models on almost every turn, so `maybeGenerateUniversalHandoff` is consulted
+// constantly. When the summarizer answers with something that is not a usable
+// handoff, nothing is persisted — and before the fix the very next switch
+// re-issued the same full-history summarization call and discarded the answer
+// again, on and on. That is the extra upstream call issue #11552 measured.
+
+function universalHandoffOptions(sessionId, handleSingleModel) {
+  return {
+    sessionId,
+    comboName: "weighted-combo",
+    messages: [{ role: "user", content: "Ship the weighted combo fix" }],
+    prevModel: "openai/gpt-4o-mini",
+    currModel: "claude/claude-3-5-sonnet-20241022",
+    universalConfig: contextHandoff.resolveUniversalHandoffConfig(null, null),
+    handleSingleModel,
+  };
+}
+
+function handoffJSONResponse(summary) {
+  return new Response(
+    JSON.stringify({
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({
+              summary,
+              keyDecisions: ["backoff on unparseable handoffs"],
+              taskProgress: "done",
+              activeEntities: ["contextHandoff.ts"],
+            }),
+          },
+        },
+      ],
+    }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
+
+test("maybeGenerateUniversalHandoff stops re-summarizing after an unparseable answer", async () => {
+  contextHandoff.resetUniversalHandoffCooldowns();
+  let calls = 0;
+  // 200 upstream OK responses that carry no handoff JSON — exactly what the
+  // weighted combo matrix sees.
+  const options = universalHandoffOptions("sess-unparseable", async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  });
+
+  for (let i = 0; i < 200; i++) {
+    contextHandoff.maybeGenerateUniversalHandoff(options);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+
+  // Positive anchor: the feature still runs — the first switch DID generate.
+  assert.equal(calls, 1, `expected exactly one summarization call, got ${calls}`);
+  assert.equal(handoffDb.getHandoff("sess-unparseable", "weighted-combo"), null);
+});
+
+test("maybeGenerateUniversalHandoff still generates and persists a usable handoff", async () => {
+  contextHandoff.resetUniversalHandoffCooldowns();
+  let calls = 0;
+  const options = universalHandoffOptions("sess-usable", async () => {
+    calls += 1;
+    return handoffJSONResponse("Weighted combo handoff");
+  });
+
+  contextHandoff.maybeGenerateUniversalHandoff(options);
+  const saved = await waitFor(() => handoffDb.getHandoff("sess-usable", "weighted-combo"));
+  assert.ok(saved, "a parseable summary must still be persisted");
+  assert.equal(saved.summary, "Weighted combo handoff");
+  assert.equal(calls, 1);
+
+  // A persisted handoff makes the next switch "inject", not "generate".
+  contextHandoff.maybeGenerateUniversalHandoff(options);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(calls, 1);
+});
+
+test("a transient upstream failure does not arm the unparseable backoff", async () => {
+  contextHandoff.resetUniversalHandoffCooldowns();
+  let calls = 0;
+  const options = universalHandoffOptions("sess-transient", async () => {
+    calls += 1;
+    if (calls === 1) return new Response("upstream down", { status: 503 });
+    return handoffJSONResponse("Recovered handoff");
+  });
+
+  contextHandoff.maybeGenerateUniversalHandoff(options);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(handoffDb.getHandoff("sess-transient", "weighted-combo"), null);
+
+  contextHandoff.maybeGenerateUniversalHandoff(options);
+  const saved = await waitFor(() => handoffDb.getHandoff("sess-transient", "weighted-combo"));
+  assert.ok(saved, "a 503 must stay retryable on the next model switch");
+  assert.equal(saved.summary, "Recovered handoff");
+  assert.equal(calls, 2);
 });

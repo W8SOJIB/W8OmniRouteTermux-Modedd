@@ -22,8 +22,15 @@
  */
 
 import { useEffect, useState } from "react";
+import { useTranslations } from "next-intl";
 import { formatResetCountdown } from "@/shared/utils/formatting";
 import type { ConnectionRowConnection } from "./ConnectionRow";
+// `providerText` is DEFINED in ./providerCredentialText (a leaf whose only
+// import is type-only) and merely re-exported by providerPageHelpers. Going
+// through that barrel pulls the whole provider-page graph — providerRegistry
+// (352 providers), shared provider constants, requestDefaults — into this tiny
+// client component for one string helper. Import from the real home instead.
+import { providerText } from "../providerCredentialText";
 
 export interface CoolingConnectionsPanelProps {
   readonly connections: readonly ConnectionRowConnection[];
@@ -37,6 +44,7 @@ function isCoolingNow(connection: ConnectionRowConnection, now: number): boolean
 
 export default function CoolingConnectionsPanel(props: CoolingConnectionsPanelProps) {
   const { connections } = props;
+  const t = useTranslations("providers");
   // Tick once per second so the human-readable countdown updates.
   const [now, setNow] = useState<number>(() => Date.now());
   useEffect(() => {
@@ -58,12 +66,17 @@ export default function CoolingConnectionsPanel(props: CoolingConnectionsPanelPr
           className="inline-block h-2 w-2 animate-pulse rounded-full bg-amber-500"
         />
         <h3 className="text-sm font-medium text-amber-700 dark:text-amber-300">
-          Currently cooling ({cooling.length})
+          {providerText(t, "coolingConnectionsTitle", "Currently cooling ({count})", {
+            count: cooling.length,
+          })}
         </h3>
       </div>
       <p className="mb-3 text-xs text-muted-foreground">
-        These connections returned a 429 (rate-limit) on their last request. OmniRoute will skip
-        them until the timer expires — no manual disable required.
+        {providerText(
+          t,
+          "coolingConnectionsDescription",
+          "These connections returned a 429 (rate-limit) on their last request. OmniRoute will skip them until the timer expires — no manual disable required."
+        )}
       </p>
       <ul className="space-y-1">
         {cooling.map((c) => {
@@ -72,7 +85,9 @@ export default function CoolingConnectionsPanel(props: CoolingConnectionsPanelPr
             c.displayName ||
             c.name ||
             c.email ||
-            (c.id ? `connection ${c.id.slice(0, 8)}` : "connection");
+            (c.id
+              ? `${providerText(t, "connectionFallback", "connection")} ${c.id.slice(0, 8)}`
+              : providerText(t, "connectionFallback", "connection"));
           return (
             <li
               key={c.id ?? label}

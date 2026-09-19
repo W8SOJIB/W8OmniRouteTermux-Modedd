@@ -1,12 +1,18 @@
 import { handleSearch } from "@omniroute/open-sse/handlers/search.ts";
-import { getProviderCredentials, extractApiKey, isValidApiKey } from "@/sse/services/auth";
+import {
+  getProviderCredentialsWithQuotaPreflight,
+  extractApiKey,
+  isValidApiKey,
+} from "@/sse/services/auth";
 import {
   getAllSearchProviders,
   getSearchProvider,
+  resolveSearchProvider,
   selectProvider,
   supportsSearchType,
+  isUnconfiguredLoopbackSearchProvider,
   SEARCH_PROVIDERS,
-  SEARCH_CREDENTIAL_FALLBACKS,
+  getSearchCredentialFallbacks,
 } from "@omniroute/open-sse/config/searchRegistry.ts";
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
@@ -14,7 +20,11 @@ import * as log from "@/sse/utils/logger";
 import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { v1SearchSchema } from "@/shared/validation/schemas";
-import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import {
+  formatValidationMessage,
+  isValidationFailure,
+  validateBody,
+} from "@/shared/validation/helpers";
 import { recordCost } from "@/domain/costRules";
 import {
   computeCacheKey,
@@ -26,6 +36,8 @@ import {
   rateLimitedProviderResponse,
   type RateLimitedCredentials,
 } from "@/app/api/v1/_shared/rateLimit";
+import { getSettings } from "@/lib/db/settings";
+import { isProviderBlockedByIdOrAlias } from "@/shared/utils/noAuthProviders";
 import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
 
 const CORS_HEADERS = {
@@ -44,7 +56,9 @@ export async function OPTIONS() {
  * GET /v1/search — list available search providers
  */
 export async function GET() {
-  const providers = getAllSearchProviders();
+  const settings = await getSettings().catch(() => ({}) as any);
+  const blockedProviders = settings?.blockedProviders || [];
+  const providers = getAllSearchProviders(blockedProviders);
   const timestamp = Math.floor(Date.now() / 1000);
 
   const data = providers.map((p) => ({
@@ -64,18 +78,20 @@ type SearchCredentials = Record<string, any>;
 type SearchCredentialLookup = SearchCredentials | RateLimitedCredentials | null;
 
 async function resolveSearchCredentials(providerId: string): Promise<SearchCredentialLookup> {
-  const credentials = await getProviderCredentials(providerId).catch(() => null);
+  const credentials = await getProviderCredentialsWithQuotaPreflight(providerId).catch(() => null);
   if (credentials && !isAllRateLimitedCredentials(credentials)) return credentials;
 
-  const fallbackId = SEARCH_CREDENTIAL_FALLBACKS[providerId];
-  if (!fallbackId) return credentials;
-
-  const fallbackCredentials = await getProviderCredentials(fallbackId).catch(() => null);
-  if (fallbackCredentials && !isAllRateLimitedCredentials(fallbackCredentials)) {
-    return fallbackCredentials;
+  for (const fallbackId of getSearchCredentialFallbacks(providerId)) {
+    const fallbackCredentials = await getProviderCredentialsWithQuotaPreflight(fallbackId).catch(
+      () => null
+    );
+    if (fallbackCredentials && !isAllRateLimitedCredentials(fallbackCredentials)) {
+      return fallbackCredentials;
+    }
+    if (fallbackCredentials) return fallbackCredentials;
   }
 
-  return fallbackCredentials || credentials;
+  return credentials;
 }
 
 async function resolveSearchExecutionCredentials(providerConfig: {
@@ -113,17 +129,28 @@ async function postHandler(request: Request, context: unknown) {
 
   const validation = validateBody(v1SearchSchema, rawBody);
   if (isValidationFailure(validation)) {
-    return errorResponse(HTTP_STATUS.BAD_REQUEST, validation.error.message);
+    return errorResponse(HTTP_STATUS.BAD_REQUEST, formatValidationMessage(validation.error));
   }
   const body = validation.data;
+  if (body.provider === "x_search") body.provider = "x-search";
+  if (body.provider === "x-search") body.search_type = "x";
 
   // Enforce API key policies — use "search" as model identifier for consistent policy config
   const policy = await enforceApiKeyPolicy(request, "search");
   if (policy.rejection) return policy.rejection;
 
+  const settings = await getSettings().catch(() => ({}) as any);
+  const blockedProviders = settings?.blockedProviders || [];
+
   // Resolve provider and credentials
   if (body.provider) {
-    const explicitProvider = getSearchProvider(body.provider);
+    if (isProviderBlockedByIdOrAlias(body.provider, blockedProviders)) {
+      return errorResponse(
+        HTTP_STATUS.FORBIDDEN,
+        `Search provider ${body.provider} is blocked by security policy`
+      );
+    }
+    const explicitProvider = resolveSearchProvider(body.provider);
     if (!explicitProvider) {
       return errorResponse(HTTP_STATUS.BAD_REQUEST, `Unknown search provider: ${body.provider}`);
     }
@@ -136,6 +163,21 @@ async function postHandler(request: Request, context: unknown) {
   }
 
   let providerConfig = selectProvider(body.provider, body.search_type);
+  if (
+    providerConfig &&
+    !body.provider &&
+    isProviderBlockedByIdOrAlias(providerConfig.id, blockedProviders)
+  ) {
+    const unblockedCandidate = Object.values(SEARCH_PROVIDERS)
+      .filter(
+        (p) =>
+          !p.fallbackOnly &&
+          supportsSearchType(p, body.search_type) &&
+          !isProviderBlockedByIdOrAlias(p.id, blockedProviders)
+      )
+      .sort((a, b) => a.costPerQuery - b.costPerQuery)[0];
+    providerConfig = unblockedCandidate || null;
+  }
   if (!providerConfig) {
     return errorResponse(
       HTTP_STATUS.BAD_REQUEST,
@@ -180,7 +222,12 @@ async function postHandler(request: Request, context: unknown) {
       // Sort by cost to find cheapest with credentials (fallback-only providers
       // are reached via the last-resort step below, never the primary pick).
       const sortedIds = Object.values(SEARCH_PROVIDERS)
-        .filter((provider) => !provider.fallbackOnly && supportsSearchType(provider, body.search_type))
+        .filter(
+          (provider) =>
+            !provider.fallbackOnly &&
+            supportsSearchType(provider, body.search_type) &&
+            !isProviderBlockedByIdOrAlias(provider.id, blockedProviders)
+        )
         .sort((a, b) => a.costPerQuery - b.costPerQuery)
         .map((p) => p.id);
 
@@ -195,6 +242,34 @@ async function postHandler(request: Request, context: unknown) {
         if (altConfig && altCreds) {
           providerConfig = altConfig;
           credentials = altCreds;
+          break;
+        }
+      }
+    }
+
+    // Last resort before failing: promote a fallback-only free provider (e.g.
+    // duckduckgo-free) to the primary pick so out-of-the-box search works when
+    // no credentialed provider is configured at all.
+    if (!credentials) {
+      const fallbackProviders = Object.values(SEARCH_PROVIDERS)
+        .filter(
+          (provider) =>
+            provider.fallbackOnly &&
+            supportsSearchType(provider, body.search_type) &&
+            !isProviderBlockedByIdOrAlias(provider.id, blockedProviders)
+        )
+        .sort((a, b) => a.costPerQuery - b.costPerQuery);
+
+      for (const fallbackProvider of fallbackProviders) {
+        providerConfig = fallbackProvider;
+        if (fallbackProvider.id === "duckduckgo-free") {
+          credentials = {};
+          break;
+        }
+        const fallbackCreds = await resolveSearchCredentials(fallbackProvider.id);
+        if (isAllRateLimitedCredentials(fallbackCreds)) continue;
+        if (fallbackCreds) {
+          credentials = fallbackCreds;
           break;
         }
       }
@@ -216,7 +291,9 @@ async function postHandler(request: Request, context: unknown) {
     // Find alternate for failover — must bind credentials to the matched provider.
     // Exclude fallback-only providers; they are only used by the last-resort step.
     const otherIds = Object.values(SEARCH_PROVIDERS)
-      .filter((provider) => !provider.fallbackOnly && supportsSearchType(provider, body.search_type))
+      .filter(
+        (provider) => !provider.fallbackOnly && supportsSearchType(provider, body.search_type)
+      )
       .sort((a, b) => a.costPerQuery - b.costPerQuery)
       .map((p) => p.id)
       .filter((id) => id !== providerConfig.id);
@@ -238,6 +315,7 @@ async function postHandler(request: Request, context: unknown) {
     if (!alternateProviderId) {
       for (const provider of Object.values(SEARCH_PROVIDERS)) {
         if (!provider.fallbackOnly || provider.id === providerConfig.id) continue;
+        if (isUnconfiguredLoopbackSearchProvider(provider)) continue;
         if (!supportsSearchType(provider, body.search_type)) continue;
         const fallbackCreds = await resolveSearchExecutionCredentials(provider);
         if (fallbackCreds && !isAllRateLimitedCredentials(fallbackCreds)) {
@@ -260,7 +338,13 @@ async function postHandler(request: Request, context: unknown) {
     clampedMaxResults,
     body.country,
     body.language,
-    { filters: body.filters, offset: body.offset, time_range: body.time_range }
+    {
+      filters: body.filters,
+      offset: body.offset,
+      time_range: body.time_range,
+      content: body.content,
+      provider_options: body.provider_options,
+    }
   );
 
   const ttl = providerConfig.cacheTTLMs ?? SEARCH_CACHE_DEFAULT_TTL_MS;
@@ -284,6 +368,8 @@ async function postHandler(request: Request, context: unknown) {
         alternateProvider: alternateProviderId,
         alternateCredentials,
         log,
+        connectionId: credentials?.connectionId || undefined,
+        apiKeyId: policy.apiKeyInfo?.id || undefined,
       });
 
       if (!result.success) {

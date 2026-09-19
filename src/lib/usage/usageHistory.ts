@@ -10,14 +10,21 @@
 import { getDbInstance } from "../db/core";
 import { protectPayloadForLog } from "../logPayloads";
 import {
+  resolveOrphanedUsageAccountIdentity,
+  resolveUsageAccountIdentity,
+} from "./accountIdentity";
+import {
+  accumulateLatencySample,
   asRecord,
+  buildLatencyStatsEntry,
+  createLatencyBucket,
   normalizeServiceTier,
-  percentile,
-  stdDev,
+  resolvePositiveOption,
   toNumber,
   toStringOrNull,
   truncatePendingPreview,
 } from "./usageHistory/helpers";
+import type { ModelLatencyStatsEntry } from "./usageHistory/helpers";
 import {
   clearCompletedDetails,
   maybeEnrichCompletedDetail,
@@ -47,6 +54,7 @@ export type PendingRequestMetadata = {
   stage?: string | null;
   stageUpdatedAt?: number | null;
   correlationId?: string | null;
+  sessionTag?: string | null;
 };
 export type PendingRequestDetail = {
   id: string;
@@ -68,6 +76,7 @@ export type PendingRequestDetail = {
   stage?: string | null;
   stageUpdatedAt?: number | null;
   correlationId?: string | null;
+  sessionTag?: string | null;
   streamChunks?: {
     provider?: string[];
     openai?: string[];
@@ -127,27 +136,52 @@ function normalizePendingMetadata(metadata?: PendingRequestMetadata): PendingReq
   if (metadata.correlationId !== undefined) {
     normalized.correlationId = toStringOrNull(metadata.correlationId) || null;
   }
+  if (metadata.sessionTag !== undefined) {
+    normalized.sessionTag = toStringOrNull(metadata.sessionTag) || null;
+  }
 
   return normalized;
 }
 
 // ──────────────── Pending Requests (in-memory) ────────────────
 
-const pendingRequests: {
-  byModel: Record<string, number>;
-  byAccount: Record<string, Record<string, number>>;
-  details: Record<string, Record<string, PendingRequestDetail[]>>;
-} = {
-  byModel: Object.create(null) as Record<string, number>,
-  byAccount: Object.create(null) as Record<string, Record<string, number>>,
-  details: Object.create(null) as Record<string, Record<string, PendingRequestDetail[]>>,
-};
+declare global {
+  var __omnirouteUsageHistoryPendingState:
+    | {
+        pendingRequests: {
+          byModel: Record<string, number>;
+          byAccount: Record<string, Record<string, number>>;
+          details: Record<string, Record<string, PendingRequestDetail[]>>;
+        };
+        pendingById: Map<string, PendingRequestDetail>;
+      }
+    | undefined;
+}
+
+// Reuse the SAME object/Map across Next.js dev HMR module re-evaluations —
+// same pattern (and reason) as src/lib/db/core.ts's `globalThis.__omnirouteDb`.
+// Without this, an edit anywhere in this module's dependency graph resets
+// in-flight request tracking to empty mid-stream, so a live poll against
+// getPendingById() (RequestLoggerDetail.tsx's Conversation Context section)
+// silently stops seeing partialAssistantText for a request that started
+// before the reload — the request keeps streaming fine, but the *next*
+// module instance's pendingById has never heard of it.
+const pendingState = (globalThis.__omnirouteUsageHistoryPendingState ??= {
+  pendingRequests: {
+    byModel: Object.create(null) as Record<string, number>,
+    byAccount: Object.create(null) as Record<string, Record<string, number>>,
+    details: Object.create(null) as Record<string, Record<string, PendingRequestDetail[]>>,
+  },
+  pendingById: new Map<string, PendingRequestDetail>(),
+});
+
+const pendingRequests = pendingState.pendingRequests;
 
 /**
  * O(1) ID → PendingRequestDetail lookup map.
  * Populated when a detail is created and cleaned up when it is removed/finalized.
  */
-const pendingById = new Map<string, PendingRequestDetail>();
+const pendingById = pendingState.pendingById;
 
 const DEFAULT_MAX_PENDING_REQUEST_AGE_MS = 60 * 60 * 1000;
 const MAX_PENDING_DETAILS = 5000;
@@ -553,7 +587,8 @@ export async function getUsageDb(sinceIso?: string | null, limit?: number, curso
   });
 
   // Provide next cursor if we hit the limit (more rows exist)
-  const nextCursor = rows.length === maxRows ? (rows[rows.length - 1] as any)?.timestamp : null;
+  const nextCursor =
+    rows.length === maxRows ? toStringOrNull(asRecord(rows[rows.length - 1]).timestamp) : null;
 
   return { data: { history, nextCursor } };
 }
@@ -561,9 +596,49 @@ export async function getUsageDb(sinceIso?: string | null, limit?: number, curso
 // ──────────────── Save Request Usage ────────────────
 
 /**
+ * DB-entity-mapped shape accepted by {@link saveRequestUsage}, mirroring the
+ * `usage_history` table columns 1:1 (see `src/lib/db/migrations/`). Convention
+ * (#3512): every `usage_history` writer should type its entry against this
+ * interface instead of an inline anonymous object or `any` — call sites are
+ * intentionally permissive (fields optional/nullable) because rows are built
+ * incrementally across several extraction points (chatCore success/failure
+ * paths, rejected-request accounting, the Codex Responses WS bridge).
+ *
+ * `tokens` stays `unknown` on purpose: callers pass either the raw
+ * provider-shaped usage object (OpenAI `prompt_tokens`/`completion_tokens`,
+ * Anthropic `input_tokens`/`cache_read_input_tokens`, …) or the already
+ * normalized `{ input, output, cacheRead, cacheCreation, reasoning }` shape —
+ * `getLoggedInputTokens`/`getLoggedOutputTokens`/`getPromptCache*Tokens` in
+ * `./tokenAccounting` accept both and extract the right fields.
+ */
+export interface UsageEntry {
+  provider?: string | null;
+  model?: string | null;
+  /** Raw or normalized token usage — see the interface doc above. */
+  tokens?: unknown;
+  status?: string | null;
+  success?: boolean;
+  latencyMs?: number;
+  timeToFirstTokenMs?: number;
+  errorCode?: string | null;
+  /** ISO timestamp; defaults to `new Date().toISOString()` when omitted. */
+  timestamp?: string;
+  connectionId?: string | null;
+  apiKeyId?: string | null;
+  apiKeyName?: string | null;
+  serviceTier?: string | null;
+  /** @deprecated legacy snake_case fallback, read only if `serviceTier` is unset. */
+  service_tier?: string | null;
+  comboStrategy?: string | null;
+  /** @deprecated legacy snake_case fallback, read only if `comboStrategy` is unset. */
+  combo_strategy?: string | null;
+  endpoint?: string | null;
+}
+
+/**
  * Save request usage entry to SQLite.
  */
-export async function saveRequestUsage(entry: any) {
+export async function saveRequestUsage(entry: UsageEntry) {
   if (!shouldPersistToDisk) return;
 
   try {
@@ -573,6 +648,13 @@ export async function saveRequestUsage(entry: any) {
 
     const tokensInput = getLoggedInputTokens(entry.tokens);
     const tokensOutput = getLoggedOutputTokens(entry.tokens);
+    const connection = entry.connectionId
+      ? (db.prepare("SELECT * FROM provider_connections WHERE id = ?").get(entry.connectionId) as
+          Record<string, unknown> | undefined)
+      : undefined;
+    const accountIdentity = connection
+      ? resolveUsageAccountIdentity(connection)
+      : resolveOrphanedUsageAccountIdentity(entry.provider, entry.connectionId);
 
     // Dedup guard: skip INSERT when an identical row already exists in the same
     // second. This prevents double-counting when onRequestSuccess fires more
@@ -619,15 +701,19 @@ export async function saveRequestUsage(entry: any) {
 
       db.prepare(
         `
-        INSERT INTO usage_history (provider, model, connection_id, api_key_id, api_key_name,
-          tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, tokens_reasoning,
-          service_tier, status, success, latency_ms, ttft_ms, error_code, combo_strategy, endpoint, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO usage_history (provider, model, connection_id, account_key, account_label,
+          account_label_priority, api_key_id, api_key_name, tokens_input, tokens_output,
+          tokens_cache_read, tokens_cache_creation, tokens_reasoning, service_tier, status, success,
+          latency_ms, ttft_ms, error_code, combo_strategy, endpoint, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
       ).run(
         entry.provider || null,
         entry.model || null,
         entry.connectionId || null,
+        accountIdentity.accountKey,
+        accountIdentity.accountLabel,
+        accountIdentity.accountLabelPriority,
         entry.apiKeyId || null,
         entry.apiKeyName || null,
         tokensInput,
@@ -666,10 +752,17 @@ export async function saveRequestUsage(entry: any) {
 
 // ──────────────── Get Usage History ────────────────
 
+export interface UsageHistoryFilter {
+  provider?: string;
+  model?: string;
+  startDate?: string | number | Date;
+  endDate?: string | number | Date;
+}
+
 /**
  * Get usage history with optional filters.
  */
-export async function getUsageHistory(filter: any = {}) {
+export async function getUsageHistory(filter: UsageHistoryFilter = {}) {
   const db = getDbInstance();
   let sql = "SELECT * FROM usage_history";
   const conditions: string[] = [];
@@ -724,40 +817,26 @@ export async function getUsageHistory(filter: any = {}) {
   });
 }
 
-export interface ModelLatencyStatsEntry {
-  provider: string;
-  model: string;
-  key: string;
-  totalRequests: number;
-  successfulRequests: number;
-  successRate: number; // 0..1
-  avgLatencyMs: number;
-  p50LatencyMs: number;
-  p95LatencyMs: number;
-  p99LatencyMs: number;
-  latencyStdDev: number;
-  windowHours: number;
-}
+export type { ModelLatencyStatsEntry } from "./usageHistory/helpers";
 
 /**
  * Aggregate rolling latency stats per provider/model from usage_history.
  * Used by auto-combo routing to incorporate real-world latency and reliability.
+ * Also computes avgTtftMs/avgE2ELatencyMs/avgTokensPerSecond (#6875) via the
+ * accumulateLatencySample/buildLatencyStatsEntry helpers.
  */
 export async function getModelLatencyStats(
-  options: { windowHours?: number; minSamples?: number; maxRows?: number } = {}
+  options: {
+    windowHours?: number;
+    minSamples?: number;
+    maxRows?: number;
+    provider?: string;
+    model?: string;
+  } = {}
 ): Promise<Record<string, ModelLatencyStatsEntry>> {
-  const windowHours =
-    Number.isFinite(Number(options.windowHours)) && Number(options.windowHours) > 0
-      ? Number(options.windowHours)
-      : 24;
-  const minSamples =
-    Number.isFinite(Number(options.minSamples)) && Number(options.minSamples) > 0
-      ? Number(options.minSamples)
-      : 1;
-  const maxRows =
-    Number.isFinite(Number(options.maxRows)) && Number(options.maxRows) > 0
-      ? Number(options.maxRows)
-      : 10000;
+  const windowHours = resolvePositiveOption(options.windowHours, 24);
+  const minSamples = resolvePositiveOption(options.minSamples, 1);
+  const maxRows = resolvePositiveOption(options.maxRows, 10000);
 
   const db = getDbInstance();
   const sinceIso = new Date(Date.now() - windowHours * 60 * 60 * 1000).toISOString();
@@ -767,33 +846,34 @@ export async function getModelLatencyStats(
     model: string | null;
     success: number | null;
     latency_ms: number | null;
+    ttft_ms: number | null;
+    tokens_output: number | null;
   };
+
+  const conditions = ["timestamp >= @sinceIso", "provider IS NOT NULL", "model IS NOT NULL"];
+  const queryParams: Record<string, unknown> = { sinceIso, maxRows };
+  if (options.provider) {
+    conditions.push("provider = @provider");
+    queryParams.provider = options.provider;
+  }
+  if (options.model) {
+    conditions.push("model = @model");
+    queryParams.model = options.model;
+  }
 
   const rows = db
     .prepare(
       `
-      SELECT provider, model, success, latency_ms
+      SELECT provider, model, success, latency_ms, ttft_ms, tokens_output
       FROM usage_history
-      WHERE timestamp >= @sinceIso
-        AND provider IS NOT NULL
-        AND model IS NOT NULL
+      WHERE ${conditions.join(" AND ")}
       ORDER BY timestamp DESC
       LIMIT @maxRows
     `
     )
-    .all({ sinceIso, maxRows }) as LatencyRow[];
+    .all(queryParams) as LatencyRow[];
 
-  const grouped = new Map<
-    string,
-    {
-      provider: string;
-      model: string;
-      totalRequests: number;
-      successfulRequests: number;
-      successfulLatencies: number[];
-      allLatencies: number[];
-    }
-  >();
+  const grouped = new Map<string, ReturnType<typeof createLatencyBucket>>();
 
   for (const row of rows) {
     const provider = toStringOrNull(row.provider);
@@ -801,17 +881,7 @@ export async function getModelLatencyStats(
     if (!provider || !model) continue;
 
     const key = `${provider}/${model}`;
-    if (!grouped.has(key)) {
-      grouped.set(key, {
-        provider,
-        model,
-        totalRequests: 0,
-        successfulRequests: 0,
-        successfulLatencies: [],
-        allLatencies: [],
-      });
-    }
-
+    if (!grouped.has(key)) grouped.set(key, createLatencyBucket(provider, model));
     const bucket = grouped.get(key);
     if (!bucket) continue;
 
@@ -819,41 +889,19 @@ export async function getModelLatencyStats(
     const isSuccess = toNumber(row.success) !== 0;
     if (isSuccess) bucket.successfulRequests += 1;
 
-    const latency = toNumber(row.latency_ms);
-    if (latency > 0) {
-      bucket.allLatencies.push(latency);
-      if (isSuccess) bucket.successfulLatencies.push(latency);
-    }
+    accumulateLatencySample(
+      bucket,
+      toNumber(row.latency_ms),
+      toNumber(row.ttft_ms),
+      toNumber(row.tokens_output),
+      isSuccess
+    );
   }
 
   const stats: Record<string, ModelLatencyStatsEntry> = {};
   for (const [key, bucket] of grouped.entries()) {
-    const baseLatencies =
-      bucket.successfulLatencies.length >= minSamples
-        ? bucket.successfulLatencies
-        : bucket.allLatencies;
-
-    if (baseLatencies.length < minSamples) continue;
-
-    const sorted = [...baseLatencies].sort((a, b) => a - b);
-    const avg = sorted.reduce((acc, n) => acc + n, 0) / sorted.length;
-    const successRate =
-      bucket.totalRequests > 0 ? bucket.successfulRequests / bucket.totalRequests : 0;
-
-    stats[key] = {
-      provider: bucket.provider,
-      model: bucket.model,
-      key,
-      totalRequests: bucket.totalRequests,
-      successfulRequests: bucket.successfulRequests,
-      successRate,
-      avgLatencyMs: Math.round(avg),
-      p50LatencyMs: Math.round(percentile(sorted, 0.5)),
-      p95LatencyMs: Math.round(percentile(sorted, 0.95)),
-      p99LatencyMs: Math.round(percentile(sorted, 0.99)),
-      latencyStdDev: Math.round(stdDev(sorted, avg)),
-      windowHours,
-    };
+    const entry = buildLatencyStatsEntry(key, bucket, minSamples, windowHours);
+    if (entry) stats[key] = entry;
   }
 
   return stats;
@@ -875,7 +923,7 @@ export async function appendRequestLog({
   model?: string;
   provider?: string;
   connectionId?: string;
-  tokens?: any;
+  tokens?: unknown;
   status?: string | number;
 }) {
   // Deprecated: request summaries now come from SQLite call_logs.
@@ -909,8 +957,11 @@ export async function getRecentLogs(limit = 200) {
       const status = typeof row.status === "number" ? row.status : String(row.status || "-");
       return `${timestamp} | ${model} | ${provider} | ${account} | ${tokensIn} | ${tokensOut} | ${status}`;
     });
-  } catch (error: any) {
-    console.error("[usageDb] Failed to read recent call logs:", error.message);
+  } catch (error) {
+    console.error(
+      "[usageDb] Failed to read recent call logs:",
+      error instanceof Error ? error.message : String(error)
+    );
     return [];
   }
 }

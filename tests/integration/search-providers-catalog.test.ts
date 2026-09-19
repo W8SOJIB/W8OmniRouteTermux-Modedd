@@ -2,7 +2,7 @@
  * Integration tests for GET /api/search/providers — extended catalog (F4).
  *
  * Tests:
- * - Returns 16 items total (13 search + 3 fetch providers).
+ * - Returns 20 items total (16 search + 4 fetch providers).
  * - Each item carries the correct `kind` field.
  * - Status reflects actual DB credential state:
  *   - "configured"  when an active, non-rate-limited connection exists.
@@ -48,10 +48,10 @@ const route = await import("../../src/app/api/search/providers/route.ts");
 // Constants
 // ---------------------------------------------------------------------------
 
-// 13 search-kind providers: serper, brave, perplexity, exa, tavily, google-pse,
-// linkup, searchapi, youcom, searxng, ollama, zai + duckduckgo-free (added in the
-// v3.8.27 cycle, registry open-sse/config/searchRegistry.ts).
-const EXPECTED_SEARCH_COUNT = 13;
+// 17 search-kind providers: serper, brave, perplexity, exa, tavily, firecrawl,
+// google-pse, linkup, searchapi, youcom, searxng, ollama, zai, jina-search,
+// context7 (#11140), duckduckgo-free, x-search (registry open-sse/config/searchRegistry.ts).
+const EXPECTED_SEARCH_COUNT = 17;
 const EXPECTED_FETCH_COUNT = 4;
 const EXPECTED_TOTAL = EXPECTED_SEARCH_COUNT + EXPECTED_FETCH_COUNT;
 
@@ -102,7 +102,7 @@ async function seedRateLimitedConnection(provider: string) {
 /** Reset DB state between tests. */
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -116,7 +116,7 @@ test.beforeEach(async () => {
 
 test.after(async () => {
   await resetStorage();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 // ---------------------------------------------------------------------------
@@ -138,7 +138,7 @@ test("search-providers-catalog: returns 401 for unauthenticated requests when au
   assert.ok(!bodyStr.includes(" at /"), "error body must not contain stack trace");
 });
 
-test("search-providers-catalog: returns 16 providers (13 search + 3 fetch)", async () => {
+test("search-providers-catalog: returns 21 providers (17 search + 4 fetch)", async () => {
   const req = await buildAuthRequest();
   const res = await route.GET(req);
 
@@ -295,7 +295,7 @@ test("search-providers-catalog: fetch providers have correct metadata", async ()
   const firecrawl = fetchProviders.find((p: { id: string }) => p.id === "firecrawl");
   assert.equal(firecrawl.name, "Firecrawl");
   assert.equal(firecrawl.costPerQuery, 0.002);
-  assert.equal(firecrawl.freeMonthlyQuota, 500);
+  assert.equal(firecrawl.freeMonthlyQuota, 1000);
   assert.ok(Array.isArray(firecrawl.fetchFormats), "fetchFormats must be an array");
   assert.ok(
     firecrawl.fetchFormats.includes("markdown"),
@@ -307,7 +307,7 @@ test("search-providers-catalog: fetch providers have correct metadata", async ()
   );
 
   const jina = fetchProviders.find((p: { id: string }) => p.id === "jina-reader");
-  assert.equal(jina.name, "Jina Reader");
+  assert.equal(jina.name, "Jina Reader (r.jina.ai)");
   assert.equal(jina.costPerQuery, 0.0005);
   assert.ok(jina.fetchFormats.includes("text"), "jina fetchFormats must include text");
 
@@ -348,6 +348,19 @@ test("search-providers-catalog: search providers have correct fields", async () 
   assert.ok(serper, "serper-search must be in search providers");
   assert.ok(serper.searchTypes.includes("web"), "serper must support web search");
   assert.equal(serper.kind, "search");
+
+  const firecrawlSearch = searchProviders.find((p: { id: string }) => p.id === "firecrawl");
+  assert.ok(firecrawlSearch, "firecrawl must be in search providers");
+  assert.equal(firecrawlSearch.kind, "search");
+  assert.equal(firecrawlSearch.costPerQuery, 0.002);
+  assert.equal(firecrawlSearch.freeMonthlyQuota, 1000);
+  assert.ok(firecrawlSearch.searchTypes.includes("web"), "firecrawl must support web");
+  assert.ok(firecrawlSearch.searchTypes.includes("news"), "firecrawl must support news");
+
+  const xSearch = searchProviders.find((p: { id: string }) => p.id === "x-search");
+  assert.ok(xSearch, "x-search must be in search providers");
+  assert.equal(xSearch.kind, "search");
+  assert.deepEqual(xSearch.searchTypes, ["x"]);
 });
 
 test("search-providers-catalog: response validates against SearchProviderCatalogResponseSchema", async () => {

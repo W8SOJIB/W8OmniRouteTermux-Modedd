@@ -8,6 +8,7 @@
 //   - stripVersion()     — strips @version suffix from package keys
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 // @ts-expect-error — .mjs helper has no type declarations; runtime shape is known.
 import {
   classifyLicense,
@@ -15,15 +16,19 @@ import {
   loadAllowlist,
 } from "../../../scripts/check/check-licenses.mjs";
 
+const PNPM_WORKSPACE_URL = new URL("../../../pnpm-workspace.yaml", import.meta.url);
+
 // ---------------------------------------------------------------------------
 // Helpers — synthetic allowlists for testing classifyLicense in isolation
 // ---------------------------------------------------------------------------
 
-function makeAllowlist(overrides: Partial<{
-  allowed: string[];
-  allowedExpressions: string[];
-  exceptions: Record<string, { license: string; justification: string; risk: string }>;
-}> = {}) {
+function makeAllowlist(
+  overrides: Partial<{
+    allowed: string[];
+    allowedExpressions: string[];
+    exceptions: Record<string, { license: string; justification: string; risk: string }>;
+  }> = {}
+) {
   return {
     allowed: ["MIT", "Apache-2.0", "BSD-3-Clause", "ISC", "0BSD"],
     allowedExpressions: ["(MIT OR Apache-2.0)", "MIT AND ISC", "MIT*"],
@@ -31,6 +36,15 @@ function makeAllowlist(overrides: Partial<{
     ...overrides,
   };
 }
+
+test("pnpm does not auto-install the unused @lobehub/ui peer subtree", () => {
+  const workspace = fs.readFileSync(PNPM_WORKSPACE_URL, "utf8");
+  assert.match(
+    workspace,
+    /^autoInstallPeers:\s*false\s*$/m,
+    "pnpm must match npm's legacy-peer-deps posture; @lobehub/ui is not a runtime dependency"
+  );
+});
 
 // ---------------------------------------------------------------------------
 // stripVersion
@@ -53,7 +67,10 @@ test("stripVersion: handles scoped package without version", () => {
 });
 
 test("stripVersion: handles nested scope-like name with version", () => {
-  assert.equal(stripVersion("@aws-sdk/client-bedrock-runtime@3.1063.0"), "@aws-sdk/client-bedrock-runtime");
+  assert.equal(
+    stripVersion("@aws-sdk/client-bedrock-runtime@3.1063.0"),
+    "@aws-sdk/client-bedrock-runtime"
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -150,7 +167,10 @@ test("classifyLicense: LGPL package with registered exception returns 'exception
   });
   const result = classifyLicense("lgpl-native-pkg@1.2.3", "LGPL-3.0-or-later", allowlist);
   assert.equal(result.status, "exception");
-  assert.ok(result.reason.includes("exception"), `reason should mention exception: ${result.reason}`);
+  assert.ok(
+    result.reason.includes("exception"),
+    `reason should mention exception: ${result.reason}`
+  );
 });
 
 test("classifyLicense: scoped package with exception: version is stripped for lookup", () => {

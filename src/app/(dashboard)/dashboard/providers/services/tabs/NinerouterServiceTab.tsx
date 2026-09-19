@@ -7,6 +7,7 @@ import { NinerouterInstallWizard } from "../components/NinerouterInstallWizard";
 import { NinerouterProviderExposureCard } from "../components/NinerouterProviderExposureCard";
 import { NinerouterModelList } from "../components/NinerouterModelList";
 import { AutoStartToggle } from "../components/AutoStartToggle";
+import { AutoRestartAdoptedToggle } from "../components/AutoRestartAdoptedToggle";
 import { ApiKeyField } from "../components/ApiKeyField";
 import { NinerouterEmbedFrame } from "../components/NinerouterEmbedFrame";
 import { useServiceStatus } from "../hooks/useServiceStatus";
@@ -29,10 +30,8 @@ export function NinerouterServiceTab() {
     <div className="space-y-4">
       <ServiceStatusCard name={NAME} />
       <ServiceLifecycleButtons name={NAME} />
-      <AutoStartToggle
-        name={NAME}
-        description="Launch 9Router automatically when OmniRoute starts"
-      />
+      <AutoStartToggle name={NAME} />
+      <AutoRestartAdoptedToggle name={NAME} />
       <ApiKeyField name={NAME} serviceLabel="9Router" showReveal={true} />
       <NinerouterProviderExposureCard />
       <NinerouterModelList />

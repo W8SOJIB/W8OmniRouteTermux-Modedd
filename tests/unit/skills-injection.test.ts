@@ -8,9 +8,17 @@ const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-skills-in
 process.env.DATA_DIR = TEST_DATA_DIR;
 
 const coreDb = await import("../../src/lib/db/core.ts");
-const { skillRegistry } = await import("../../src/lib/skills/registry.ts");
-const { injectSkills, injectSkillTools, detectProvider } =
+const { GLOBAL_SKILL_OWNER_ID, skillRegistry } = await import("../../src/lib/skills/registry.ts");
+const { injectSkills, injectSkillTools, detectProvider, decodeSkillToolName } =
   await import("../../src/lib/skills/injection.ts");
+
+// Since #9058, identifiers that violate the provider tool-name pattern
+// (^[a-zA-Z0-9_-]+$ — every name@version here, because of "@" and ".") are
+// encoded as omr_skill_<base64url(name@version)>, and bare property-map
+// schemas are normalized to { type: "object", properties: {...} }.
+function encodedName(identifier: string): string {
+  return `omr_skill_${Buffer.from(identifier, "utf8").toString("base64url")}`;
+}
 
 function resetRegistryState() {
   skillRegistry["registeredSkills"].clear();
@@ -20,7 +28,7 @@ function resetRegistryState() {
 async function resetStorage() {
   resetRegistryState();
   coreDb.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -52,7 +60,7 @@ test.beforeEach(async () => {
 test.after(() => {
   resetRegistryState();
   coreDb.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("injectSkills renders enabled tools in provider-specific shapes", async () => {
@@ -71,27 +79,57 @@ test("injectSkills renders enabled tools in provider-specific shapes", async () 
   assert.deepEqual(openaiTools[0], {
     type: "function",
     function: {
-      name: "search@1.0.0",
+      name: "omr_skill_c2VhcmNoQDEuMC4w", // encodedName("search@1.0.0")
       description: "search the web",
-      parameters: { query: "string" },
+      parameters: { type: "object", properties: { query: "string" } },
     },
   });
+  assert.equal(decodeSkillToolName("omr_skill_c2VhcmNoQDEuMC4w"), "search@1.0.0");
   assert.deepEqual(openaiTools[1], { name: "existing-tool" });
   assert.deepEqual(claudeTools, [
     {
-      name: "search@1.0.0",
+      name: "omr_skill_c2VhcmNoQDEuMC4w",
       description: "search the web",
-      input_schema: { query: "string" },
+      input_schema: { type: "object", properties: { query: "string" } },
     },
   ]);
   assert.deepEqual(geminiTools, [
     {
-      name: "search@1.0.0",
+      name: "omr_skill_c2VhcmNoQDEuMC4w",
       description: "search the web",
-      parameters: { query: "string" },
+      parameters: { type: "object", properties: { query: "string" } },
     },
   ]);
   assert.deepEqual(fallbackTools, [openaiTools[0]]);
+});
+
+test("injectSkills includes global skills without leaking another API key's skills", async () => {
+  await skillRegistry.register({
+    name: "releaseNotes",
+    version: "1.0.0",
+    description: "draft release notes",
+    schema: { input: {}, output: {} },
+    handler: "release-notes-handler",
+    enabled: true,
+    apiKeyId: GLOBAL_SKILL_OWNER_ID,
+  });
+  await skillRegistry.register({
+    name: "privateSkill",
+    version: "1.0.0",
+    description: "private skill",
+    schema: { input: {}, output: {} },
+    handler: "private-handler",
+    enabled: true,
+    apiKeyId: "key-b",
+  });
+
+  const tools = injectSkills({ provider: "openai", apiKeyId: "key-a" });
+
+  assert.equal(tools.length, 1);
+  assert.equal(
+    decodeSkillToolName((tools[0] as { function: { name: string } }).function.name),
+    "releaseNotes@1.0.0"
+  );
 });
 
 test("injectSkillTools only injects into the last user message without tools", async () => {
@@ -179,11 +217,39 @@ test("injectSkills auto mode matches message/context semantics and applies score
   assert.deepEqual(tools[0], {
     type: "function",
     function: {
-      name: "issueSearch@1.0.0",
+      name: encodedName("issueSearch@1.0.0"),
       description: "search github issues and pull requests",
-      parameters: { query: "string" },
+      parameters: { type: "object", properties: { query: "string" } },
     },
   });
+});
+
+test("injectSkills auto mode only scores name tokens with at least three characters", async () => {
+  for (const name of ["aiSearch", "apiSearch"]) {
+    await skillRegistry.register({
+      name,
+      version: "1.0.0",
+      description: "find",
+      schema: { input: {}, output: {} },
+      handler: `${name}-handler`,
+      enabled: true,
+      mode: "auto",
+      apiKeyId: "key-token-length",
+    });
+  }
+
+  const tools = injectSkills({
+    provider: "other",
+    apiKeyId: "key-token-length",
+    messages: [{ role: "user", content: "ai api find" }],
+  });
+
+  assert.deepEqual(
+    tools.map((tool) =>
+      decodeSkillToolName((tool as { function: { name: string } }).function.name)
+    ),
+    ["apiSearch@1.0.0"]
+  );
 });
 
 test("injectSkills auto mode prefers provider-matching tagged skills", async () => {
@@ -226,7 +292,7 @@ test("injectSkills auto mode prefers provider-matching tagged skills", async () 
       (tool): tool is { function: { name: string } } =>
         !!tool && typeof tool === "object" && "function" in tool
     )
-    .map((tool) => tool.function.name);
+    .map((tool) => decodeSkillToolName(tool.function.name));
   assert.equal(injectedNames[0], "openaiDocTool@1.0.0");
   assert.equal(injectedNames.includes("claudeDocTool@1.0.0"), true);
 });
@@ -266,7 +332,9 @@ test("injectSkills auto mode limits selected auto skills and keeps on-mode skill
 
   // 1 always-on + max 5 auto
   assert.equal(tools.length, 6);
-  const names = tools.map((tool) => (tool as { function: { name: string } }).function.name);
+  const names = tools.map((tool) =>
+    decodeSkillToolName((tool as { function: { name: string } }).function.name)
+  );
   assert.equal(names.includes("alwaysOnUtility@1.0.0"), true);
   assert.equal(names.filter((name) => name.startsWith("searchSkill")).length, 5);
 });

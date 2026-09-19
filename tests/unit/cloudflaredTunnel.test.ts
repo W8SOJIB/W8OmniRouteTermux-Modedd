@@ -293,6 +293,6 @@ test("getCloudflaredTunnelStatus resets stale runtime state from a previous serv
       process.env.CLOUDFLARED_BIN = originalBinary;
     }
 
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });

@@ -25,7 +25,7 @@ const evalSuiteByIdRoute = await import("../../src/app/api/evals/suites/[suiteId
 function resetDb() {
   core.resetDbInstance();
   localDb.resetApiKeyState();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -36,7 +36,7 @@ test.beforeEach(() => {
 test.after(() => {
   core.resetDbInstance();
   localDb.resetApiKeyState();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("evals GET returns suites, target options, api key metadata, and persisted history", async () => {

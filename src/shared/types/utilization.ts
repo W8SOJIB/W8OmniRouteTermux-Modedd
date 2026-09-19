@@ -19,11 +19,18 @@ export interface ProviderUtilizationPoint {
   windowKey: string;
 }
 
+export interface ConnectionMetaEntry {
+  email: string | null;
+  name: string | null;
+  displayName: string | null;
+}
+
 export interface ProviderUtilizationResponse {
   timeRange: "1h" | "24h" | "7d" | "30d";
   bucketSizeMinutes: number;
   providers: string[];
   data: ProviderUtilizationPoint[];
+  connectionMeta?: Record<string, ConnectionMetaEntry>;
 }
 
 export interface ComboHealthMetrics {
@@ -82,6 +89,8 @@ export interface ComboRecord {
   name?: string;
   strategy?: string;
   models?: unknown[];
+  autoConfig?: unknown;
+  config?: unknown;
 }
 
 export type UtilizationTimeRange = "1h" | "24h" | "7d" | "30d";
@@ -251,7 +260,9 @@ export interface ComboAutopilotReport {
     degradedCount: number;
     downCount: number;
     issueCount: number;
-    actionableCount: number;
+    suggestionCount: number;
+    /** @deprecated Use suggestionCount instead. Kept as an alias for backward compatibility; remove after 2 releases. */
+    actionableCount?: number;
   };
   combos: ComboAutopilotCombo[];
 }
@@ -267,14 +278,16 @@ export type ComboScoringInspectorFactorKey =
   | "tierAffinity"
   | "specificityMatch"
   | "contextAffinity"
-  | "resetWindowAffinity";
+  | "cacheAffinity"
+  | "sessionAvailability"
+  | "resetWindowAffinity"
+  | "connectionDensity"
+  | "quality";
 
 export type ComboScoringInspectorSource =
-  | "combo_health"
-  | "combo_forecast"
-  | "combo_autopilot"
-  | "runtime"
-  | "default";
+  "combo_health" | "combo_forecast" | "combo_autopilot" | "runtime" | "default";
+
+export type ComboScoringInspectorWeightSource = "default" | "explicit" | "mode_pack";
 
 export interface ComboScoringInspectorFactor {
   key: ComboScoringInspectorFactorKey;
@@ -376,6 +389,8 @@ export interface ComboScoringInspectorCombo {
   strategy: string;
   taskType: string;
   weights: Record<ComboScoringInspectorFactorKey, number>;
+  weightSource: ComboScoringInspectorWeightSource;
+  modePack: string | null;
   selectedExecutionKey: string | null;
   targets: ComboScoringInspectorTarget[];
   warnings: string[];

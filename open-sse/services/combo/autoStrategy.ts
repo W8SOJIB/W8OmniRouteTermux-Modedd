@@ -21,18 +21,30 @@
  */
 
 import { isRecord } from "./comboData.ts";
-import type { AutoProviderCandidate, ComboLike, ResolvedComboTarget } from "./types.ts";
+import type {
+  AutoProviderCandidate,
+  ComboLike,
+  HistoricalLatencyStatsEntry,
+  ResolvedComboTarget,
+} from "./types.ts";
 import { extractSessionAffinityKey } from "@/sse/services/auth";
+import { filterChatSelectableModels } from "../modelEndpointPolicy.ts";
 import { DEFAULT_INTENT_CONFIG, type IntentClassifierConfig } from "../intentClassifier.ts";
 import { getTaskFitness } from "../autoCombo/taskFitness.ts";
 import {
   calculateFactors,
   calculateScore,
+  computePoolMaxima,
   type ProviderCandidate,
   type ScoringWeights,
 } from "../autoCombo/scoring.ts";
 import type { RoutingHint } from "../manifestAdapter";
-import { getProviderConnections } from "../../../src/lib/db/providers";
+import { getCachedProviderConnections } from "../../../src/lib/db/readCache";
+import {
+  getSyncedAvailableModels,
+  getCustomModels,
+  getHiddenModelsByProvider,
+} from "../../../src/lib/db/models";
 import { getProviderModels } from "../../config/providerModels.ts";
 import {
   getConnectionRoutingTags,
@@ -243,7 +255,10 @@ export async function applyRequestTagRouting(
   await Promise.all(
     providerIds.map(async (providerId) => {
       try {
-        const connections = await getProviderConnections({ provider: providerId, isActive: true });
+        const connections = await getCachedProviderConnections({
+          provider: providerId,
+          isActive: true,
+        });
         providerConnections.set(
           providerId,
           Array.isArray(connections) ? (connections as Array<Record<string, unknown>>) : []
@@ -343,6 +358,11 @@ export function scoreAutoTargets(
 ) {
   const targetByExecutionKey = new Map(targets.map((target) => [target.executionKey, target]));
   const activeCandidates = candidates.filter((candidate) => candidate.quotaCutoffBlocked !== true);
+  // Computed once per scoring pass, not per candidate — see computePoolMaxima's
+  // doc comment (scoring.ts) for the O(n^2) OOM this avoids on large auto-combo
+  // candidate pools (#OOM incident, zero-config auto combo expanding to 1000s
+  // of provider/model targets).
+  const poolMaxima = computePoolMaxima(activeCandidates as unknown as ProviderCandidate[]);
 
   return activeCandidates
     .map((candidate) => {
@@ -365,10 +385,11 @@ export function scoreAutoTargets(
       };
       const factors = calculateFactors(
         candidate as ProviderCandidate,
-        activeCandidates,
+        activeCandidates as unknown as ProviderCandidate[],
         taskType ?? "general",
         getTaskFitness,
-        manifestHint ?? undefined
+        manifestHint ?? undefined,
+        poolMaxima
       );
       let score = calculateScore(factors, weights);
       // B17: Quota Share soft-policy deprioritization
@@ -414,8 +435,24 @@ export async function expandAutoComboCandidatePool(
   if (Array.isArray(localAutoConfig?.candidatePool) && localAutoConfig.candidatePool.length > 0)
     return eligibleTargets;
 
+  // #COMBO-REF: if the combo references other combos via kind:"combo-ref" entries,
+  // the resolved eligibleTargets already represent the operator's intended pool.
+  // Expanding to ALL providers would defeat the purpose of the combo-ref constraint
+  // (e.g. an "auto" combo delegating to a "priority" sub-combo should not pull in
+  // every model from every active provider).
+  // When the operator has populated the combo's models[] (the common
+  // case for combos created through the dashboard multi-model editor
+  // with strategy=auto), the explicit list IS the candidate pool.
+  // Expansion to every active provider's catalog would silently
+  // override the operator's intent and inject models the operator
+  // never approved. Only fall through to the full-catalog expansion
+  // when the operator has not pre-populated a models[] (pure-auto
+  // combos that want to score every model).
+  const explicitModels = (combo as Record<string, unknown> | null | undefined)?.models;
+  if (Array.isArray(explicitModels) && explicitModels.length > 0) return eligibleTargets;
+
   try {
-    const allConnections = await getProviderConnections({ isActive: true });
+    const allConnections = await getCachedProviderConnections({ isActive: true });
     const providerIds = [
       ...new Set(
         (allConnections as Array<{ provider?: unknown }>)
@@ -423,11 +460,36 @@ export async function expandAutoComboCandidatePool(
           .filter((p): p is string => typeof p === "string" && p.length > 0)
       ),
     ];
+    // Pre-build a Set of already-present modelStr values so candidate-pool
+    // expansion doesn't turn into O(n^2) per provider. See #OOM incident
+    // (zero-config auto combo expanding to 1000s of provider/model targets).
+    const seenModelStrs = new Set(eligibleTargets.map((t) => t.modelStr));
+    const hiddenModelsMap = getHiddenModelsByProvider();
     for (const providerId of providerIds) {
-      const providerModels = getProviderModels(providerId);
-      for (const model of providerModels) {
-        const modelStr = `${providerId}/${model.id}`;
-        if (!eligibleTargets.some((t) => t.modelStr === modelStr)) {
+      // #auto-pool-visible-only: when the operator has synced/custom models for
+      // this provider, expand ONLY those (minus hidden); fall back to the static
+      // catalog only when the user has none. This keeps catalog-only models
+      // (e.g. openrouter/auto) out of pure-auto pools when the operator only
+      // synced a subset (e.g. OpenRouter with importFreeModelsOnly).
+      // #11088 (option 1): the synced store now persists non-chat models too —
+      // chat combo pools must keep filtering them out at read time.
+      const [syncedModelsRaw, customModels] = await Promise.all([
+        getSyncedAvailableModels(providerId),
+        getCustomModels(providerId),
+      ]);
+      const syncedModels = filterChatSelectableModels(providerId, syncedModelsRaw);
+      const hiddenModels = hiddenModelsMap.get(providerId);
+      const userVisibleIds = new Set<string>();
+      for (const m of syncedModels) if (m.id && !hiddenModels?.has(m.id)) userVisibleIds.add(m.id);
+      for (const m of customModels) if (m.id && !hiddenModels?.has(m.id)) userVisibleIds.add(m.id);
+      const hasUserModels = userVisibleIds.size > 0;
+      const expandIds = hasUserModels
+        ? Array.from(userVisibleIds)
+        : getProviderModels(providerId).map((m) => m.id);
+      for (const modelId of expandIds) {
+        const modelStr = `${providerId}/${modelId}`;
+        if (!seenModelStrs.has(modelStr)) {
+          seenModelStrs.add(modelStr);
           eligibleTargets.push({
             kind: "model",
             stepId: modelStr,
@@ -472,4 +534,24 @@ export function deriveComboSessionKey(body: Record<string, unknown>): string | n
   } catch {
     return null;
   }
+}
+
+/**
+ * Surface TTFT/E2E-latency/tokens-per-second from a historical latency-stats
+ * entry onto an AutoProviderCandidate's speed-telemetry fields (#6875). Pure
+ * projection — only positive, finite numbers pass through; anything else is
+ * omitted so the existing speed-ranking factor (speedRanking.ts, #6011) falls
+ * back to its own pool-median default instead of scoring on a bad 0/NaN.
+ */
+export function deriveSpeedTelemetry(
+  metric: HistoricalLatencyStatsEntry | null
+): Pick<AutoProviderCandidate, "avgTtftMs" | "avgE2ELatencyMs" | "avgTokensPerSecond"> {
+  const positive = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+
+  return {
+    avgTtftMs: positive(metric?.avgTtftMs),
+    avgE2ELatencyMs: positive(metric?.avgE2ELatencyMs),
+    avgTokensPerSecond: positive(metric?.avgTokensPerSecond),
+  };
 }

@@ -45,7 +45,7 @@ async function resetStorage() {
   for (let attempt = 0; attempt < 10; attempt++) {
     try {
       if (fs.existsSync(TEST_DATA_DIR)) {
-        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
       break;
     } catch (error: unknown) {
@@ -109,7 +109,7 @@ test.beforeEach(async () => {
 test.after(async () => {
   apiKeysDb.resetApiKeyState();
   coreDb.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 // ---------------------------------------------------------------------------
@@ -146,6 +146,26 @@ test("disableNonPublicModels=true + auto/<group> request → not rejected by pub
       `auto/ model must not be blocked by published-model gate; got: ${body.error.message}`
     );
   }
+});
+
+test("reasoning routing preserves auto/* targets during API-key re-check", async () => {
+  const created = await apiKeysDb.createApiKey("Reasoning Auto Key", "machine-reasoning-auto");
+  await apiKeysDb.updateApiKeyPermissions(created.id, {
+    allowedModels: ["openai/gpt-4o-mini"],
+    disableNonPublicModels: true,
+  });
+  apiKeysDb.clearApiKeyCaches();
+
+  const policy = await loadPolicy("reasoning-auto-target");
+  const metadata = await apiKeysDb.getApiKeyMetadata(created.key);
+  const rejection = await policy.validateApiKeyRoutingTarget(
+    makeRequest(created.key),
+    created.key,
+    metadata,
+    "auto/coding"
+  );
+
+  assert.equal(rejection, null, "auto/* is a virtual combo target and must remain allowed");
 });
 
 test("disableNonPublicModels=true + qtSd/ virtual model → not rejected by published-model gate", async () => {

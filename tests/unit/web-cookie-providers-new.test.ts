@@ -6,6 +6,7 @@ const { PoeWebExecutor } = await import("../../open-sse/executors/poe-web.ts");
 const { VeniceWebExecutor } = await import("../../open-sse/executors/venice-web.ts");
 const { V0VercelWebExecutor } = await import("../../open-sse/executors/v0-vercel-web.ts");
 const { KimiWebExecutor } = await import("../../open-sse/executors/kimi-web.ts");
+const { MoonshotExecutor } = await import("../../open-sse/executors/moonshot.ts");
 const { DoubaoWebExecutor } = await import("../../open-sse/executors/doubao-web.ts");
 const { QwenWebExecutor } = await import("../../open-sse/executors/qwen-web.ts");
 const { getExecutor, hasSpecializedExecutor } = await import("../../open-sse/executors/index.ts");
@@ -118,9 +119,11 @@ test("HuggingChat executor is registered", () => {
 
 test("Poe Web executor is registered", () => {
   assert.ok(hasSpecializedExecutor("poe-web"));
-  assert.ok(hasSpecializedExecutor("poe"));
   const executor = getExecutor("poe-web");
   assert.ok(executor instanceof PoeWebExecutor);
+  // #8969: canonical API-key `poe` must not route through PoeWebExecutor.
+  assert.equal(hasSpecializedExecutor("poe"), false);
+  assert.ok(!(getExecutor("poe") instanceof PoeWebExecutor));
 });
 
 test("Venice Web executor is registered", () => {
@@ -138,13 +141,12 @@ test("v0 Vercel Web executor is registered", () => {
 });
 
 test("Kimi Web executor is registered", () => {
-  assert.ok(hasSpecializedExecutor("kimi-web"));
-  // #4699: the `kimi` API-key provider must NOT be routed through KimiWebExecutor
-  // (Bug 2) — it correctly falls through to DefaultExecutor. Only the explicit
-  // kimi-web alias keeps the specialized web executor.
-  assert.equal(hasSpecializedExecutor("kimi"), false);
-  const executor = getExecutor("kimi-web");
-  assert.ok(executor instanceof KimiWebExecutor);
+  assert.ok(getExecutor("kimi-web") instanceof KimiWebExecutor);
+  // #4699: the legacy `kimi` API-key id must never route through Kimi Web.
+  assert.ok(hasSpecializedExecutor("kimi"));
+  const legacyExecutor = getExecutor("kimi");
+  assert.ok(legacyExecutor instanceof MoonshotExecutor);
+  assert.ok(!(legacyExecutor instanceof KimiWebExecutor));
 });
 
 test("Doubao Web executor is registered", () => {
@@ -190,7 +192,6 @@ test("Doubao Web sets correct provider", () => {
 
 test("Qwen Web executor is registered", () => {
   assert.ok(hasSpecializedExecutor("qwen-web"));
-  assert.ok(hasSpecializedExecutor("qw"));
   const executor = getExecutor("qwen-web");
   assert.ok(executor instanceof QwenWebExecutor);
 });
@@ -669,7 +670,7 @@ test("v0 Vercel Web: error response returns error result", async () => {
 
 // ── Kimi Web Execution Tests ─────────────────────────────────────────────────
 
-test("Kimi Web: targets www.kimi.com (international)", async () => {
+test("Kimi Web: targets www.kimi.ai (international)", async () => {
   // The new executor talks to the Connect-RPC streaming endpoint on the
   // international domain. A bare empty credential is rejected before the
   // fetch fires, so we feed a fake JWT and let the mock absorb the request.
@@ -683,11 +684,11 @@ test("Kimi Web: targets www.kimi.com (international)", async () => {
     });
     assert.ok(result.response instanceof Response);
     // Parse the URL and assert on the exact hostname rather than a substring
-    // match — `includes("www.kimi.com")` would also accept a hostile host like
-    // `www.kimi.com.evil.net` or `evil.net/?x=www.kimi.com` (CodeQL
+    // match — `includes("www.kimi.ai")` would also accept a hostile host like
+    // `www.kimi.ai.evil.net` or `evil.net/?x=www.kimi.ai` (CodeQL
     // js/incomplete-url-substring-sanitization).
     const host = new URL(result.url).hostname;
-    assert.equal(host, "www.kimi.com", `got ${result.url}`);
+    assert.equal(host, "www.kimi.ai", `got ${result.url}`);
     assert.notEqual(host, "www.moonshot.cn", `got ${result.url}`);
   } finally {
     restore.restore();

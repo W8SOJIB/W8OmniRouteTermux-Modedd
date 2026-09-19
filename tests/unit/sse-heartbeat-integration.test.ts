@@ -103,7 +103,7 @@ test("integration: openai-chunk heartbeat is valid JSON parseable by SDKs", asyn
     const { value, done } = await readWithTimeout(reader);
     if (done) break;
     const chunk = decodeChunk(value);
-    if (chunk.startsWith("data: ") && chunk.includes("omniroute-keepalive")) {
+    if (chunk.startsWith("data: ") && chunk.includes("chatcmpl-keepalive")) {
       const jsonStr = chunk.slice(6, chunk.indexOf("\n\n"));
       const parsed = JSON.parse(jsonStr); // must not throw
       assert.equal(parsed.object, "chat.completion.chunk");
@@ -118,7 +118,7 @@ test("integration: openai-chunk heartbeat is valid JSON parseable by SDKs", asyn
 });
 
 test("integration: shapeForClientFormat + createSseHeartbeatTransform pipeline (claude path)", async () => {
-  // Simulates what chatCore.ts does at line 4276
+  // Simulates what chatCore.ts does
   const shape = shapeForClientFormat("claude");
   assert.equal(shape, HEARTBEAT_SHAPES.ANTHROPIC_PING);
 
@@ -136,6 +136,6 @@ test("integration: shapeForClientFormat + createSseHeartbeatTransform pipeline (
   const reader = upstream.pipeThrough(transform).getReader();
   await reader.read(); // first real
   const { value } = await readWithTimeout(reader);
-  assert.match(decodeChunk(value), /^event: ping\ndata: \{\}\n\n$/);
+  assert.match(decodeChunk(value), /^event: ping\ndata: \{"type":"ping"\}\n\n$/);
   await reader.cancel();
 });

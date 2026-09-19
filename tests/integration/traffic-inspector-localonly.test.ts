@@ -19,7 +19,7 @@ const { isLocalOnlyPath, isLoopbackHost } = await import(
 );
 
 test.after(() => {
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 // ── isLocalOnlyPath assertions ──────────────────────────────────────────────

@@ -70,7 +70,7 @@ export interface UseModelVisibilityHandlersReturn {
   clearingModels: boolean;
   modelFilter: string;
   testingModelId: string | null;
-  modelTestStatus: Record<string, "ok" | "error">;
+  modelTestStatus: Record<string, "ok" | "error" | "quota">;
   testingAll: boolean;
   testProgress: { done: number; total: number } | null;
   autoHideFailed: boolean;
@@ -91,7 +91,7 @@ export interface UseModelVisibilityHandlersReturn {
   handleTestAll: (targets: Array<{ modelId: string; fullModel: string }>) => Promise<void>;
   /** Apply a model's test-all result to the per-row status icon (used by the
    *  passthrough section, which runs its own test-all loop). */
-  onModelTestStatusChange: (modelId: string, status: "ok" | "error") => void;
+  onModelTestStatusChange: (modelId: string, status: "ok" | "error" | "quota") => void;
 }
 
 // ──── hook ───────────────────────────────────────────────────────────────────
@@ -116,7 +116,7 @@ export function useModelVisibilityHandlers({
   const [clearingModels, setClearingModels] = useState(false);
   const [modelFilter, setModelFilter] = useState("");
   const [testingModelId, setTestingModelId] = useState<string | null>(null);
-  const [modelTestStatus, setModelTestStatus] = useState<Record<string, "ok" | "error">>({});
+  const [modelTestStatus, setModelTestStatus] = useState<Record<string, "ok" | "error" | "quota">>({});
   const [testingAll, setTestingAll] = useState(false);
   const [testProgress, setTestProgress] = useState<{ done: number; total: number } | null>(null);
   const [autoHideFailed, setAutoHideFailed] = useState(false);
@@ -316,11 +316,13 @@ export function useModelVisibilityHandlers({
         // extractApiErrorMessage coerces any object-shaped `error` (e.g. a Zod
         // format object) to a string so notify.error never hands the toast a
         // non-string child (React #31 → frozen page).
-        notify.error(extractApiErrorMessage(data, "Model test failed"));
+        notify.error(
+          extractApiErrorMessage(data, providerText(t, "modelTestFailed", "Model test failed"))
+        );
         setModelTestStatus((prev) => ({ ...prev, [modelId]: "error" }));
       }
     } catch (err) {
-      notify.error("Network error testing model");
+      notify.error(providerText(t, "modelTestNetworkError", "Network error testing model"));
       setModelTestStatus((prev) => ({ ...prev, [modelId]: "error" }));
     } finally {
       setTestingModelId(null);
@@ -352,7 +354,7 @@ export function useModelVisibilityHandlers({
               results?: Record<
                 string,
                 {
-                  status?: "ok" | "error";
+                  status?: "ok" | "error" | "slow";
                   rateLimited?: boolean;
                   isTimeout?: boolean;
                   error?: string;
@@ -370,8 +372,12 @@ export function useModelVisibilityHandlers({
 
             const entry = result.results?.[fullModel];
             const outcome = evaluateTestAllEntry(entry, autoHideFailed);
-            // Paint the per-model icon green/red, same as the single-model ▶ test.
-            setModelTestStatus((prev) => ({ ...prev, [modelId]: outcome.status }));
+            // #9511: paint "quota" status for quota-exhausted models (amber badge),
+            // "ok" for healthy, "error" for genuine failures.
+            setModelTestStatus((prev) => ({
+              ...prev,
+              [modelId]: outcome.isQuota ? "quota" : outcome.status,
+            }));
             if (outcome.status === "ok") {
               ok++;
             } else {
@@ -431,7 +437,7 @@ export function useModelVisibilityHandlers({
     handleClearAllModels,
     onTestModel,
     handleTestAll,
-    onModelTestStatusChange: (modelId: string, status: "ok" | "error") =>
+    onModelTestStatusChange: (modelId: string, status: "ok" | "error" | "quota") =>
       setModelTestStatus((prev) => ({ ...prev, [modelId]: status })),
   };
 }

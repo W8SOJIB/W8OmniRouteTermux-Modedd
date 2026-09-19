@@ -21,12 +21,12 @@ async function resetStorage() {
       const targetPath = path.join(TEST_DATA_DIR, entry);
       const stat = fs.lstatSync(targetPath);
       if (stat.isDirectory()) {
-        fs.rmSync(targetPath, { recursive: true, force: true });
+        fs.rmSync(targetPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       } else {
         await backupDb.unlinkFileWithRetry(targetPath, { maxAttempts: 20, baseDelayMs: 25 });
       }
     }
-    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
@@ -78,7 +78,7 @@ test.beforeEach(async () => {
 
 test.after(async () => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("backupDbFile creates manual backups and listDbBackups returns metadata", async () => {
@@ -98,7 +98,7 @@ test("backupDbFile creates manual backups and listDbBackups returns metadata", a
 });
 
 test("listDbBackups returns an empty list when the backup directory is missing", async () => {
-  fs.rmSync(core.DB_BACKUPS_DIR, { recursive: true, force: true });
+  fs.rmSync(core.DB_BACKUPS_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   const backups = await backupDb.listDbBackups();
   assert.deepEqual(backups, []);
 });

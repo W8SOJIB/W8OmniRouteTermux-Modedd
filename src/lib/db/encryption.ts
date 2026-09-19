@@ -52,6 +52,31 @@ export interface ConnectionFields {
 }
 
 /**
+ * #9927 — dedupe tracker for credential-decrypt-failure messages. The health
+ * sweep / refresh / request routing re-decrypt the same corrupt row every
+ * cycle; we log the enriched, actionable message ONCE per
+ * (provider + connection + failing-ciphertext) state so it does not spam
+ * every sweep, while still re-logging if the row state actually changes
+ * (e.g. a different field starts failing) instead of permanently suppressing.
+ */
+const loggedDecryptFailures = new Set<string>();
+
+function decryptFailureSignature(
+  connectionId: string,
+  provider: string,
+  failed: Array<{ field: string; value: unknown }>
+): string {
+  const parts = failed
+    .map((f) => `${f.field}:${typeof f.value === "string" ? f.value : ""}`)
+    .sort()
+    .join("|");
+  return `${provider}::${connectionId}::${parts}`;
+}
+
+const RECOVERY_HINT =
+  "Re-authenticate this account, or verify STORAGE_ENCRYPTION_KEY matches the key used to store it.";
+
+/**
  * Derive the PRIMARY encryption key using the static salt.
  * This is the canonical key derivation that all new encryptions use.
  * Returns null if no encryption key is configured.
@@ -157,7 +182,10 @@ export function encrypt(plaintext: string | null | undefined): string | null | u
  * auto-migration: the next encrypt() call will re-encrypt it with the
  * static-salt key, gradually migrating the database.
  */
-export function decrypt(ciphertext: string | null | undefined): string | null | undefined {
+export function decrypt(
+  ciphertext: string | null | undefined,
+  opts?: { quiet?: boolean }
+): string | null | undefined {
   if (!ciphertext || typeof ciphertext !== "string") return ciphertext;
 
   // Not encrypted — return as-is (legacy plaintext or passthrough mode)
@@ -204,14 +232,21 @@ export function decrypt(ciphertext: string | null | undefined): string | null | 
       return decrypted;
     }
 
-    console.error(
-      `[Encryption] Decryption failed. Ciphertext prefix: ${ciphertext.slice(0, 30)}... ` +
-        `Auth tag validation likely failed.`
-    );
+    // #9927 — the low-level generic log is suppressed when called through the
+    // connection-decryption path (quiet:true); decryptConnectionFields emits a
+    // single enriched message naming the credential + recovery path instead.
+    if (!opts?.quiet) {
+      console.error(
+        `[Encryption] Decryption failed. Ciphertext prefix: ${ciphertext.slice(0, 30)}... ` +
+          `Auth tag validation likely failed.`
+      );
+    }
     return null;
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error("[Encryption] Decryption failed:", message);
+    if (!opts?.quiet) {
+      console.error("[Encryption] Decryption failed:", message);
+    }
     return null;
   }
 }
@@ -242,10 +277,13 @@ export function decryptConnectionFields<T extends ConnectionFields | null | unde
   if (!row) return row;
   if (!isEncryptionEnabled()) return row;
 
-  const apiKey = decrypt(row.apiKey);
-  const accessToken = decrypt(row.accessToken);
-  const refreshToken = decrypt(row.refreshToken);
-  const idToken = decrypt(row.idToken);
+  // quiet:true — the low-level generic decrypt() log is suppressed here so a
+  // single failure emits ONE enriched message (below) naming the credential
+  // and recovery path (#9927) instead of one generic line per field per cycle.
+  const apiKey = decrypt(row.apiKey, { quiet: true });
+  const accessToken = decrypt(row.accessToken, { quiet: true });
+  const refreshToken = decrypt(row.refreshToken, { quiet: true });
+  const idToken = decrypt(row.idToken, { quiet: true });
 
   // #6148 — a stored credential that is still encrypted (`enc:v1:…`) but
   // decrypts to null means the STORAGE_ENCRYPTION_KEY changed or was unset.
@@ -256,6 +294,31 @@ export function decryptConnectionFields<T extends ConnectionFields | null | unde
     (looksEncrypted(row.accessToken) && accessToken === null) ||
     (looksEncrypted(row.refreshToken) && refreshToken === null) ||
     (looksEncrypted(row.idToken) && idToken === null);
+
+  if (credentialDecryptFailed) {
+    const failed: Array<{ field: string; value: unknown }> = [];
+    if (looksEncrypted(row.apiKey) && apiKey === null) failed.push({ field: "apiKey", value: row.apiKey });
+    if (looksEncrypted(row.accessToken) && accessToken === null)
+      failed.push({ field: "accessToken", value: row.accessToken });
+    if (looksEncrypted(row.refreshToken) && refreshToken === null)
+      failed.push({ field: "refreshToken", value: row.refreshToken });
+    if (looksEncrypted(row.idToken) && idToken === null) failed.push({ field: "idToken", value: row.idToken });
+
+    const connectionId = typeof row.id === "string" ? row.id : "";
+    const provider = typeof row.provider === "string" ? row.provider : "unknown";
+    const fields = failed.map((f) => f.field).join(", ");
+
+    // Dedupe per credential/row state: the sweep re-decrypts the same corrupt
+    // row every cycle — log ONCE unless the failing state actually changes.
+    const signature = decryptFailureSignature(connectionId, provider, failed);
+    if (!loggedDecryptFailures.has(signature)) {
+      loggedDecryptFailures.add(signature);
+      console.error(
+        `[Encryption] Failed to decrypt credential(s) [${fields}] for provider ` +
+          `"${provider}" (connection ${connectionId || "unknown"}). ${RECOVERY_HINT}`
+      );
+    }
+  }
 
   return {
     ...row,

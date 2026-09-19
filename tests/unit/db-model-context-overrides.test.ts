@@ -14,7 +14,7 @@ const mco = await import("../../src/lib/db/modelContextOverrides.ts");
 
 function resetStorage() {
   coreDb.resetDbInstance();
-  fs.rmSync(moduleDataDir, { recursive: true, force: true });
+  fs.rmSync(moduleDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(moduleDataDir, { recursive: true });
 }
 
@@ -26,7 +26,7 @@ beforeEach(() => {
 
 after(() => {
   coreDb.resetDbInstance();
-  fs.rmSync(moduleDataDir, { recursive: true, force: true });
+  fs.rmSync(moduleDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 describe("modelContextOverrides", () => {

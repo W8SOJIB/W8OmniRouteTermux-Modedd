@@ -9,6 +9,86 @@ const CODEX_QUOTA_ORDER: Record<string, number> = {
   gpt_5_3_codex_spark_weekly: 3,
   banked_reset_credits: 4,
 };
+const GLM_FAMILY_PROVIDERS = ["glm", "glm-cn", "glmt", "opencode-go"];
+const KIMI_CODING_PROVIDERS = ["kimi-coding", "kimi-coding-apikey"];
+
+/**
+ * Providers whose quotas already get a deterministic fixed-window order below
+ * (Codex, GLM family, and Kimi Coding). Display layers (e.g. QuotaCardExpanded)
+ * must not re-sort these by remaining percentage, or they undo this order (#6687).
+ */
+export function hasFixedQuotaOrder(providerId: string | undefined): boolean {
+  const id = String(providerId || "").toLowerCase();
+  return id === "codex" || GLM_FAMILY_PROVIDERS.includes(id) || KIMI_CODING_PROVIDERS.includes(id);
+}
+
+/**
+ * Canonical chronological rank of a rolling usage window, derived from the
+ * quota key itself rather than from a provider list.
+ *
+ * Providers name the same two windows in mutually incompatible ways —
+ * `"session (5h)"` (claude, minimax, kimi), `"5 Hours Quota"` (GLM/zai),
+ * `"five_hour"` (command-code, qwen-token-plan), `"code_5h"` (kimi-coding),
+ * plain `"session"` (codex) — so matching on the shape of the key is the only
+ * thing that generalizes. Returns `null` for anything that is not a recognizable
+ * time window (per-model buckets, credit balances, token counters), which is
+ * what keeps this from claiming quotas it has no opinion about.
+ */
+export function quotaWindowRank(name: unknown): number | null {
+  const key = String(name ?? "")
+    .trim()
+    .toLowerCase();
+  if (!key) return null;
+  // Order matters: "mcp_monthly" must not be caught by the weekly probe, and
+  // "5 Hours Quota" must not be caught by anything before the session probe.
+  if (/month/.test(key)) return 2;
+  if (/week|7\s*d\b|_7d\b|seven[_\s-]?day/.test(key)) return 1;
+  if (/session|hour|\b5\s*h\b|_5h\b/.test(key)) return 0;
+  return null;
+}
+
+/**
+ * #7764: whether a quota list is a set of rolling time windows whose relative
+ * order is inherent (session before weekly before monthly) and must therefore
+ * survive rendering.
+ *
+ * This is the structural counterpart to the provider whitelist above. The
+ * whitelist exists because a few providers need an order the window rank cannot
+ * express (Codex interleaves GPT-5.3-Codex-Spark windows and a banked-credit
+ * row between the canonical ones), but it went stale the moment any other
+ * provider started reporting session+weekly — claude, minimax, zai and
+ * command-code all do. Deriving the answer from the data means the next such
+ * provider is covered on arrival.
+ *
+ * Requires at least two DISTINCT ranks: with a single window there is no pair
+ * to keep stable, so the pre-existing worst-status-first sort is left alone.
+ */
+export function hasCanonicalWindowOrder(quotas: unknown): boolean {
+  if (!Array.isArray(quotas)) return false;
+  const ranks = new Set<number>();
+  for (const quota of quotas) {
+    if (!quota || (quota as any).isCredits) continue;
+    const rank = quotaWindowRank((quota as any).name);
+    if (rank !== null) ranks.add(rank);
+  }
+  return ranks.size >= 2;
+}
+
+/**
+ * Stable sort of a quota list into canonical window order. Unrecognized entries
+ * (credits, token counters, per-model buckets) sink below the windows while
+ * keeping their relative order, so nothing is lost or shuffled.
+ */
+export function sortQuotasByWindow<T>(quotas: T[]): T[] {
+  return [...quotas]
+    .map((quota, index) => ({ quota, index }))
+    .sort((a, b) => {
+      const ra = quotaWindowRank((a.quota as any)?.name) ?? 99;
+      const rb = quotaWindowRank((b.quota as any)?.name) ?? 99;
+      return ra - rb || a.index - b.index;
+    })
+    .map((entry) => entry.quota);
+}
 
 function quotaEntries(data: any): Array<[string, any]> {
   return data?.quotas && typeof data.quotas === "object" ? Object.entries(data.quotas) : [];
@@ -43,14 +123,24 @@ function getResetAdjustedQuota(quota: any) {
 
 function normalizeQuotaEntry(name: string, quota: any = {}, extras: any = {}) {
   const adjusted = getResetAdjustedQuota(quota);
+  const remaining = Number(quota?.remaining);
   return {
     name,
     used: Number.isFinite(adjusted.used) ? adjusted.used : 0,
     total: adjusted.total,
+    ...(Number.isFinite(remaining) ? { remaining } : {}),
     resetAt: quota?.resetAt || null,
     staleAfterReset: adjusted.staleAfterReset,
     ...(adjusted.remainingPercentage !== undefined
       ? { remainingPercentage: adjusted.remainingPercentage }
+      : {}),
+    ...(quota?.extraCreditsInferred !== undefined
+      ? { extraCreditsInferred: Number(quota.extraCreditsInferred) || 0 }
+      : {}),
+    ...(quota?.overPlan !== undefined ? { overPlan: quota.overPlan === true } : {}),
+    ...(quota?.displayName !== undefined ? { displayName: String(quota.displayName) } : {}),
+    ...(quota?.isPercentageOnly !== undefined
+      ? { isPercentageOnly: quota.isPercentageOnly === true }
       : {}),
     ...extras,
   };
@@ -147,12 +237,39 @@ function parseCodex(data: any) {
   return quotas;
 }
 
+function buildClaudeExtraUsageQuota(extraUsage: any) {
+  const monthlyLimit = Number(extraUsage?.monthly_limit ?? 0);
+  const usedCredits = Number(extraUsage?.used_credits ?? 0);
+  const utilization = Number(extraUsage?.utilization ?? 0);
+  const remainingPercentage = Number.isFinite(utilization)
+    ? Math.max(0, 100 - utilization)
+    : undefined;
+  const remaining = Number.isFinite(monthlyLimit) ? Math.max(0, monthlyLimit - usedCredits) : 0;
+
+  return buildCreditsQuota("extra_usage", remaining, remainingPercentage ?? 100, {
+    used: Number.isFinite(usedCredits) ? usedCredits : 0,
+    total: Number.isFinite(monthlyLimit) ? monthlyLimit : 0,
+    currency: extraUsage?.currency,
+  });
+}
+
+// #6806: some Claude plans (e.g. "default_raven_enterprise") return no
+// five_hour/seven_day utilization windows at all — only a credit-billing
+// extraUsage block — so quotas can be {} while extraUsage still holds real,
+// actionable usage data. Fold it in instead of falling back to "No quota data".
 function parseClaude(data: any) {
   if (data?.message)
     return [{ name: "error", used: 0, total: 0, resetAt: null, message: data.message }];
-  return quotaEntries(data).map(([name, quota]) =>
+
+  const quotas = quotaEntries(data).map(([name, quota]) =>
     normalizeQuotaEntry(name, quota, { isPercentageOnly: true })
   );
+
+  if (data?.extraUsage?.is_enabled) {
+    quotas.push(buildClaudeExtraUsageQuota(data.extraUsage));
+  }
+
+  return quotas;
 }
 
 function parseDeepseekQuota(quotaKey: string, quota: any) {
@@ -169,6 +286,27 @@ function parseDeepseek(data: any) {
   return quotaEntries(data).map(([quotaKey, quota]) => parseDeepseekQuota(quotaKey, quota));
 }
 
+// #10078 follow-up: AgentRouter's `quotas.balance` entry (open-sse/services/usage/agentrouter.ts)
+// carries a real USD amount in `remaining` + `currency: "USD"`. The generic path
+// (normalizeQuotaEntry via parseGeneric) drops `currency` entirely and never sets
+// `isCredits`/`creditCount`, so QuotaCardBody/QuotaCardExpanded's dollar-formatted
+// renderer (which only activates on `q.isCredits`) never triggers — the balance was
+// rendered as a bare "100%/0% left" percentage instead of "$X.XX". Route it through
+// buildCreditsQuota() (same shape DeepSeek/Claude-extra-usage credits rows use) so the
+// dollar figure — and an exhausted ($0.00) balance — render unambiguously as USD.
+function parseAgentrouterQuota(quotaKey: string, quota: any) {
+  if (quotaKey !== "balance") return normalizeQuotaEntry(quotaKey, quota);
+  const remaining = Math.max(0, Number(quota?.remaining ?? 0));
+  const currency = quota?.currency || "USD";
+  const remainingPercentage =
+    safePercentage(quota?.remainingPercentage) ?? (remaining > 0 ? 100 : 0);
+  return buildCreditsQuota(currency, remaining, remainingPercentage, { currency });
+}
+
+function parseAgentrouter(data: any) {
+  return quotaEntries(data).map(([quotaKey, quota]) => parseAgentrouterQuota(quotaKey, quota));
+}
+
 function parseProviderQuotas(providerId: string, data: any) {
   if (providerId === "github") return parseGithub(data);
   if (["glm", "glm-cn", "glmt", "opencode-go"].includes(providerId)) return parseGlmFamily(data);
@@ -176,6 +314,7 @@ function parseProviderQuotas(providerId: string, data: any) {
   if (providerId === "codex") return parseCodex(data);
   if (providerId === "claude") return parseClaude(data);
   if (providerId === "deepseek") return parseDeepseek(data);
+  if (providerId === "agentrouter") return parseAgentrouter(data);
   return parseGeneric(data);
 }
 
@@ -190,13 +329,26 @@ function sortProviderModelOrder(provider: string, quotas: any[]) {
 }
 
 function sortGlmOrder(providerId: string, quotas: any[]) {
-  if (!["glm", "glm-cn", "glmt", "opencode-go"].includes(providerId)) return;
+  if (!GLM_FAMILY_PROVIDERS.includes(providerId)) return;
   quotas.sort((a, b) => (GLM_QUOTA_ORDER[a.name] ?? 99) - (GLM_QUOTA_ORDER[b.name] ?? 99));
 }
 
 function sortCodexOrder(providerId: string, quotas: any[]) {
   if (providerId !== "codex") return;
   quotas.sort((a, b) => (CODEX_QUOTA_ORDER[a.name] ?? 99) - (CODEX_QUOTA_ORDER[b.name] ?? 99));
+}
+
+function sortKimiOrder(providerId: string, quotas: any[]) {
+  if (!KIMI_CODING_PROVIDERS.includes(providerId)) return;
+  const rank = (name: string) => {
+    if (/^code_5h(?:_|$)/.test(name)) return 0;
+    if (/^code_7d(?:_|$)/.test(name)) return 1;
+    return 99;
+  };
+  quotas.sort((a, b) => {
+    const rankDiff = rank(String(a.name)) - rank(String(b.name));
+    return rankDiff || String(a.name).localeCompare(String(b.name));
+  });
 }
 
 export function parseQuotaData(provider: string | undefined, data: any) {
@@ -208,6 +360,7 @@ export function parseQuotaData(provider: string | undefined, data: any) {
     sortProviderModelOrder(provider, normalizedQuotas);
     sortGlmOrder(providerId, normalizedQuotas);
     sortCodexOrder(providerId, normalizedQuotas);
+    sortKimiOrder(providerId, normalizedQuotas);
     return normalizedQuotas;
   } catch (error) {
     console.error(`Error parsing quota data for ${provider}:`, error);

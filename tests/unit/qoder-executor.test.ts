@@ -6,6 +6,8 @@ import path from "node:path";
 
 import { QoderExecutor } from "../../open-sse/executors/qoder.ts";
 import { getQwenCliUserAgent } from "../../open-sse/config/providerHeaderProfiles.ts";
+import { qoderProvider } from "../../open-sse/config/providers/registry/qoder/index.ts";
+import { FREE_MODEL_BUDGETS } from "../../open-sse/config/freeModelCatalog.data.ts";
 import {
   buildQoderPrompt,
   getStaticQoderModels,
@@ -47,7 +49,7 @@ function withStubQoderCli(fn: () => void | Promise<void>) {
   const restore = () => {
     if (prevBin === undefined) delete process.env.CLI_QODER_BIN;
     else process.env.CLI_QODER_BIN = prevBin;
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   };
   return Promise.resolve().then(fn).finally(restore);
 }
@@ -110,15 +112,35 @@ test("normalizeQoderPatProviderData forces PAT + qodercli transport", () => {
 
 test("mapQoderModelToLevel maps static models to qodercli levels", () => {
   assert.equal(mapQoderModelToLevel("qoder-rome-30ba3b"), "qmodel");
-  assert.equal(mapQoderModelToLevel("deepseek-r1"), "ultimate");
-  assert.equal(mapQoderModelToLevel("qwen3-max"), "performance");
+  assert.equal(mapQoderModelToLevel("deepseek-r1"), "dmodel");
+  assert.equal(mapQoderModelToLevel("qwen3-max"), "qmodel_latest");
+  assert.equal(mapQoderModelToLevel("qwen3.8-max-preview"), "qmodel_preview");
+  assert.equal(mapQoderModelToLevel("kimi-k3"), "kmodel_latest");
   assert.equal(mapQoderModelToLevel(""), null);
 });
 
-test("getStaticQoderModels exposes the static if/* catalog seed", () => {
+test("getStaticQoderModels exposes the current nine-model Qoder catalog", () => {
   const models = getStaticQoderModels();
-  assert.ok(models.some((model) => model.id === "qoder-rome-30ba3b"));
-  assert.ok(models.some((model) => model.id === "deepseek-r1"));
+  const ids = models.map((model) => model.id);
+  const freeCatalogIds = FREE_MODEL_BUDGETS.filter((model) => model.provider === "qoder").map(
+    (model) => model.modelId
+  );
+
+  assert.equal(models.length, 9);
+  assert.deepEqual(
+    ids,
+    qoderProvider.models.map((model) => model.id)
+  );
+  assert.deepEqual(freeCatalogIds, ids);
+  assert.ok(ids.includes("qwen3.8-max-preview"));
+  assert.ok(ids.includes("deepseek-v4-flash"));
+  assert.ok(!ids.includes("qoder-rome-30ba3b"));
+
+  const preview = qoderProvider.models.find((model) => model.id === "qwen3.8-max-preview");
+  assert.equal(preview?.supportsVision, true);
+  assert.equal(preview?.supportsReasoning, true);
+  assert.equal(preview?.contextLength, 1_000_000);
+  assert.equal(preview?.maxInputTokens, 180_000);
 });
 
 test("buildQoderPrompt flattens transcript and warns against local tools", () => {
@@ -366,6 +388,44 @@ test("QoderExecutor: stream calls pass through successful SSE responses", async 
     assert.match(body, /\[DONE\]/);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("QoderExecutor: surfaces qodercli stderr when is_error=true with empty result (#9319)", async () => {
+  const prevBin = process.env.CLI_QODER_BIN;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "qodercli-stub-"));
+  const stub = path.join(dir, "qodercli");
+  // Stub that exits 0 but writes is_error:true and empty result to stdout,
+  // and meaningful error to stderr — simulating qodercli CLI failure where
+  // the real upstream error is only on stderr.
+  fs.writeFileSync(
+    stub,
+    [
+      "#!/bin/sh",
+      'echo \'{"type":"result","subtype":"success","is_error":true,"result":""}\'',
+      'echo "upstream Cosy signing failed (invalid workspace)" >&2',
+      "exit 0",
+    ].join("\n"),
+    { mode: 0o755 }
+  );
+  process.env.CLI_QODER_BIN = stub;
+  try {
+    const executor = new QoderExecutor();
+    const { response } = await executor.execute({
+      model: "qwen3-coder-plus",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials: { apiKey: "pt-0pUI-test-token" },
+    });
+    const payload = (await response.json()) as { error: { message: string } };
+    // The response should surface the stderr content, not just the generic
+    // "qodercli returned an error" fallback.
+    assert.match(payload.error.message, /upstream Cosy signing failed/);
+    assert.equal(response.status, 502);
+  } finally {
+    if (prevBin === undefined) delete process.env.CLI_QODER_BIN;
+    else process.env.CLI_QODER_BIN = prevBin;
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 

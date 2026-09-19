@@ -2,15 +2,22 @@ import createNextIntlPlugin from "next-intl/plugin";
 import { createMDX } from "fumadocs-mdx/next";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { betterSqlite3AliasFor } from "./scripts/build/better-sqlite3-stub-flag.mjs";
 import { mitmManagerAliasFor } from "./scripts/build/mitm-stub-flag.mjs";
+import { normalizeBasePath } from "./scripts/build/normalizeBasePath.mjs";
+import {
+  buildSecurityHeaderRules,
+  nonPageRoutePrefixes,
+  resolveDashboardEmbedMode,
+} from "./scripts/build/dashboardEmbed.mjs";
 
 const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 const distDir = process.env.NEXT_DIST_DIR || ".build/next";
 const projectRoot = dirname(fileURLToPath(import.meta.url));
 const scriptSrc =
   process.env.NODE_ENV === "development"
-    ? "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:"
-    : "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:";
+    ? "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: https://static.cloudflareinsights.com"
+    : "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: https://static.cloudflareinsights.com";
 const contentSecurityPolicy = [
   "default-src 'self'",
   "base-uri 'self'",
@@ -74,6 +81,11 @@ function isNextIntlExtractorDynamicImportWarning(warning) {
 // for security-sensitive environments. See docs/security/SOCKET_DEV_FINDINGS.md.
 const isMinimalBuild = process.env.OMNIROUTE_BUILD_PROFILE === "minimal";
 
+// #10273: `null` unless the operator opts in with DASHBOARD_ALLOW_EMBED=vscode. Read at build
+// time like every other knob in this file (OMNIROUTE_BASE_PATH, OMNIROUTE_BUILD_PROFILE, …),
+// so changing it requires a rebuild. See scripts/build/dashboardEmbed.mjs.
+const dashboardEmbedMode = resolveDashboardEmbedMode(process.env);
+
 const minimalBuildAliases = isMinimalBuild
   ? {
       "@/mitm/cert/install": "./src/mitm/cert/install.stub.ts",
@@ -101,7 +113,20 @@ const nextConfig = {
   // before route matching, so authz classification (classifyRoute/isLocalOnlyPath)
   // keeps operating on un-prefixed paths — see src/server/authz/pipeline.ts for
   // the two redirect call sites that re-add it via `request.nextUrl.basePath`.
-  basePath: process.env.OMNIROUTE_BASE_PATH || "",
+  basePath: normalizeBasePath(process.env.OMNIROUTE_BASE_PATH),
+  // Next 16 (both webpack and Turbopack) app-router renders SSR asset URLs from
+  // `assetPrefix` ALONE — basePath only affects routing/links. Without mirroring
+  // it here, a subpath build emits /_next/static shell references that 404
+  // behind a reverse proxy. The Docker runtime patcher (ensure-docker-base-path)
+  // rewrites the same knob for prebuilt root-path images.
+  assetPrefix: normalizeBasePath(process.env.OMNIROUTE_BASE_PATH) || undefined,
+  // Client-visible mirror of basePath for fetch/EventSource rewriting under reverse
+  // proxies (installBasePathFetch), and for client display helpers (useDisplayBaseUrl)
+  // that append the subpath to window.location.origin when building curl/endpoint
+  // examples. Empty by default (root deploys unchanged).
+  env: {
+    NEXT_PUBLIC_OMNIROUTE_BASE_PATH: normalizeBasePath(process.env.OMNIROUTE_BASE_PATH),
+  },
   distDir,
   // Turbopack config: redirect native modules to stubs at build time
   turbopack: {
@@ -114,8 +139,48 @@ const nextConfig = {
       // the stub to every npm/Electron/VPS artifact and broke Agent Bridge
       // start for all non-Docker users (#6344). See scripts/build/mitm-stub-flag.mjs.
       ...mitmManagerAliasFor(process.env),
+      // better-sqlite3 → build-time stub ONLY where the build worker actually
+      // aborts while tracing the native addon (SIGABRT at worker teardown,
+      // #10060); opt in with OMNIROUTE_BETTER_SQLITE3_STUB=1. The alias used to
+      // be unconditional on the premise that serverExternalPackages still won
+      // at runtime — it does not: resolveAlias rewrites the request before the
+      // externals check, so the stub was bundled and EVERY route answered 500
+      // (#11343). See scripts/build/better-sqlite3-stub-flag.mjs.
+      ...betterSqlite3AliasFor(process.env),
       ...minimalBuildAliases,
     },
+    // src/lib/agentSkills/generator.ts builds its fs base path from a runtime
+    // `outputDir` parameter (`path.join(process.cwd(), outputDir)`), which is
+    // NOT a compile-time literal, so Turbopack's build-time file-tracing
+    // analyzer can't statically narrow the several dynamic readdirSync/rmSync/
+    // readFileSync/writeFileSync call sites a few lines below and falls back
+    // to an "Overly broad patterns... matches N files" warning — once per
+    // Next.js entry point that imports the module (/api/agent-skills/generate,
+    // /api/cli-tools/pi-settings). The fs access is legitimate and bounded
+    // (skills/<id>/SKILL.md, ~48 known IDs), so this is a known-benign,
+    // expected diagnostic — suppress it here rather than fight the analyzer,
+    // mirroring the isNextIntlExtractorDynamicImportWarning precedent below
+    // for the webpack path. (#6582)
+    // open-sse/services/compression/ruleLoader.ts and
+    // .../engines/rtk/filterLoader.ts both define an identical
+    // getModuleDir() helper that walks up directories via
+    // path.resolve(anchor) + fs.existsSync(...) in a loop with a
+    // non-literal argument — the same dynamic-path fs access pattern as
+    // the agentSkills case above, but not covered by that narrower
+    // allowlist glob, so the "Overly broad patterns..." warning kept
+    // firing (610 times, once per entry point transitively importing the
+    // compression module). Same known-benign, bounded fs access;
+    // suppressed here rather than fought. (#7051, follow-up to #6582)
+    ignoreIssue: [
+      {
+        path: "**/src/lib/agentSkills/**",
+        description: /Overly broad patterns can lead to build performance issues/,
+      },
+      {
+        path: "**/open-sse/services/compression/**",
+        description: /Overly broad patterns can lead to build performance issues/,
+      },
+    ],
   },
   output: "standalone",
   compress: true,
@@ -133,6 +198,10 @@ const nextConfig = {
     serverActions: {
       bodySizeLimit: process.env.OMNIROUTE_SERVER_ACTIONS_BODY_LIMIT || "50mb",
     },
+    // Reduce peak heap during production builds (Next.js 15+).
+    webpackMemoryOptimizations: true,
+    // Run webpack in a separate Node worker, lowering main-process memory.
+    webpackBuildWorker: true,
     // Next.js proxy (middleware) has a default 10MB body clone limit. File
     // uploads (OpenAI-compatible /v1/files) routinely exceed this. Match the
     // 512 MB server-side cap; tune via env if needed.
@@ -206,6 +275,10 @@ const nextConfig = {
     "thread-stream",
     "pino-abstract-transport",
     "better-sqlite3",
+    // sql.js WASM is resolved at runtime via createRequire(); Next's static
+    // analysis can't follow _require.resolve("sql.js/package.json") and spams
+    // build warnings.  Externalizing silences them without changing behaviour.
+    "sql.js",
     // sqlite-vec ships a native vec0.so loaded at runtime via createRequire().
     // Turbopack otherwise tries to bundle the .so and fails with "Unknown module
     // type"; externalizing it keeps the require at runtime (like better-sqlite3).
@@ -341,11 +414,21 @@ const nextConfig = {
   },
 
   async headers() {
+    // #10273: opt-in embedding for the VS Code Simple Browser (OmniCopilot). Off by default —
+    // `securityHeaders` then applies to `/:path*` exactly as it always has. When the operator
+    // sets DASHBOARD_ALLOW_EMBED=vscode, buildSecurityHeaderRules() splits that catch-all into
+    // two complementary rules: the API surface keeps `frame-ancestors 'none'` + X-Frame-Options,
+    // the HTML pages get `frame-ancestors 'self' vscode-webview:` and no X-Frame-Options.
+    // The exclusion list is DERIVED from the rewrite table below (self-reference is safe — the
+    // config object is fully built by the time Next calls headers()), so a future root-level API
+    // alias is excluded automatically instead of silently becoming framable.
+    const embedRules = buildSecurityHeaderRules({
+      mode: dashboardEmbedMode,
+      securityHeaders,
+      prefixes: dashboardEmbedMode ? nonPageRoutePrefixes(await nextConfig.rewrites()) : [],
+    });
     return [
-      {
-        source: "/:path*",
-        headers: securityHeaders,
-      },
+      ...embedRules,
       // G-10: allow OmniRoute's own dashboard to embed the 9Router UI via our reverse proxy.
       // `frame-ancestors 'self'` overrides the global `frame-ancestors 'none'` only for this
       // path. The route is already LOCAL_ONLY (routeGuard.ts) so remote origins cannot reach it.
@@ -362,6 +445,11 @@ const nextConfig = {
       {
         source: "/dashboard/skills",
         destination: "/dashboard/omni-skills",
+        permanent: true,
+      },
+      {
+        source: "/dashboard/providers/freepik",
+        destination: "/dashboard/providers/magnific",
         permanent: true,
       },
       // Architecture
@@ -587,6 +675,33 @@ const nextConfig = {
       {
         source: "/v1beta",
         destination: "/api/v1beta",
+      },
+      // Issue #6405 follow-up: unknown root-level paths must return JSON 404,
+      // not the dashboard HTML shell. Rewrite the missing prefixes under /api/*
+      // so they hit the /api/[...omnirouteApiCatchAll] route (#6424) — which
+      // returns application/json with error.type === "not_found". Real /api/*
+      // routes take precedence over the catch-all, so any future
+      // /api/anthropic/*, /api/openai/*, /api/metrics, /api/debug endpoints
+      // still match first.
+      {
+        source: "/anthropic/:path*",
+        destination: "/api/anthropic/:path*",
+      },
+      {
+        source: "/openai/:path*",
+        destination: "/api/openai/:path*",
+      },
+      {
+        source: "/metrics",
+        destination: "/api/metrics",
+      },
+      {
+        source: "/debug",
+        destination: "/api/debug",
+      },
+      {
+        source: "/.env",
+        destination: "/api/.env",
       },
     ];
   },

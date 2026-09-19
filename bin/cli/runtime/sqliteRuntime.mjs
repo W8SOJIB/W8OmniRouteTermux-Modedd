@@ -6,7 +6,9 @@ import { pathToFileURL } from "node:url";
 import { validateBinaryMagic, platformBinaryLabel } from "./magicBytes.mjs";
 
 const RUNTIME_DIR = join(homedir(), ".omniroute", "runtime");
-const BETTER_SQLITE3_VERSION = "better-sqlite3@^12.10.1";
+// Exported so the packaging coherence guard (tests/unit/pack-boot-runtime-paths.test.ts)
+// can assert this stays on the same major as optionalDependencies.better-sqlite3 (#11242).
+export const BETTER_SQLITE3_VERSION = "better-sqlite3@^13.0.2";
 
 let resolvedCached = null;
 

@@ -5,6 +5,7 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolveDataDir } from "../data-dir.mjs";
 import { registerContexts } from "./contexts.mjs";
+import { guardHostConfigTarget } from "../utils/config-home-guard.mjs";
 
 function ensureBackup(configPath) {
   if (!fs.existsSync(configPath)) return;
@@ -86,6 +87,13 @@ async function runConfigSetCommand(toolId, opts = {}) {
     printError(result.error || "Failed to generate config");
     return 1;
   }
+
+  const guard = await guardHostConfigTarget(result.configPath, {
+    toolLabel: toolId,
+    hostCommand: `omniroute config set ${toolId}`,
+    allowContainerWrite: Boolean(opts.allowContainerWrite ?? opts["allow-container-write"]),
+  });
+  if (guard !== 0) return guard;
 
   const nonInteractive = opts.nonInteractive || opts.yes;
 
@@ -271,6 +279,10 @@ export function registerConfig(program) {
     .option("--model <model>", "Model identifier (where applicable)")
     .option("--non-interactive", "Do not prompt for confirmation")
     .option("--yes", "Skip confirmation prompt")
+    .option(
+      "--allow-container-write",
+      "Write the config even when OmniRoute runs in a container and the target is not mounted from the host"
+    )
     .action(async (tool, opts, cmd) => {
       const globalOpts = cmd.parent.optsWithGlobals();
       const exitCode = await runConfigSetCommand(tool, {
@@ -306,6 +318,10 @@ export function registerConfig(program) {
     .option("--model <model>", "Model identifier")
     .option("--non-interactive", "Do not prompt for confirmation")
     .option("--yes", "Skip confirmation prompt")
+    .option(
+      "--allow-container-write",
+      "Write the config even when OmniRoute runs in a container and the target is not mounted from the host"
+    )
     .action(async (opts, cmd) => {
       const globalOpts = cmd.parent.optsWithGlobals();
       const exitCode = await runConfigSetCommand("opencode", {

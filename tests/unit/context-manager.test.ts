@@ -1,8 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-context-manager-"));
+const ORIGINAL_DATA_DIR = process.env.DATA_DIR;
+process.env.DATA_DIR = TEST_DATA_DIR;
 
 const { compressContext, estimateTokens, getTokenLimit } =
   await import("../../open-sse/services/contextManager.ts");
+const core = await import("../../src/lib/db/core.ts");
+
+test.after(() => {
+  core.resetDbInstance();
+  if (ORIGINAL_DATA_DIR === undefined) delete process.env.DATA_DIR;
+  else process.env.DATA_DIR = ORIGINAL_DATA_DIR;
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+});
 
 // ─── estimateTokens ─────────────────────────────────────────────────────────
 
@@ -32,6 +47,44 @@ test("getTokenLimit: uses GPT-5.5 Codex model context", () => {
 
 test("getTokenLimit: default fallback", () => {
   assert.equal(getTokenLimit("unknown"), 128000);
+});
+
+// Regression for #8496: hyperagent Claude-family agents (fable/opus/sonnet) must
+// resolve to the 1M context window for every fallback model id, driven solely by
+// the registry's `defaultContextLength` (open-sse/config/providers/registry/hyperagent) —
+// not by a provider-unscoped model-name substring match, which previously collided
+// with unrelated providers serving the same Claude model ids (see
+// "getTokenLimit: does not force 1M onto non-hyperagent providers" below).
+const HYPERAGENT_FALLBACK_MODEL_IDS = [
+  "fable-latest",
+  "claude-fable-5",
+  "opus-latest",
+  "claude-opus-4-8",
+  "sonnet-latest",
+  "claude-sonnet-5",
+];
+
+for (const modelId of HYPERAGENT_FALLBACK_MODEL_IDS) {
+  test(`getTokenLimit: hyperagent/${modelId} resolves to 1M context`, () => {
+    assert.equal(getTokenLimit("hyperagent", modelId), 1_000_000);
+  });
+
+  test(`getTokenLimit: ha (alias)/${modelId} resolves to 1M context`, () => {
+    assert.equal(getTokenLimit("ha", modelId), 1_000_000);
+  });
+}
+
+test("getTokenLimit: does not force 1M onto non-hyperagent providers serving the same model ids", () => {
+  // windsurf used to pin this exact id at 200000, but its built-in provider entry was
+  // retired (#8228 — replaced by devin-desktop). With no per-provider source left,
+  // #11034 resolves the effort-suffixed variant via its BASE model (`claude-opus-4.7-max`
+  // → `claude-opus-4.7` → canonical `claude-opus-4-7`), whose real catalog window IS 1M.
+  // This is a legitimate base-model resolution, not the forbidden hyperagent default leak:
+  // it comes from the shared model catalog, never from the hyperagent registry scope.
+  assert.equal(getTokenLimit("windsurf", "claude-opus-4.7-max"), 1_000_000);
+  // bluesminds still pins its own claude-opus-4-5 entry to 200000, and that pin must win
+  // over both the name heuristic and any 1M window from sibling providers/catalogs.
+  assert.equal(getTokenLimit("bluesminds", "claude-opus-4-5"), 200000);
 });
 
 // ─── compressContext ────────────────────────────────────────────────────────

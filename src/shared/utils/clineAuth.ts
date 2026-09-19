@@ -8,7 +8,94 @@
  * must route its headers through `buildClineHeaders()`.
  */
 
-const APP_VERSION = process.env.npm_package_version || "0.0.0";
+import { APP_CONFIG } from "../constants/appConfig";
+
+const APP_VERSION = APP_CONFIG.version;
+const DEFAULT_CLINE_CLIENT_TYPE = "omniroute";
+const INTERNAL_HEALTH_CHECK_CLIENT_TYPE = "omniroute-internal-health-check";
+
+export interface ClineHeaderContext {
+  taskId?: string;
+  clientType?: string;
+  clientVersion?: string;
+  platform?: string;
+  platformVersion?: string;
+  coreVersion?: string;
+  isMultiRoot?: boolean;
+}
+
+function cleanHeaderValue(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const cleaned = value.trim();
+  if (!cleaned || cleaned.length > 256 || /[\r\n\0]/.test(cleaned)) return undefined;
+  return cleaned;
+}
+
+function getHeaderCaseInsensitive(
+  headers: Record<string, string> | null | undefined,
+  name: string
+): string | undefined {
+  const key = Object.keys(headers ?? {}).find((candidate) => candidate.toLowerCase() === name);
+  return key ? cleanHeaderValue(headers?.[key]) : undefined;
+}
+
+/** Keep an inbound Cline task id when supplied; never invent task identity at the proxy layer. */
+export function resolveClineTaskId(
+  clientHeaders?: Record<string, string> | null
+): string | undefined {
+  return getHeaderCaseInsensitive(clientHeaders, "x-task-id");
+}
+
+function resolveClineClientType(clientHeaders?: Record<string, string> | null): string | undefined {
+  return getHeaderCaseInsensitive(clientHeaders, "x-internal-test") === "combo-health-check"
+    ? INTERNAL_HEALTH_CHECK_CLIENT_TYPE
+    : undefined;
+}
+
+/**
+ * Apply Cline billing headers with case-insensitive replacement. Task identity
+ * is optional and may only come from the request context; stored/configured
+ * header layers must not fabricate or override it.
+ */
+export function applyClineProtocolHeaders(
+  headers: Record<string, string>,
+  context: ClineHeaderContext = {}
+): Record<string, string> {
+  const taskId = cleanHeaderValue(context.taskId);
+  const clientVersion = cleanHeaderValue(context.clientVersion) ?? APP_VERSION;
+  const existingClientType = getHeaderCaseInsensitive(headers, "x-client-type");
+  const clientType =
+    cleanHeaderValue(context.clientType) ??
+    (existingClientType === INTERNAL_HEALTH_CHECK_CLIENT_TYPE
+      ? INTERNAL_HEALTH_CHECK_CLIENT_TYPE
+      : DEFAULT_CLINE_CLIENT_TYPE);
+  const required: Record<string, string> = {
+    "HTTP-Referer": "https://cline.bot",
+    "X-Title": "Cline",
+    "User-Agent": `Cline/${clientVersion}`,
+    "X-IS-MULTIROOT": context.isMultiRoot === true ? "true" : "false",
+    "X-CLIENT-TYPE": clientType,
+    "X-CLIENT-VERSION": clientVersion,
+    "X-PLATFORM": cleanHeaderValue(context.platform) ?? process.platform ?? "unknown",
+    "X-PLATFORM-VERSION": cleanHeaderValue(context.platformVersion) ?? process.version ?? "unknown",
+    "X-CORE-VERSION": cleanHeaderValue(context.coreVersion) ?? APP_VERSION,
+  };
+
+  for (const existing of Object.keys(headers)) {
+    if (existing.toLowerCase() === "x-task-id") delete headers[existing];
+  }
+  if (taskId) required["X-Task-ID"] = taskId;
+
+  for (const [name, value] of Object.entries(required)) {
+    for (const existing of Object.keys(headers)) {
+      if (existing !== name && existing.toLowerCase() === name.toLowerCase()) {
+        delete headers[existing];
+      }
+    }
+    headers[name] = value;
+  }
+  return headers;
+}
 
 /**
  * Normalize a raw Cline token into the `workos:`-prefixed access-token shape
@@ -38,25 +125,62 @@ export function getClineAuthorizationHeader(token: unknown): string {
  */
 export function buildClineHeaders(
   token: unknown,
-  extraHeaders: Record<string, string> = {}
+  extraHeaders: Record<string, string> = {},
+  context: ClineHeaderContext = {}
 ): Record<string, string> {
   const authorization = getClineAuthorizationHeader(token);
-  const headers: Record<string, string> = {
-    "HTTP-Referer": "https://cline.bot",
-    "X-Title": "Cline",
-    "User-Agent": `OmniRoute/${APP_VERSION}`,
-    "X-PLATFORM": process.platform || "unknown",
-    "X-PLATFORM-VERSION": process.version || "unknown",
-    "X-CLIENT-TYPE": "omniroute",
-    "X-CLIENT-VERSION": APP_VERSION,
-    "X-CORE-VERSION": APP_VERSION,
-    "X-IS-MULTIROOT": "false",
-    ...extraHeaders,
-  };
+  const headers = applyClineProtocolHeaders({ ...extraHeaders }, context);
 
   if (authorization) {
     headers.Authorization = authorization;
   }
 
+  return headers;
+}
+
+/**
+ * Build headers for a ClinePass request. ClinePass is dual-auth: an OAuth
+ * connection (workos:-prefixed token in `accessToken`) needs the full Cline
+ * client header set from `buildClineHeaders()`; a BYOK API-key connection
+ * (`sk_...` key, #5942) sends the key as a plain Bearer token — no `workos:`
+ * prefix — alongside the Cline identification headers.
+ */
+export function buildClinepassHeaders(
+  credentials: { accessToken?: unknown; apiKey?: unknown } | null | undefined,
+  effectiveKey?: string,
+  context: ClineHeaderContext = {}
+): Record<string, string> {
+  if (credentials?.accessToken) {
+    return buildClineHeaders(credentials.accessToken, {}, context);
+  }
+  const headers = applyClineProtocolHeaders({}, context);
+  const byokKey = effectiveKey || (credentials?.apiKey as string | undefined);
+  if (byokKey) headers.Authorization = `Bearer ${byokKey}`;
+  return headers;
+}
+
+/**
+ * Executor call-site helper: merge the Cline/ClinePass auth headers directly
+ * into an in-progress `headers` record, mutating it in place. Keeps the
+ * `case "cline"` / `case "clinepass"` branches in the executor down to a
+ * single call each — `isClinepass` selects `buildClinepassHeaders()`'s
+ * dual-auth (OAuth or BYOK) shape vs. `buildClineHeaders()`'s single-token
+ * `workos:`-prefixed shape.
+ */
+export function applyClineAuthHeaders(
+  headers: Record<string, string>,
+  credentials: { accessToken?: unknown; apiKey?: unknown } | null | undefined,
+  effectiveKey: string | undefined,
+  clientHeaders: Record<string, string> | null | undefined,
+  isClinepass: boolean
+): Record<string, string> {
+  const context: ClineHeaderContext = {
+    taskId: resolveClineTaskId(clientHeaders),
+    clientType: resolveClineClientType(clientHeaders),
+  };
+  const built = isClinepass
+    ? buildClinepassHeaders(credentials, effectiveKey, context)
+    : buildClineHeaders(effectiveKey || credentials?.accessToken, {}, context);
+  Object.assign(headers, built);
   return headers;
 }

@@ -12,14 +12,17 @@ import { validateBody, isValidationFailure } from "@/shared/validation/helpers";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { encryptMetadata } from "@/lib/webhookDispatcher";
 import { isEncryptionEnabled } from "@/lib/db/encryption";
-import { parseAndValidateWebhookUrl } from "@/shared/network/outboundUrlGuard";
+import { parseAndValidateWebhookUrl } from "@/shared/network/outboundUrlGuardPolicy";
+
+import { WEBHOOK_EVENT_VALUES } from "@/lib/webhooks/eventDescriptions";
 
 const WEBHOOK_KINDS = ["slack", "telegram", "discord", "custom"] as const;
+const WEBHOOK_EVENT_VALUES_WITH_WILDCARD = ["*", ...WEBHOOK_EVENT_VALUES] as const;
 
 const createWebhookSchema = z
   .object({
     url: z.string().min(1).max(2000),
-    events: z.array(z.string()).optional().default(["*"]),
+    events: z.array(z.enum(WEBHOOK_EVENT_VALUES_WITH_WILDCARD)).optional().default(["*"]),
     secret: z.string().max(500).optional(),
     description: z.string().max(1000).optional().default(""),
     kind: z.enum(WEBHOOK_KINDS).optional().default("custom"),
@@ -43,13 +46,16 @@ export async function GET(request: Request) {
   if (authError) return authError;
 
   try {
-    const webhooks = getWebhooks();
+    const { searchParams } = new URL(request.url);
+    const limit = searchParams.has("limit") ? Number(searchParams.get("limit")) : undefined;
+    const offset = searchParams.has("offset") ? Number(searchParams.get("offset")) : 0;
+    const result = getWebhooks(limit !== undefined ? { limit, offset } : undefined);
     // Mask secrets in listing
-    const masked = webhooks.map((w) => ({
+    const masked = result.webhooks.map((w) => ({
       ...w,
       secret: w.secret ? `${w.secret.slice(0, 10)}...` : null,
     }));
-    return NextResponse.json({ webhooks: masked });
+    return NextResponse.json({ webhooks: masked, total: result.total });
   } catch (error: any) {
     return NextResponse.json(
       { error: sanitizeErrorMessage(error) || "Failed to list webhooks" },

@@ -5,12 +5,29 @@
  * Each provider has its own request format and endpoint.
  */
 
+import { LMARENA_DIRECT_IMAGE_MODELS } from "./providers/registry/lmarena/directModels.ts";
+import { SEGMIND_IMAGE_PROVIDER } from "./providers/registry/segmind/imageModels.ts";
+import { KIE_IMAGE_MODELS } from "./providers/registry/kie/imageModels.ts";
+import { MAGNIFIC_IMAGE_PROVIDER } from "./providers/registry/magnific/index.ts";
+import { STABILITY_AI_IMAGE_MODELS } from "./providers/registry/stability-ai/imageModels.ts";
+import { CHEAPERINFERENCE_IMAGE_PROVIDER } from "./providers/registry/cheaperinference/imageModels.ts";
+import {
+  ADOBE_FIREFLY_IMAGE_ROUTING_ALIASES,
+  toRegistryImageModels,
+} from "../services/adobeFireflyModels.ts";
+import { AI_HORDE_IMAGE_PROVIDER } from "./providers/registry/aihorde/imageModels.ts";
+
 interface ImageModelEntry {
   id: string;
   name: string;
   inputModalities?: string[];
+  // See STABILITY_AI_IMAGE_MODELS for why this exists: some models accept "text"
+  // but mechanically require an image regardless.
+  imageRequired?: boolean;
   description?: string;
   isMarket?: boolean;
+  supportedSizes?: string[];
+  mediaCapabilities?: Record<string, unknown>;
 }
 
 interface ImageProviderConfig {
@@ -24,6 +41,7 @@ interface ImageProviderConfig {
   authHeader: string;
   format: string;
   models: ImageModelEntry[];
+  routingAliases?: readonly string[];
   supportedSizes: string[];
 }
 
@@ -33,7 +51,9 @@ interface ImageModelAliasEntry {
   name: string;
   listInCatalog: boolean;
   inputModalities?: string[];
+  imageRequired?: boolean;
   description?: string;
+  mediaCapabilities?: Record<string, unknown>;
 }
 
 interface ImageCatalogModelEntry {
@@ -43,6 +63,7 @@ interface ImageCatalogModelEntry {
   supportedSizes: string[];
   inputModalities: string[];
   description?: string;
+  mediaCapabilities?: Record<string, unknown>;
 }
 
 const IMAGE_MODEL_ALIASES: Record<string, ImageModelAliasEntry> = {
@@ -115,13 +136,73 @@ function resolveImageModelAlias(modelStr) {
   return alias ? { provider: alias.provider, model: alias.model } : null;
 }
 
+// A bare alias may only rewrite a provider-prefixed model when it stays on the
+// SAME provider (e.g. `antigravity/gemini-3.1-flash-image-preview` →
+// antigravity's callable `gemini-3.1-flash-image`). A cross-provider bare alias
+// must NOT override an explicit prefix — #9982 removed the unconditional bare
+// fallback because `fal-ai/flux-2-max` was being hijacked to black-forest-labs
+// by the bare `flux-2-max` alias.
+function resolveSameProviderBareAlias(providerId, model) {
+  const aliased = resolveImageModelAlias(model);
+  return aliased && aliased.provider === providerId ? aliased : null;
+}
+
 function findImageModelConfig(providerId, modelId) {
   const provider = IMAGE_PROVIDERS[providerId];
   if (!provider) return null;
   return provider.models.find((model) => model.id === modelId) || null;
 }
 
+// Kept out of getImageModelEntry() (which sits at the complexity-ratchet cap) — an
+// alias can override imageRequired directly, else it falls back to its target
+// model's own flag. Consumers coerce the result with Boolean(), so no `?? false`.
+function resolveAliasImageRequired(alias, modelConfig) {
+  return alias.imageRequired ?? modelConfig?.imageRequired;
+}
+
 export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
+  agnes: {
+    id: "agnes",
+    baseUrl: "https://apihub.agnes-ai.com/v1/images/generations",
+    authType: "apikey",
+    authHeader: "bearer",
+    format: "agnes-image",
+    models: [
+      {
+        id: "agnes-image-2.1-flash",
+        name: "Agnes Image 2.1 Flash",
+        inputModalities: ["text", "image"],
+        description: "Agnes text-to-image, image-to-image, and multi-image composition model",
+      },
+    ],
+    supportedSizes: ["1K", "2K", "3K", "4K"],
+  },
+
+  "qwen-cloud-token-plan": {
+    id: "qwen-cloud-token-plan",
+    alias: "qct",
+    baseUrl:
+      "https://token-plan.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+    authType: "apikey",
+    authHeader: "bearer",
+    format: "qwen-token-plan-image",
+    models: [
+      {
+        id: "wan2.7-image",
+        name: "Wan 2.7 Image",
+        inputModalities: ["text", "image"],
+      },
+      {
+        id: "wan2.7-image-pro",
+        name: "Wan 2.7 Image Pro",
+        inputModalities: ["text", "image"],
+      },
+    ],
+    // Both models share 1K/2K support. The Pro model also accepts explicit 4K
+    // dimensions, which callers can still pass through the permissive request schema.
+    supportedSizes: ["1024x1024", "2048x2048"],
+  },
+
   openai: {
     id: "openai",
     baseUrl: "https://api.openai.com/v1/images/generations",
@@ -129,6 +210,7 @@ export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
     authHeader: "bearer",
     format: "openai", // native OpenAI format
     models: [
+      { id: "dall-e-3", name: "DALL·E 3" },
       { id: "gpt-image-2", name: "GPT Image 2" },
       { id: "gpt-image-1.5", name: "GPT Image 1.5" },
       { id: "gpt-image-1-mini", name: "GPT Image 1 Mini" },
@@ -147,7 +229,11 @@ export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
     authType: "oauth",
     authHeader: "bearer",
     format: "codex-responses",
-    models: [{ id: "gpt-5.5", name: "GPT 5.5 (Codex Image)" }],
+    models: [
+      { id: "gpt-5.6-sol", name: "GPT 5.6 Sol (Codex Image)" },
+      { id: "gpt-5.6-terra", name: "GPT 5.6 Terra (Codex Image)" },
+      { id: "gpt-5.6-luna", name: "GPT 5.6 Luna (Codex Image)" },
+    ],
     supportedSizes: ["1024x1024", "1024x1536", "1536x1024"],
   },
 
@@ -158,8 +244,59 @@ export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
     authType: "apikey",
     authHeader: "cookie",
     format: "chatgpt-web",
-    models: [{ id: "gpt-5.3-instant", name: "GPT-5.3 Instant (ChatGPT Web Image)" }],
+    models: [{ id: "gpt-5.5", name: "GPT-5.5 Instant (ChatGPT Web Image)" }],
     supportedSizes: ["1024x1024", "1024x1536", "1536x1024"],
+  },
+
+  // #10466: Gemini Web session image generation (Nano Banana). Same
+  // web-cookie transport as the gemini-web chat provider — the handler
+  // drives the session executor in image mode and extracts the generated
+  // asset URLs from the StreamGenerate frames.
+  "gemini-web": {
+    id: "gemini-web",
+    alias: "gweb",
+    baseUrl: "https://gemini.google.com/app",
+    authType: "apikey",
+    authHeader: "cookie",
+    format: "gemini-web",
+    // `-web` suffix on purpose: the bare `nano-banana` id is owned by
+    // adobe-firefly (operator decision 2026-07-31, pinned by the
+    // cheaperinference-image-models guard). parseImageModel's bare-model scan
+    // walks providers in insertion order, so a bare `nano-banana` here would
+    // steal that resolution. Keep this id distinct.
+    models: [{ id: "nano-banana-web", name: "Nano Banana (Gemini Web Image)" }],
+    supportedSizes: ["1024x1024", "1024x1536", "1536x1024"],
+  },
+
+  // Cursor plan image generation via the Agent CLI native `generateImage` tool.
+  // Reuses the same OAuth/API-key connection as chat (`provider: "cursor"`).
+  // Requires the `agent` binary (CURSOR_AGENT_BIN) — see cursorAgentImage handler.
+  cursor: {
+    id: "cursor",
+    alias: "cu",
+    // Sentinel: execution is local Agent CLI, not an HTTP image API.
+    baseUrl: "agent://cursor-agent",
+    authType: "oauth",
+    authHeader: "bearer",
+    format: "cursor-agent-image",
+    models: [
+      { id: "auto", name: "Cursor Auto (Image)" },
+      { id: "composer-2", name: "Composer 2 (Image)" },
+      { id: "composer-2.5", name: "Composer 2.5 (Image)" },
+    ],
+    supportedSizes: ["1024x1024", "1024x1792", "1792x1024", "1024x1536", "1536x1024"],
+  },
+
+  "microsoft-designer-web": {
+    id: "microsoft-designer-web",
+    alias: "msdesigner",
+    baseUrl:
+      "https://designerapp.officeapps.live.com/designerapp/DallE.ashx?action=GetDallEImagesCogSci",
+    authType: "apikey",
+    authHeader: "bearer",
+    format: "designer-web",
+    models: [{ id: "dall-e-3", name: "DALL-E 3 (Microsoft Designer Web)" }],
+    supportedSizes: ["1024x1024", "1792x1024", "1024x1792"],
   },
 
   xai: {
@@ -305,44 +442,7 @@ export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
     authType: "apikey",
     authHeader: "bearer",
     format: "kie-image",
-    models: [
-      { id: "gpt4o-image", name: "KIE 4o Image" },
-      { id: "seedream/4.5-text-to-image", name: "Seedream 4.5", isMarket: true },
-      { id: "seedream/4.5-edit", name: "Seedream 4.5 Edit", isMarket: true },
-      { id: "seedream/5.0-lite-text-to-image", name: "Seedream 5.0 Lite", isMarket: true },
-      { id: "seedream/5.0-lite-image-to-image", name: "Seedream 5.0 Lite I2I", isMarket: true },
-      { id: "z-image/4.0-text-to-image", name: "Z-Image v4.0", isMarket: true },
-      { id: "z-image/4.5-text-to-image", name: "Z-Image v4.5", isMarket: true },
-      { id: "google-imagen/imagen4-fast", name: "Imagen 4 Fast", isMarket: true },
-      { id: "google-imagen/imagen4-ultra", name: "Imagen 4 Ultra", isMarket: true },
-      { id: "google-imagen/imagen4", name: "Imagen 4", isMarket: true },
-      { id: "google-imagen/nano-banana-2", name: "Nano Banana 2", isMarket: true },
-      { id: "google-imagen/nano-banana", name: "Nano Banana", isMarket: true },
-      { id: "google-imagen/nano-banana-pro", name: "Nano Banana Pro", isMarket: true },
-      { id: "google-imagen/nano-banana-edit", name: "Nano Banana Edit", isMarket: true },
-      { id: "flux/2-pro-image-to-image", name: "Flux 2 Pro I2I", isMarket: true },
-      { id: "flux/2-pro-text-to-image", name: "Flux 2 Pro T2I", isMarket: true },
-      { id: "flux/2-image-to-image", name: "Flux 2 I2I", isMarket: true },
-      { id: "flux/2-text-to-image", name: "Flux 2 T2I", isMarket: true },
-      { id: "flux/kontext", name: "Flux Kontext", isMarket: true },
-      { id: "grok-imagine/text-to-image", name: "Grok Imagine T2I", isMarket: true },
-      { id: "grok-imagine/image-to-image", name: "Grok Imagine I2I", isMarket: true },
-      { id: "gpt/gpt-image-1.5-text-to-image", name: "GPT Image 1.5 T2I", isMarket: true },
-      { id: "gpt/gpt-image-1.5-image-to-image", name: "GPT Image 1.5 I2I", isMarket: true },
-      { id: "gpt/gpt-image-2-text-to-image", name: "GPT Image 2 T2I", isMarket: true },
-      { id: "gpt/gpt-image-2-image-to-image", name: "GPT Image 2 I2I", isMarket: true },
-      { id: "ideogram/v3-text-to-image", name: "Ideogram v3", isMarket: true },
-      { id: "ideogram/v3-edit", name: "Ideogram v3 Edit", isMarket: true },
-      { id: "ideogram/v3-remix", name: "Ideogram v3 Remix", isMarket: true },
-      { id: "ideogram/v3-reframe", name: "Ideogram v3 Reframe", isMarket: true },
-      { id: "qwen/text-to-image", name: "Qwen T2I", isMarket: true },
-      { id: "qwen/image-to-image", name: "Qwen I2I", isMarket: true },
-      { id: "qwen/image-edit", name: "Qwen Edit", isMarket: true },
-      { id: "qwen2/image-edit", name: "Qwen2 Edit", isMarket: true },
-      { id: "qwen2/text-to-image", name: "Qwen2 T2I", isMarket: true },
-      { id: "wan/2.7-image", name: "Wan 2.7 Image", isMarket: true },
-      { id: "wan/2.7-image-pro", name: "Wan 2.7 Image Pro", isMarket: true },
-    ],
+    models: KIE_IMAGE_MODELS,
     supportedSizes: ["1:1", "16:9", "9:16", "4:3", "3:4"],
   },
 
@@ -355,6 +455,21 @@ export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
     format: "haiper-image",
     models: [{ id: "gen2", name: "Gen 2 Image" }],
     supportedSizes: ["16:9", "9:16", "1:1", "4:3", "3:4"],
+  },
+  // #2482: MiniMax already has entries in musicRegistry/audioRegistry/videoRegistry,
+  // but was missing an image provider entirely, so MiniMax image-model requests
+  // fell through the format dispatch below to a 400/unmatched-format response.
+  minimax: {
+    id: "minimax",
+    baseUrl: "https://api.minimax.io/v1/image_generation",
+    authType: "apikey",
+    authHeader: "bearer",
+    format: "minimax-image",
+    models: [
+      { id: "image-01", name: "MiniMax Image-01" },
+      { id: "image-01-live", name: "MiniMax Image-01 Live" },
+    ],
+    supportedSizes: ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "1024x1024"],
   },
   leonardo: {
     id: "leonardo",
@@ -380,6 +495,7 @@ export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
     ],
     supportedSizes: ["1024x1024", "1024x1792", "1792x1024"],
   },
+  magnific: MAGNIFIC_IMAGE_PROVIDER,
   sdwebui: {
     id: "sdwebui",
     baseUrl: "http://localhost:7860/sdapi/v1/txt2img",
@@ -451,18 +567,21 @@ export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
     authHeader: "key",
     format: "fal-ai",
     models: [
-      { id: "fal-ai/flux-2-max", name: "FLUX.2 Max" },
-      { id: "fal-ai/flux-2-pro", name: "FLUX.2 Pro" },
-      { id: "fal-ai/flux-2-flex", name: "FLUX.2 Flex" },
+      { id: "flux-2-max", name: "FLUX.2 Max" },
+      { id: "flux-2-pro", name: "FLUX.2 Pro" },
+      { id: "flux-2-flex", name: "FLUX.2 Flex" },
       { id: "bria/text-to-image/3.2", name: "Bria 3.2" },
-      { id: "fal-ai/bytedance/seedream/v4.5/text-to-image", name: "SeeDream V4.5" },
-      { id: "fal-ai/bytedance/dreamina/v3.1/text-to-image", name: "Dreamina V3.1" },
-      { id: "fal-ai/ideogram/v3", name: "Ideogram V3" },
+      { id: "bytedance/seedream/v4.5/text-to-image", name: "SeeDream V4.5" },
+      { id: "bytedance/dreamina/v3.1/text-to-image", name: "Dreamina V3.1" },
+      { id: "ideogram/v3", name: "Ideogram V3" },
+      // Prefix-only on purpose: adobe-firefly owns the bare nano-banana ids
+      // (operator decision 2026-07-31, pinned by cheaperinference-image-models
+      // guard). The dispatch path tolerates the fal-ai/ prefix (fal.ts).
       { id: "fal-ai/nano-banana-pro", name: "Nano Banana Pro" },
       { id: "fal-ai/nano-banana-2", name: "Nano Banana 2" },
-      { id: "fal-ai/recraft/v4/pro/text-to-image", name: "Recraft V4 Pro via Fal" },
-      { id: "fal-ai/recraft/v4/text-to-image", name: "Recraft V4 via Fal" },
-      { id: "fal-ai/stable-diffusion-v35-medium", name: "Stable Diffusion v3.5 Medium" },
+      { id: "recraft/v4/pro/text-to-image", name: "Recraft V4 Pro via Fal" },
+      { id: "recraft/v4/text-to-image", name: "Recraft V4 via Fal" },
+      { id: "stable-diffusion-v35-medium", name: "Stable Diffusion v3.5 Medium" },
     ],
     supportedSizes: ["1024x1024", "1024x1280", "1280x1024"],
   },
@@ -473,32 +592,7 @@ export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
     authType: "apikey",
     authHeader: "bearer",
     format: "stability-ai",
-    models: [
-      { id: "stable-image-ultra", name: "Stable Image Ultra" },
-      { id: "stable-image-core", name: "Stable Image Core" },
-      { id: "sd3.5-large-turbo", name: "sd3.5-large-turbo" },
-      { id: "sd3.5-large", name: "sd3.5-large" },
-      { id: "sd3.5-medium", name: "sd3.5-medium" },
-      { id: "sd3.5-flash", name: "sd3.5-flash" },
-      { id: "erase", name: "Erase", inputModalities: ["image"] },
-      { id: "inpaint", name: "Inpaint", inputModalities: ["text", "image"] },
-      { id: "outpaint", name: "Outpaint", inputModalities: ["text", "image"] },
-      { id: "remove-background", name: "Remove Background", inputModalities: ["image"] },
-      { id: "search-and-replace", name: "Search and Replace", inputModalities: ["text", "image"] },
-      { id: "search-and-recolor", name: "Search and Recolor", inputModalities: ["text", "image"] },
-      {
-        id: "replace-background-and-relight",
-        name: "Replace Background and Relight",
-        inputModalities: ["text", "image"],
-      },
-      { id: "creative", name: "Creative Upscale", inputModalities: ["text", "image"] },
-      { id: "fast", name: "Fast Upscale", inputModalities: ["image"] },
-      { id: "conservative", name: "Conservative Upscale", inputModalities: ["image"] },
-      { id: "sketch", name: "Sketch Control", inputModalities: ["text", "image"] },
-      { id: "structure", name: "Structure Control", inputModalities: ["text", "image"] },
-      { id: "style", name: "Style Control", inputModalities: ["text", "image"] },
-      { id: "style-transfer", name: "Style Transfer", inputModalities: ["text", "image"] },
-    ],
+    models: STABILITY_AI_IMAGE_MODELS,
     supportedSizes: ["1024x1024", "1024x1280", "1280x1024"],
   },
 
@@ -548,6 +642,9 @@ export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
     models: [{ id: "topaz-enhance", name: "topaz-enhance", inputModalities: ["image"] }],
     supportedSizes: ["1024x1024"],
   },
+
+  // Segmind (#6656): 200+ models, `POST /v1/{model}`, x-api-key, raw image bytes.
+  segmind: SEGMIND_IMAGE_PROVIDER,
   nanogpt: {
     id: "nanogpt",
     baseUrl: "https://nano-gpt.com/api/v1/images/generations",
@@ -576,7 +673,11 @@ export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
     authHeader: "bearer",
     format: "nvidia-nim",
     models: [
-      { id: "black-forest-labs/flux.1-dev", name: "FLUX.1 Dev", inputModalities: ["text", "image"] },
+      {
+        id: "black-forest-labs/flux.1-dev",
+        name: "FLUX.1 Dev",
+        inputModalities: ["text", "image"],
+      },
       { id: "black-forest-labs/flux.1-schnell", name: "FLUX.1 Schnell" },
       {
         id: "black-forest-labs/flux.1-kontext-dev",
@@ -614,7 +715,9 @@ export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
   // beyond this seed list.
   huggingface: {
     id: "huggingface",
-    baseUrl: "https://api-inference.huggingface.co/models",
+    // HF retired api-inference.huggingface.co; text-to-image now routes through
+    // router.huggingface.co with the hf-inference provider pinned in the path.
+    baseUrl: "https://router.huggingface.co/hf-inference/models",
     authType: "apikey",
     authHeader: "bearer",
     format: "huggingface-image",
@@ -625,13 +728,168 @@ export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
     ],
     supportedSizes: ["1024x1024"],
   },
+
+  // Arena (formerly LMArena) Direct-chat Image category (static scrape 2026-07-09).
+  // Not listed in the chat registry — image catalog only. Generation path still
+  // uses cookie session auth via the lmarena provider connection (stable wire id).
+  lmarena: {
+    id: "lmarena",
+    alias: "lma",
+    baseUrl: "https://arena.ai/nextjs-api/stream/create-evaluation",
+    authType: "apikey",
+    authHeader: "cookie",
+    format: "openai",
+    models: LMARENA_DIRECT_IMAGE_MODELS,
+    supportedSizes: ["1024x1024", "1024x1792", "1792x1024"],
+  },
+
+  // Adobe Firefly (unofficial) — IMS access_token (clio-playground-web) or browser
+  // Cookie from firefly.adobe.com. Async 3P image generate + poll.
+  // Model list = static fallback from models/discovery capture; live discovery
+  // refreshes via resolveAdobeFireflyCatalog when credentials work.
+  "adobe-firefly": {
+    id: "adobe-firefly",
+    alias: "firefly",
+    baseUrl: "https://firefly-3p.ff.adobe.io/v2/3p-images/generate-async",
+    authType: "apikey",
+    authHeader: "bearer",
+    format: "adobe-firefly-image",
+    models: toRegistryImageModels(),
+    routingAliases: ADOBE_FIREFLY_IMAGE_ROUTING_ALIASES,
+    supportedSizes: [],
+  },
+
+  // Cheaper Inference (OSS-sponsor gateway). Declared AFTER adobe-firefly on
+  // purpose: it shares the nano-banana-pro / nano-banana-2 ids, and parseImageModel
+  // resolves a bare id by first-match over this object's iteration order, so
+  // Firefly keeps the bare ids and these are prefix-only. See the module for the
+  // full collision note.
+  cheaperinference: CHEAPERINFERENCE_IMAGE_PROVIDER,
+
+  // Keep Bailian Coding Plan after existing duplicate model owners so adding
+  // explicit `bailian-coding-plan/` and `bcp/` routes does not change
+  // historical bare-model routing.
+  "bailian-coding-plan": {
+    id: "bailian-coding-plan",
+    alias: "bcp",
+    baseUrl:
+      "https://coding-intl.dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+    authType: "apikey",
+    authHeader: "bearer",
+    format: "bailian-coding-plan-image",
+    models: [
+      {
+        id: "wan2.7-image",
+        name: "Wan 2.7 Image",
+        inputModalities: ["text", "image"],
+      },
+      {
+        id: "wan2.7-image-pro",
+        name: "Wan 2.7 Image Pro",
+        inputModalities: ["text", "image"],
+      },
+      {
+        id: "qwen-image-2.0",
+        name: "Qwen Image 2.0",
+        inputModalities: ["text", "image"],
+      },
+      {
+        id: "qwen-image-2.0-pro",
+        name: "Qwen Image 2.0 Pro",
+        inputModalities: ["text", "image"],
+      },
+    ],
+    supportedSizes: ["1024x1024", "2048x2048"],
+  },
+
+  // Keep Alibaba after existing duplicate model owners so adding explicit
+  // `alibaba/` and `ali/` routes does not change historical bare-model routing.
+  alibaba: {
+    id: "alibaba",
+    alias: "ali",
+    baseUrl:
+      "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+    authType: "apikey",
+    authHeader: "bearer",
+    format: "alibaba-image",
+    models: [
+      {
+        id: "qwen-image-3.0-pro",
+        name: "Qwen Image 3.0 Pro",
+        inputModalities: ["text", "image"],
+      },
+      {
+        id: "qwen-image-2.0-pro-2026-06-22",
+        name: "Qwen Image 2.0 Pro (2026-06-22)",
+        inputModalities: ["text", "image"],
+      },
+      {
+        id: "qwen-image-2.0",
+        name: "Qwen Image 2.0",
+        inputModalities: ["text", "image"],
+      },
+      { id: "z-image-turbo", name: "Z-Image Turbo" },
+      { id: "wan2.6-t2i", name: "Wan 2.6 T2I" },
+    ],
+    supportedSizes: ["1024x1024", "1280x1280", "2048x2048"],
+  },
+
+  // Keep regular Qwen Cloud isolated from Alibaba, Bailian Coding Plan, and
+  // Qwen Cloud Token Plan. Explicit `qwen-cloud/` or `qwc/` routes use only
+  // the regular Qwen Cloud connection and its regional DashScope endpoint.
+  "qwen-cloud": {
+    id: "qwen-cloud",
+    alias: "qwc",
+    baseUrl:
+      "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+    authType: "apikey",
+    authHeader: "bearer",
+    format: "qwen-cloud-image",
+    models: [
+      {
+        id: "wan2.7-image-pro",
+        name: "Wan 2.7 Image Pro",
+        inputModalities: ["text", "image"],
+      },
+      {
+        id: "wan2.7-image",
+        name: "Wan 2.7 Image",
+        inputModalities: ["text", "image"],
+      },
+      {
+        id: "qwen-image-3.0-pro",
+        name: "Qwen Image 3.0 Pro",
+        inputModalities: ["text", "image"],
+      },
+      {
+        id: "qwen-image-2.0-pro-2026-06-22",
+        name: "Qwen Image 2.0 Pro (2026-06-22)",
+        inputModalities: ["text", "image"],
+      },
+      {
+        id: "qwen-image-2.0-2026-03-03",
+        name: "Qwen Image 2.0 (2026-03-03)",
+        inputModalities: ["text", "image"],
+      },
+      { id: "z-image-turbo", name: "Z-Image Turbo" },
+    ],
+    // 1K/2K are shared by the whole catalog. Wan 2.7 Image Pro callers can
+    // still pass supported 4K dimensions through the permissive request schema.
+    supportedSizes: ["1024x1024", "2048x2048"],
+  },
+  aihorde: AI_HORDE_IMAGE_PROVIDER,
 };
 
 /**
  * Get image provider config by ID
  */
 export function getImageProvider(providerId) {
-  return IMAGE_PROVIDERS[providerId] || null;
+  if (IMAGE_PROVIDERS[providerId]) return IMAGE_PROVIDERS[providerId];
+  if (!providerId) return null;
+  for (const config of Object.values(IMAGE_PROVIDERS)) {
+    if (config.alias === providerId) return config;
+  }
+  return null;
 }
 
 /**
@@ -651,21 +909,23 @@ export function parseImageModel(modelStr) {
     if (modelStr.startsWith(providerId + "/")) {
       const model = modelStr.slice(providerId.length + 1);
       const aliased =
-        resolveImageModelAlias(`${providerId}/${model}`) || resolveImageModelAlias(model);
+        resolveImageModelAlias(`${providerId}/${model}`) ||
+        resolveSameProviderBareAlias(providerId, model);
       return aliased || { provider: providerId, model };
     }
     // Check alias if available
     if (config.alias && modelStr.startsWith(config.alias + "/")) {
       const model = modelStr.slice(config.alias.length + 1);
       const aliased =
-        resolveImageModelAlias(`${providerId}/${model}`) || resolveImageModelAlias(model);
+        resolveImageModelAlias(`${providerId}/${model}`) ||
+        resolveSameProviderBareAlias(providerId, model);
       return aliased || { provider: providerId, model };
     }
   }
 
-  // No provider prefix — try to find the model in every provider
+  // No provider prefix — try to find the model in every provider, excluding cookie-auth (web) bridges
   for (const [providerId, config] of Object.entries(IMAGE_PROVIDERS)) {
-    if (config.models.some((m) => m.id === modelStr)) {
+    if (config.authHeader !== "cookie" && (config.routingAliases?.includes(modelStr) || config.models.some((m) => m.id === modelStr))) {
       return { provider: providerId, model: modelStr };
     }
   }
@@ -684,9 +944,10 @@ function imageProviderCatalogEntries(
     id: `${providerId}/${model.id}`,
     name: model.name,
     provider: providerId,
-    supportedSizes: config.supportedSizes,
+    supportedSizes: model.supportedSizes || config.supportedSizes,
     inputModalities: model.inputModalities || ["text"],
     description: model.description || undefined,
+    mediaCapabilities: model.mediaCapabilities,
   }));
 }
 
@@ -723,6 +984,18 @@ export function getImageModelAliases() {
   return IMAGE_MODEL_ALIASES;
 }
 
+/**
+ * #6457 — precise provider+modelId membership check against the image registry.
+ * Unlike getImageModelEntry() (which also resolves bare aliases and unprefixed
+ * ids by scanning every provider), this only answers "is `modelId` registered
+ * as an image model under this exact `providerId`?" — used by the chat catalog
+ * builder to keep upstream-discovered models (e.g. HuggingFace's live
+ * `/v1/models`, which returns image/diffusion models with no modality field)
+ * out of the chat listing when they are already known image-only models.
+ */
+export function isRegisteredImageModel(providerId, modelId) {
+  return Boolean(findImageModelConfig(providerId, modelId));
+}
 export function getImageModelEntry(modelStr) {
   if (!modelStr) return null;
 
@@ -733,6 +1006,7 @@ export function getImageModelEntry(modelStr) {
       provider: alias.provider,
       model: alias.model,
       inputModalities: alias.inputModalities || modelConfig?.inputModalities || ["text"],
+      imageRequired: resolveAliasImageRequired(alias, modelConfig),
       description: alias.description || modelConfig?.description || undefined,
     };
   }
@@ -747,6 +1021,13 @@ export function getImageModelEntry(modelStr) {
     provider,
     model,
     inputModalities: modelConfig.inputModalities || ["text"],
+    imageRequired: modelConfig.imageRequired,
     description: modelConfig.description || undefined,
   };
+}
+
+/** Image input is mandatory only for edit-only models (`["image"]`, no `"text"`). Dual-modality models also accept pure t2i. */
+export function modalitiesRequireImageInput(inputModalities) {
+  const list = Array.isArray(inputModalities) ? inputModalities : ["text"];
+  return list.includes("image") && !list.includes("text");
 }

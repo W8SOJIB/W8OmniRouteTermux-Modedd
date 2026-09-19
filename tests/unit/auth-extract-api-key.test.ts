@@ -90,6 +90,48 @@ test("extractApiKey accepts Anthropic-Version (TitleCase) header", () => {
   assert.equal(extractApiKey(req), "sk-titlecase-version");
 });
 
+test("extractApiKey returns the key from x-goog-api-key when Authorization and x-api-key are absent (#7034)", () => {
+  const req = makeRequest({ "x-goog-api-key": "sk-goog-native" });
+  assert.equal(extractApiKey(req), "sk-goog-native");
+});
+
+test("extractApiKey accepts uppercase X-Goog-Api-Key header casing (#7034)", () => {
+  const req = makeRequest({ "X-Goog-Api-Key": "sk-goog-uppercase" });
+  assert.equal(extractApiKey(req), "sk-goog-uppercase");
+});
+
+test("extractApiKey trims surrounding whitespace from x-goog-api-key value (#7034)", () => {
+  const req = makeRequest({ "x-goog-api-key": "   sk-goog-padded   " });
+  assert.equal(extractApiKey(req), "sk-goog-padded");
+});
+
+test("extractApiKey returns null when x-goog-api-key contains only whitespace (#7034)", () => {
+  const req = makeRequest({ "x-goog-api-key": "   " });
+  assert.equal(extractApiKey(req), null);
+});
+
+test("extractApiKey prefers Bearer over x-goog-api-key when both are present (#7034)", () => {
+  const req = makeRequest({
+    Authorization: "Bearer sk-bearer-wins",
+    "x-goog-api-key": "sk-goog-loser",
+  });
+  assert.equal(extractApiKey(req), "sk-bearer-wins");
+});
+
+test("extractApiKey prefers x-api-key (with anthropic-version) over x-goog-api-key when both are present (#7034)", () => {
+  const req = makeRequest({
+    "x-api-key": "sk-anthropic-wins",
+    "x-goog-api-key": "sk-goog-loser",
+    ...ANTHROPIC,
+  });
+  assert.equal(extractApiKey(req), "sk-anthropic-wins");
+});
+
+test("extractApiKey does not require anthropic-version for the x-goog-api-key fallback (#7034)", () => {
+  const req = makeRequest({ "x-goog-api-key": "sk-goog-no-version-needed" });
+  assert.equal(extractApiKey(req), "sk-goog-no-version-needed");
+});
+
 test("extractApiKey extracts a path-scoped token from /api/v1/vscode/<token>/...", () => {
   const req = new Request("https://omniroute.test/api/v1/vscode/sk-test-path-token/models");
   assert.equal(extractApiKey(req), "sk-test-path-token");
@@ -107,6 +149,22 @@ test("extractApiKey extracts a path-scoped token from /api/v1/vscode/combos/<tok
     "https://omniroute.test/api/v1/vscode/combos/sk-test-path-token/api/version"
   );
   assert.equal(extractApiKey(req), "sk-test-path-token");
+});
+
+test("extractApiKey accepts x-api-key without anthropic-version when User-Agent is claude-code (#8655)", () => {
+  const req = makeRequest({
+    "x-api-key": "sk-omniroute-test-key",
+    "User-Agent": "claude-code/0.2.29 node/v20.18.0 darwin-x64",
+  });
+  assert.equal(extractApiKey(req), "sk-omniroute-test-key");
+});
+
+test("extractApiKey accepts x-api-key without anthropic-version when User-Agent is @anthropic-ai/sdk (#8655)", () => {
+  const req = makeRequest({
+    "x-api-key": "sk-omniroute-test-key",
+    "User-Agent": "anthropic-typescript/0.25.0",
+  });
+  assert.equal(extractApiKey(req), "sk-omniroute-test-key");
 });
 
 test("extractApiKey does NOT extract a query-string token (#3300 security follow-up)", () => {

@@ -109,7 +109,7 @@ test("syncClaudeProfilesFromModels falls back to a generic profile for unmatched
     // No effort tier for the generic fallback — effortLevel must be omitted.
     assert.equal("effortLevel" in json, false);
   } finally {
-    await fs.rm(claudeHome, { recursive: true, force: true });
+    await fs.rm(claudeHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -137,7 +137,7 @@ test("syncClaudeProfilesFromModels writes directory-per-profile settings + threa
     // The auth token must never be written to disk.
     assert.equal(JSON.stringify(json).includes("ANTHROPIC_AUTH_TOKEN"), false);
   } finally {
-    await fs.rm(claudeHome, { recursive: true, force: true });
+    await fs.rm(claudeHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -166,7 +166,7 @@ test("syncClaudeProfilesFromModels dry-run writes nothing and reports via the in
     // …and writes nothing to disk.
     await assert.rejects(fs.stat(settingsPath), /ENOENT/);
   } finally {
-    await fs.rm(claudeHome, { recursive: true, force: true });
+    await fs.rm(claudeHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 

@@ -16,7 +16,10 @@ import {
 } from "@omniroute/open-sse/services/compression/diffHelper";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { countTextTokens } from "@/shared/utils/tiktokenCounter";
-import { ensureEngineBreakdown } from "@omniroute/open-sse/services/compression/engineBreakdown";
+import {
+  ensureEngineBreakdown,
+  reconcileSingleEngineTokens,
+} from "@omniroute/open-sse/services/compression/engineBreakdown";
 import { summarizeEncoderCandidates } from "@omniroute/open-sse/services/compression/engines/headroom/encoderComparison";
 import { DEFAULT_MIN_ROWS } from "@omniroute/open-sse/services/compression/engines/headroom/smartcrusher";
 
@@ -90,10 +93,17 @@ function messagesToText(messages: Array<{ role: string; content: unknown }>): st
     .join("\n");
 }
 
-function buildStep(engine: string, fuzzy?: { enabled: boolean }) {
-  return engine === "session-dedup" && fuzzy?.enabled
-    ? { engine, config: { fuzzy: { enabled: true } } }
-    : { engine };
+function buildStep(
+  engine: string,
+  fuzzy?: { enabled: boolean },
+  /** Optional detail bag (e.g. headroom.minRows from saved settings). */
+  detail?: Record<string, unknown>
+) {
+  const config: Record<string, unknown> = { ...(detail ?? {}) };
+  if (engine === "session-dedup" && fuzzy?.enabled) {
+    config.fuzzy = { enabled: true };
+  }
+  return Object.keys(config).length > 0 ? { engine, config } : { engine };
 }
 
 function headroomParticipates(
@@ -108,6 +118,25 @@ function headroomParticipates(
   if (engineId) return engineId === "headroom";
   if (pipeline) return pipeline.includes("headroom");
   return mode === "stacked";
+}
+
+/**
+ * Resolve the optional headroom detail (minRows) from a synthesized compression config.
+ * Extracted from dispatchCompression to keep that dispatcher under the complexity gate (#8056/#8058).
+ */
+function resolveHeadroomDetail(config: unknown): {
+  headroomDetail: CompressionConfig["headroom"] | undefined;
+  headroomStepDetail: { minRows: number } | undefined;
+} {
+  const headroomDetail =
+    config && typeof config === "object" && config !== null
+      ? (config as CompressionConfig).headroom
+      : undefined;
+  const headroomStepDetail =
+    headroomDetail && typeof headroomDetail.minRows === "number"
+      ? { minRows: headroomDetail.minRows }
+      : undefined;
+  return { headroomDetail, headroomStepDetail };
 }
 
 async function dispatchCompression(
@@ -128,11 +157,22 @@ async function dispatchCompression(
   // (CompressionConfig.riskGate) — uniform across all three branches and type-safe.
   // QuantumLock uses the same pattern: when enabled the studio forces cachingContext so the dry-run
   // badge shows what WOULD be stabilized in production (real caching gains show in telemetry only).
+  // When the client/settings carry a headroom detail sub-object, thread it so
+  // buildStepOptions can merge minRows into the headroom engine stepConfig (#8056).
+  const { headroomDetail, headroomStepDetail } = resolveHeadroomDetail(opts.config);
+
   if (opts.engineId) {
     const q = quantumExtras(opts.quantumLock);
     return applyCompressionAsync(requestBody, "stacked", {
       config: {
-        stackedPipeline: [buildStep(opts.engineId, opts.fuzzyDedup)],
+        stackedPipeline: [
+          buildStep(
+            opts.engineId,
+            opts.fuzzyDedup,
+            opts.engineId === "headroom" ? headroomStepDetail : undefined
+          ),
+        ],
+        ...(headroomDetail ? { headroom: headroomDetail } : {}),
         ...(opts.fidelityGate ? { fidelityGate: opts.fidelityGate } : {}),
         ...(opts.riskGate ? { riskGate: opts.riskGate } : {}),
         ...q.configPatch,
@@ -144,7 +184,10 @@ async function dispatchCompression(
     const q = quantumExtras(opts.quantumLock);
     return applyCompressionAsync(requestBody, "stacked", {
       config: {
-        stackedPipeline: opts.pipeline.map((engine) => buildStep(engine, opts.fuzzyDedup)),
+        stackedPipeline: opts.pipeline.map((engine) =>
+          buildStep(engine, opts.fuzzyDedup, engine === "headroom" ? headroomStepDetail : undefined)
+        ),
+        ...(headroomDetail ? { headroom: headroomDetail } : {}),
         ...(opts.fidelityGate ? { fidelityGate: opts.fidelityGate } : {}),
         ...(opts.riskGate ? { riskGate: opts.riskGate } : {}),
         ...q.configPatch,
@@ -217,7 +260,14 @@ export async function POST(req: Request) {
     const tokensSaved = Math.max(0, originalTokens - compressedTokens);
     const savingsPct = originalTokens > 0 ? Math.round((tokensSaved / originalTokens) * 100) : 0;
     const techniquesUsed: string[] = result.stats?.techniquesUsed ?? [];
-    const engineBreakdown = result.stats ? ensureEngineBreakdown(result.stats) : [];
+    const engineBreakdown = result.stats
+      ? reconcileSingleEngineTokens(
+          ensureEngineBreakdown(result.stats),
+          originalTokens,
+          compressedTokens,
+          savingsPct
+        )
+      : [];
     const diff = buildCompressionPreviewDiff(
       originalText,
       compressedText,
@@ -226,9 +276,38 @@ export async function POST(req: Request) {
       heatmapMode as HeatmapMode | undefined
     );
 
+    const headroomMinRows =
+      typeof config?.headroom?.minRows === "number" && Number.isFinite(config.headroom.minRows)
+        ? config.headroom.minRows
+        : DEFAULT_MIN_ROWS;
     const encoderComparison = headroomParticipates(engineId, pipeline, effectiveMode)
-      ? summarizeEncoderCandidates(messages, DEFAULT_MIN_ROWS, countTextTokens)
+      ? summarizeEncoderCandidates(messages, headroomMinRows, countTextTokens)
       : null;
+
+    // #6461: when fallbackApplied=true, synthesize a deduped reason list from data the
+    // pipeline already produces on result.stats (engineBreakdown[].rejectReason,
+    // validationErrors, and inflation-guard entries in validationWarnings). Non-fallback
+    // runs return []/null — zero change on the happy path.
+    const fallbackReasons: string[] = [];
+    if (diff.fallbackApplied) {
+      const seen = new Set<string>();
+      const push = (s: unknown) => {
+        if (typeof s === "string" && s.length > 0 && !seen.has(s)) {
+          seen.add(s);
+          fallbackReasons.push(s);
+        }
+      };
+      for (const step of engineBreakdown) {
+        if ((step as { rejected?: boolean }).rejected === true) {
+          push((step as { rejectReason?: string }).rejectReason);
+        }
+      }
+      for (const err of diff.validationErrors ?? []) push(err);
+      for (const warn of diff.validationWarnings ?? []) {
+        if (typeof warn === "string" && warn.startsWith("pipeline-inflation-guard:")) push(warn);
+      }
+    }
+    const fallbackReason = fallbackReasons[0] ?? null;
 
     return NextResponse.json({
       encoderComparison,
@@ -246,7 +325,7 @@ export async function POST(req: Request) {
       mode: effectiveMode,
       intensity: null,
       outputMode: null,
-      skippedReasons: [],
+      skippedReasons: fallbackReasons,
       diff: diff.segments,
       preservedBlocks: diff.preservedBlocks,
       ruleRemovals: diff.ruleRemovals,
@@ -261,7 +340,10 @@ export async function POST(req: Request) {
       validationWarnings: diff.validationWarnings,
       validationErrors: diff.validationErrors,
       fallbackApplied: diff.fallbackApplied,
-      ...(diff.fallbackReason && { fallbackReason: diff.fallbackReason }),
+      // Prefer the pipeline's canonical `diff.fallbackReason`; fall back to the
+      // first synthesized reason (#6461) when the pipeline did not set one.
+      fallbackReason: diff.fallbackReason ?? fallbackReason,
+      fallbackReasons,
       ...(diff.heatmap ? { heatmap: diff.heatmap } : {}),
     });
   } catch (err: unknown) {

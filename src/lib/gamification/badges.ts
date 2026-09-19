@@ -161,6 +161,16 @@ export const BUILTIN_BADGES: Omit<BadgeDefinition, "createdAt">[] = [
     criteria: JSON.stringify({ type: "threshold", metric: "uptime", threshold: 100, window: 7 }),
     hidden: 0,
   },
+  {
+    id: "radar-supporter",
+    name: "Radar Supporter",
+    description: "Verified a live OmniRoute Radar supporter feed",
+    icon: "radar",
+    category: "contribution",
+    rarity: "rare",
+    criteria: JSON.stringify({ type: "action_count", action: "radar_supporter", threshold: 1 }),
+    hidden: 0,
+  },
 
   // ── Streak (Engagement) ──────────────────────────────────────────────────
   {

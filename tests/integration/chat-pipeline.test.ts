@@ -14,11 +14,12 @@ const providersDb = await import("../../src/lib/db/providers.ts");
 const combosDb = await import("../../src/lib/db/combos.ts");
 const settingsDb = await import("../../src/lib/db/settings.ts");
 const apiKeysDb = await import("../../src/lib/db/apiKeys.ts");
-const callLogsDb = await import("../../src/lib/usage/callLogs.ts");
 const readCacheDb = await import("../../src/lib/db/readCache.ts");
+const { getLatestCallLog, getResponsesCallLogs } = await import("./_chatPipelineCallLogs.ts");
 const { invalidateMemorySettingsCache } = await import("../../src/lib/memory/settings.ts");
 const { skillRegistry } = await import("../../src/lib/skills/registry.ts");
 const { skillExecutor } = await import("../../src/lib/skills/executor.ts");
+const { encodeSkillToolName } = await import("../../src/lib/skills/injection.ts");
 const { handleChat } = await import("../../src/sse/handlers/chat.ts");
 const { initTranslators } = await import("../../open-sse/translator/index.ts");
 const { clearInflight } = await import("../../open-sse/services/requestDedup.ts");
@@ -59,6 +60,7 @@ type SeedApiKeyOptions = {
   name?: string;
   noLog?: boolean;
   allowedConnections?: string[];
+  allowedCombos?: string[];
   allowedModels?: string[];
 };
 
@@ -371,7 +373,7 @@ async function resetStorage() {
   invalidateMemorySettingsCache();
   await new Promise((resolve) => setTimeout(resolve, 20));
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
   initTranslators();
 }
@@ -400,12 +402,14 @@ async function seedApiKey({
   name = "chat-pipeline-key",
   noLog = false,
   allowedConnections,
+  allowedCombos,
   allowedModels,
 }: SeedApiKeyOptions = {}) {
   const key = await apiKeysDb.createApiKey(name, "machine-test");
   const updates: Record<string, unknown> = {};
   if (noLog) updates.noLog = true;
   if (allowedConnections) updates.allowedConnections = allowedConnections;
+  if (allowedCombos) updates.allowedCombos = allowedCombos;
   if (allowedModels) updates.allowedModels = allowedModels;
   if (Object.keys(updates).length > 0) {
     await apiKeysDb.updateApiKeyPermissions(key.id, updates);
@@ -491,18 +495,6 @@ async function waitFor(fn, timeoutMs = 1500) {
   return null;
 }
 
-async function getLatestCallLog() {
-  const rows = await callLogsDb.getCallLogs({ limit: 5 });
-  if (!Array.isArray(rows) || rows.length === 0) return null;
-  return callLogsDb.getCallLogById(rows[0].id);
-}
-
-async function getResponsesCallLogs() {
-  const rows = await callLogsDb.getCallLogs({ limit: 200 });
-  if (!Array.isArray(rows) || rows.length === 0) return [];
-  return rows.filter((row) => row.path === "/v1/responses");
-}
-
 test.beforeEach(async () => {
   BaseExecutor.RETRY_CONFIG.delayMs = 0;
   await resetStorage();
@@ -520,7 +512,7 @@ test.after(async () => {
   clearInflight();
   resetAllCircuitBreakers();
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("chat pipeline handles OpenAI passthrough with valid API key auth", async () => {
@@ -604,11 +596,10 @@ test("chat pipeline persists Codex responses cache and reasoning tokens to call 
   assert.equal(callLog.tokens.reasoning, 13);
 });
 
-test("chat pipeline applies global Codex priority service tier inside combos", async () => {
-  await seedConnection("codex", { apiKey: "sk-codex-combo-priority" });
-  await settingsDb.updateSettings({
-    codexServiceTier: { enabled: true, tier: "priority" },
-  });
+test("chat pipeline applies Codex OAuth fingerprint and priority tier inside combos", async () => {
+  setCliCompatProviders(["codex"]);
+  await seedConnection("codex", { authType: "oauth", accessToken: "codex-combo-oauth-token" });
+  await settingsDb.updateSettings({ codexServiceTier: { enabled: true, tier: "priority" } });
   await combosDb.createCombo({
     name: "codex-priority-combo",
     strategy: "priority",
@@ -616,10 +607,8 @@ test("chat pipeline applies global Codex priority service tier inside combos", a
     models: ["codex/gpt-5.5"],
   });
   const fetchCalls = [];
-
-  globalThis.fetch = async (url, init: RequestInit = {}) => {
+  globalThis.fetch = async (_url, init: RequestInit = {}) => {
     fetchCalls.push({
-      url: String(url),
       headers: toPlainHeaders(init.headers),
       body: init.body ? JSON.parse(String(init.body)) : null,
     });
@@ -628,21 +617,24 @@ test("chat pipeline applies global Codex priority service tier inside combos", a
 
   const response = await handleChat(
     buildRequest({
+      url: "http://localhost/v1/responses",
+      headers: { "session-id": "combo-client-session" },
       body: {
         model: "codex-priority-combo",
         stream: false,
-        messages: [{ role: "user", content: "Use Codex combo priority" }],
+        input: "Use Codex combo priority",
       },
     })
   );
 
   const json = (await response.json()) as any;
-  assert.equal(response.status, 200);
+  assert.equal(json.object, "response");
   assert.equal(fetchCalls.length, 1);
-  assert.match(fetchCalls[0].url, /\/responses$/);
-  assert.equal(fetchCalls[0].headers.Authorization, "Bearer sk-codex-combo-priority");
-  assert.equal(fetchCalls[0].body.service_tier, "priority");
-  assert.equal(json.choices[0].message.content, "combo priority ok");
+  const [call] = fetchCalls;
+  assert.equal(call.headers.Authorization, "Bearer codex-combo-oauth-token");
+  assert.notEqual(call.headers["session-id"], "combo-client-session");
+  assert.equal(call.headers["session-id"], call.body.client_metadata.session_id);
+  assert.equal(call.body.service_tier, "priority");
 });
 
 test("chat pipeline applies Codex CLI fingerprint to OAuth responses requests", async () => {
@@ -698,8 +690,18 @@ test("chat pipeline applies Codex CLI fingerprint to OAuth responses requests", 
   assert.equal(call.headers.Version, getCodexClientVersion());
   assert.equal(call.headers["Openai-Beta"], "responses=experimental");
   assert.equal(call.headers["X-Codex-Beta-Features"], "responses_websockets");
-  assert.equal(call.headers["User-Agent"], "codex-cli/0.142.0 (Windows 10.0.26200; x64)");
-  assert.equal(call.headers["x-codex-window-id"], "conv_codex_fingerprint:0");
+  // Derive from the same source the code reads (see getCodexClientVersion() two
+  // lines above) instead of pinning the literal — #9323's version bump to 0.146.0
+  // broke this assertion while the rest of the test kept passing.
+  assert.equal(
+    call.headers["User-Agent"],
+    `codex-cli/${getCodexClientVersion()} (Windows 10.0.26200; x64)`
+  );
+  // Session convergence derives a fresh session/thread id instead of passing the
+  // client's raw conversation_id straight through, so the window id must be derived
+  // from the (converged) request id header, not the original client-supplied literal.
+  assert.notEqual(call.headers["session_id"], "conv_codex_fingerprint");
+  assert.equal(call.headers["x-codex-window-id"], `${call.headers["x-client-request-id"]}:0`);
   assert.ok(call.headers["x-client-request-id"], "expected Codex request id header");
   assert.ok(call.headers["x-codex-turn-metadata"], "expected Codex turn metadata header");
 
@@ -725,7 +727,7 @@ test("chat pipeline applies Codex CLI fingerprint to OAuth responses requests", 
   );
 });
 
-test("chat pipeline strips previous_response_id from stateless Codex responses by default", async () => {
+test("chat pipeline fails closed on an unresolvable previous_response_id and keeps stateless Codex responses stateless", async () => {
   await seedConnection("codex", {
     apiKey: "sk-codex-stateless-responses",
     providerSpecificData: { openaiStoreEnabled: false },
@@ -759,9 +761,38 @@ test("chat pipeline strips previous_response_id from stateless Codex responses b
     })
   );
 
-  await response.json();
+  // #10262 virtualized `previous_response_id`: in any mode other than "preserve"
+  // the id is resolved against OmniRoute's own continuation store BEFORE routing.
+  // An id it cannot resolve fails closed with OpenAI's own contract instead of
+  // being silently stripped and forwarded as a fresh turn (which would have
+  // dropped the conversation history without telling the client).
+  const failClosed = (await response.json()) as { error?: { code?: string } };
+  assert.equal(response.status, 400);
+  assert.equal(failClosed.error?.code, "previous_response_not_found");
+  assert.equal(fetchCalls.length, 0, "a request that fails closed must not reach the upstream");
 
-  assert.equal(response.status, 200);
+  // Positive anchor: the same stateless Codex connection, without the unresolvable
+  // continuation id, still dispatches — and the stateless contract still holds
+  // (store:false, no previous_response_id on the wire).
+  const followUp = await handleChat(
+    buildRequest({
+      url: "http://localhost/v1/responses",
+      body: {
+        model: "codex/gpt-5.5",
+        stream: false,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "First VS Code turn" }],
+          },
+        ],
+      },
+    })
+  );
+  await followUp.json();
+
+  assert.equal(followUp.status, 200);
   assert.equal(fetchCalls.length, 1);
   assert.match(fetchCalls[0].url, /\/responses$/);
   assert.equal(fetchCalls[0].body.previous_response_id, undefined);
@@ -1111,7 +1142,8 @@ test("chat pipeline allows unauthenticated requests through to provider resoluti
   // handleChat does not enforce REQUIRE_API_KEY — that's the authz pipeline's job.
   // Without provider credentials seeded, the request falls through to the "no credentials" path.
   // Upstream port decolua/9router#336: 400 → 404 so combo routing can fall through.
-  assert.equal(response.status, 404);
+  // #10797: single-model (non-combo) no-credentials now remaps 404 → 401.
+  assert.equal(response.status, 401);
   assert.match(json.error.message, /No active credentials for provider/i);
 });
 
@@ -1230,7 +1262,8 @@ test("chat pipeline returns current no-credentials contract when no provider con
 
   const json = (await response.json()) as any;
   // Upstream port decolua/9router#336: 400 → 404 so combo routing can fall through.
-  assert.equal(response.status, 404);
+  // #10797: single-model (non-combo) no-credentials now remaps 404 → 401.
+  assert.equal(response.status, 401);
   assert.match(json.error.message, /No active credentials for provider: openai/);
 });
 
@@ -1437,13 +1470,23 @@ test("chat pipeline injects skills into tools and intercepts tool calls with ski
     enabled: true,
   });
 
+  // #9058: provider tool names must match ^[a-zA-Z0-9_-]+$, so `name@version`
+  // identifiers travel base64url-encoded. Derive the expectation from the helper
+  // instead of pinning the encoded literal.
+  const expectedSkillToolName = encodeSkillToolName("lookupWeather", "1.0.0");
+  assert.match(expectedSkillToolName, /^[a-zA-Z0-9_-]+$/);
+  assert.notEqual(expectedSkillToolName, "lookupWeather@1.0.0");
+
   const fetchCalls = [];
   globalThis.fetch = async (url, init: RequestInit = {}) => {
     fetchCalls.push({
       url: String(url),
       body: init.body ? JSON.parse(String(init.body)) : null,
     });
-    return buildOpenAIToolCallResponse();
+    // #9058: the upstream echoes back exactly the tool name it was given — the
+    // provider-safe encoded one — so this also exercises decodeSkillToolName()
+    // on the interception path.
+    return buildOpenAIToolCallResponse({ toolName: expectedSkillToolName });
   };
 
   const response = await handleChat(
@@ -1461,7 +1504,7 @@ test("chat pipeline injects skills into tools and intercepts tool calls with ski
   assert.equal(response.status, 200);
   assert.equal(fetchCalls.length, 1);
   assert.ok(Array.isArray(fetchCalls[0].body.tools));
-  assert.equal(fetchCalls[0].body.tools[0].function.name, "lookupWeather@1.0.0");
+  assert.equal(fetchCalls[0].body.tools[0].function.name, expectedSkillToolName);
   assert.equal(json.choices[0].finish_reason, "tool_calls");
   assert.equal(json.tool_results[0].tool_call_id, "call_weather");
   assert.equal(JSON.parse(json.tool_results[0].output).forecast, "Sunny in Sao Paulo");

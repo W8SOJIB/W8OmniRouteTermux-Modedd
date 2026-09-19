@@ -38,13 +38,13 @@ function jsonRequest(body: unknown): Request {
 async function resetStorage() {
   delete process.env.INITIAL_PASSWORD;
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
 test.after(async () => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("batch-delete removes multiple existing proxies in one request", async () => {
@@ -59,7 +59,7 @@ test("batch-delete removes multiple existing proxies in one request", async () =
   assert.equal(body.deleted, 2);
   assert.equal(body.failed, 0);
   // Both are actually gone from the store.
-  const remaining = await proxiesDb.listProxies({ includeSecrets: false });
+  const { items: remaining } = await proxiesDb.listProxies({ includeSecrets: false });
   assert.equal(remaining.filter((p) => p.id === a.id || p.id === b.id).length, 0);
 });
 

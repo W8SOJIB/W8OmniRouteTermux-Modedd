@@ -57,7 +57,7 @@ function writeTestPlugin(opts?: { name?: string; onRequest?: boolean; enabledByD
 // ── Helpers ──
 
 function cleanupDir(dir: string) {
-  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
 // Track temp source dirs for cleanup
@@ -65,7 +65,7 @@ const activeSourceDirs: string[] = [];
 
 function cleanupSourceDirs() {
   for (const dir of activeSourceDirs) {
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
   }
   activeSourceDirs.length = 0;
 }

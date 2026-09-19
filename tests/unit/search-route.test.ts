@@ -13,7 +13,7 @@ const searchRoute = await import("../../src/app/api/v1/search/route.ts");
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -42,23 +42,24 @@ test.beforeEach(async () => {
 
 test.after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
-test("v1 search GET lists all 13 search providers", async () => {
+test("v1 search GET lists all search providers", async () => {
   const response = await searchRoute.GET();
   const body = (await response.json()) as any;
   const ids = body.data.map((item: { id: string }) => item.id);
 
   assert.equal(response.status, 200);
   assert.equal(body.object, "list");
-  assert.equal(body.data.length, 13);
+  assert.equal(body.data.length, 17);
   assert.deepEqual(ids, [
     "serper-search",
     "brave-search",
     "perplexity-search",
     "exa-search",
     "tavily-search",
+    "firecrawl",
     "google-pse-search",
     "linkup-search",
     "searchapi-search",
@@ -66,7 +67,10 @@ test("v1 search GET lists all 13 search providers", async () => {
     "searxng-search",
     "ollama-search",
     "zai-search",
+    "jina-search",
+    "context7",
     "duckduckgo-free",
+    "x-search",
   ]);
 });
 
@@ -124,6 +128,72 @@ test("v1 search POST uses stored Linkup credentials and returns normalized resul
     assert.equal(body.results[0].snippet, "Linkup snippet");
     assert.equal(body.results[0].citation.provider, "linkup-search");
     assert.equal(body.cached, false);
+    assert.equal(body.usage.queries_used, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("v1 search POST uses firecrawl credentials for unified firecrawl search", async () => {
+  await seedConnection("firecrawl", { apiKey: "fc-route-key" });
+
+  const originalFetch = globalThis.fetch;
+  let capturedUrl = "";
+  let capturedInit: RequestInit | undefined;
+
+  globalThis.fetch = async (url, init = {}) => {
+    capturedUrl = String(url);
+    capturedInit = init;
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: {
+          web: [
+            {
+              title: "Firecrawl route hit",
+              url: "https://example.com/fc",
+              description: "From firecrawl via /v1/search",
+            },
+          ],
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  };
+
+  try {
+    const response = await searchRoute.POST(
+      new Request("http://localhost/api/v1/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: "omniroute firecrawl",
+          provider: "firecrawl",
+          max_results: 3,
+          search_type: "web",
+        }),
+      })
+    );
+    const body = (await response.json()) as {
+      provider: string;
+      results: Array<{ title: string; snippet: string }>;
+      usage: { queries_used: number };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(capturedUrl, "https://api.firecrawl.dev/v2/search");
+    assert.equal(
+      (capturedInit?.headers as Record<string, string>).Authorization,
+      "Bearer fc-route-key"
+    );
+    const requestBody = JSON.parse(String(capturedInit?.body || "{}"));
+    assert.equal(requestBody.query, "omniroute firecrawl");
+    assert.equal(requestBody.limit, 3);
+    assert.deepEqual(requestBody.sources, ["web"]);
+    assert.equal(body.provider, "firecrawl");
+    assert.equal(body.results.length, 1);
+    assert.equal(body.results[0].title, "Firecrawl route hit");
+    assert.equal(body.results[0].snippet, "From firecrawl via /v1/search");
     assert.equal(body.usage.queries_used, 1);
   } finally {
     globalThis.fetch = originalFetch;
@@ -248,12 +318,16 @@ test("v1 search POST accepts authless SearXNG with provider_options baseUrl", as
   }
 });
 
-test("v1 search POST accepts authless SearXNG with the built-in default base URL", async () => {
+test("v1 search POST rejects authless SearXNG on the unconfigured catalog default base URL (#10976)", async () => {
+  // #10976/#10981 (already merged on this base): the catalog-default
+  // localhost:8888 always fails in Docker/K8s, so it's now skipped unless a
+  // request/connection baseUrl override resolves it to a real URL. This
+  // replaces the older "default URL is attempted as-is" expectation.
   const originalFetch = globalThis.fetch;
-  let capturedUrl = "";
+  let fetchCalled = false;
 
   globalThis.fetch = async (url) => {
-    capturedUrl = String(url);
+    fetchCalled = true;
     return new Response(
       JSON.stringify({
         results: [
@@ -283,13 +357,9 @@ test("v1 search POST accepts authless SearXNG with the built-in default base URL
     );
     const body = (await response.json()) as any;
 
-    assert.equal(response.status, 200);
-    assert.equal(
-      capturedUrl,
-      "http://localhost:8888/search?q=default+self+hosted+meta+search&format=json&categories=general"
-    );
-    assert.equal(body.provider, "searxng-search");
-    assert.equal(body.results[0].title, "Default SearXNG result");
+    assert.equal(response.status, 503);
+    assert.equal(fetchCalled, false);
+    assert.match(String(body.error?.message ?? body.error ?? ""), /catalog default/i);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -350,25 +420,24 @@ test("v1 search POST preserves stored SearXNG baseUrl for authless providers", a
   }
 });
 
-test("v1 search POST auto-select uses authless SearXNG when no API-key providers are configured", async () => {
+test("v1 search POST falls back to duckduckgo-free when no provider is configured (#11097)", async () => {
+  // Contract changed by PR #11097 ("fix(search): fall back to duckduckgo-free when
+  // no search provider is configured"): zero-credential /v1/search no longer returns
+  // 400 — it promotes the fallback-only duckduckgo-free provider so out-of-the-box
+  // search works. This test pins the NEW contract.
   const originalFetch = globalThis.fetch;
   let capturedUrl = "";
 
+  // DuckDuckGo lite HTML shape: result link + snippet cell (see
+  // open-sse/services/freeWebSearch.ts parseDuckDuckGoLite).
+  const liteHtml = `<html><body>
+    <a href="https://example.com/auto-result" class='result-link'>Auto-selected DuckDuckGo result</a>
+    <td class='result-snippet'>Fallback free search snippet</td>
+  </body></html>`;
+
   globalThis.fetch = async (url) => {
     capturedUrl = String(url);
-    return new Response(
-      JSON.stringify({
-        results: [
-          {
-            title: "Auto-selected SearXNG result",
-            url: "https://searx.example/auto",
-            content: "Auto-selected self-hosted response",
-            engines: ["duckduckgo"],
-          },
-        ],
-      }),
-      { status: 200, headers: { "content-type": "application/json" } }
-    );
+    return new Response(liteHtml, { status: 200, headers: { "content-type": "text/html" } });
   };
 
   try {
@@ -387,10 +456,12 @@ test("v1 search POST auto-select uses authless SearXNG when no API-key providers
     assert.equal(response.status, 200);
     assert.equal(
       capturedUrl,
-      "http://localhost:8888/search?q=auto+select+self+hosted+search&format=json&categories=general"
+      "https://lite.duckduckgo.com/lite/",
+      "the fallback must call the DuckDuckGo lite endpoint"
     );
-    assert.equal(body.provider, "searxng-search");
-    assert.equal(body.results[0].title, "Auto-selected SearXNG result");
+    assert.equal(body.provider, "duckduckgo-free");
+    assert.equal(body.results[0].title, "Auto-selected DuckDuckGo result");
+    assert.equal(body.results[0].url, "https://example.com/auto-result");
   } finally {
     globalThis.fetch = originalFetch;
   }

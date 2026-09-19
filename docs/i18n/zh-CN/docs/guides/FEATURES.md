@@ -18,11 +18,11 @@ OmniRoute 控制台各功能区的可视化指南。
 
 v3.7.x → v3.8.0 版本周期引入了零配置自动路由、新的服务商、OAuth 流程、更深度的容灾能力，以及大幅增强的 CLI 体验。以下是主要功能——完整细节见下文及链接的规范文档。
 
-- 🤖 **Auto Combo / 零配置自动路由** — 使用 `auto/coding`、`auto/fast`、`auto/cheap`、`auto/offline`、`auto/smart`、`auto/lkgp` 前缀。背后是 9 因子评分引擎和 4 个精选**模式包**（快速交付、成本优先、质量优先、离线友好）
+- 🤖 **Auto Combo / 零配置自动路由** — 使用 `auto/coding`、`auto/fast`、`auto/cheap`、`auto/offline`、`auto/smart`、`auto/lkgp` 前缀。背后是 13 因子评分引擎和 4 个精选**模式包**（快速交付、成本优先、质量优先、离线友好）
 - 🆕 **Command Code 服务商** (#2199) — 一线注册，含模型目录和配额追踪
 - 🆕 **Z.AI 服务商** — 新增免费层服务商，带配额标签
 - 🎬 **KIE 媒体扩展** — 扩展目录，包含视频生成模型
-- 🔐 **Windsurf + Devin CLI OAuth 流程** (#2168) — 端到端浏览器登录
+- 🔐 **Devin 认证** — Desktop 导入现有的 Devin API 密钥；CLI 使用本地 `devin auth login` 凭据
 - 🆓 **9 个新的免费服务商** — LLM7、Lepton、Kluster、UncloseAI、BazaarLink、Completions、Enally、FreeTheAi、Command Code
 - 🎯 **Manifest 感知层级路由 W1–W4** — 服务商 Manifest 驱动加权层级选择
 - 🎨 **Cursor 完全兼容 OpenAI 格式** — 工具调用、流式传输、会话管理端到端打通
@@ -61,7 +61,7 @@ OpenRouter 连接可以在 高级设置 中存储每个连接的 `preset`。设�
 
 ## 🎨 Combo
 
-使用 17 种策略创建模型路由 Combo：priority、weighted、fill-first、round-robin、p2c（power-of-two-choices）、random、least-used、cost-optimized、reset-aware、reset-window、headroom、strict-random、auto、lkgp（last-known-good-provider）、context-optimized、context-relay，以及 **fusion**（并行扇出到一组模型，然后通过评判模型合成一个答案）。每个 Combo 将多个模型串联起来，具备自动容灾能力，并包含快速模板和就绪检查。
+使用 19 种公开策略创建模型路由 Combo：priority、weighted、round-robin、context-relay、fill-first、p2c（power-of-two-choices）、random、least-used、cost-optimized、reset-aware、reset-window、headroom、strict-random、auto、lkgp（last-known-good-provider）、context-optimized、cache-optimized、**fusion**（并行扇出到一组模型，然后通过评判模型合成一个答案）以及 **pipeline**。每个 Combo 将多个模型串联起来，具备自动容灾能力，并包含快速模板和就绪检查。
 
 最近的 Combo 改进：
 
@@ -142,7 +142,7 @@ CLI 智能体发现与管理控制台。以网格形式展示 17 个内置智能
 - **协议 Badge** — stdio、HTTP 等
 - **自定义智能体** — 通过表单注册任意 CLI 工具（名称、二进制文件、版本命令、启动参数）
 - **CLI 指纹匹配** — 按服务商切换，匹配原生 CLI 请求签名，降低封禁风险同时保留代理 IP
-- **OAuth 支持的智能体** — Windsurf 与 Devin CLI 现使用浏览器 OAuth 流程进行认证（v3.8.0+）
+- **本地 Devin 认证** — Devin CLI 使用 `devin auth login`；无需浏览器 OAuth 流程
 
 ---
 

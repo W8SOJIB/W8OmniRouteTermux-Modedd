@@ -1,9 +1,16 @@
 import { NextResponse } from "next/server";
-import { getSettings, updateSettings } from "@/lib/localDb";
+import { z } from "zod";
+import {
+  getSettings,
+  getSettingsRevision,
+  updateSettings,
+  SettingsRevisionConflictError,
+} from "@/lib/db/settings";
 import { getRuntimePorts } from "@/lib/runtime/ports";
 import { updateSettingsSchema } from "@/shared/validation/settingsSchemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
+import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
 import { resolveModelLockoutSettings } from "@/lib/resilience/modelLockoutSettings";
 import {
   validateProxyUrl,
@@ -20,11 +27,19 @@ import {
   verifyManagementPassword,
 } from "@/lib/auth/managementPassword";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { isPaidModelTarget } from "@/shared/utils/freeModels";
 import { getAuditRequestContext, logAuditEvent } from "@/lib/compliance";
-import { isDashboardSessionAuthenticated } from "@/shared/utils/apiAuth";
+import { isAuthRequired, isDashboardSessionAuthenticated } from "@/shared/utils/apiAuth";
 import { isCliTokenAuthValid } from "@/lib/middleware/cliTokenAuth";
 import { extractApiKey } from "@/sse/services/auth";
 import { getApiKeyMetadata } from "@/lib/db/apiKeys";
+import { getRadarAdminUrl } from "@/lib/radar/links";
+import {
+  AUTHZ_HEADER_AUTH_ID,
+  AUTHZ_HEADER_AUTH_KIND,
+  AUTHZ_HEADER_PEER_LOCALITY,
+} from "@/server/authz/headers";
+import { readSubjectFromHeaders } from "@/server/authz/assertAuth";
 
 /**
  * Force this route to run dynamically per-request and never be cached/prerendered.
@@ -38,6 +53,52 @@ export const revalidate = 0;
 
 /** Response headers applied to every successful GET/PATCH on /api/settings. */
 const SETTINGS_RESPONSE_HEADERS = { "Cache-Control": "no-store" } as const;
+
+function settingsResponseHeaders(settingsRevision: number): Record<string, string> {
+  return {
+    ...SETTINGS_RESPONSE_HEADERS,
+    ETag: String(settingsRevision),
+  };
+}
+
+const RadarAdminOwnerSubjectSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("dashboard_session"), id: z.literal("dashboard") }).strict(),
+  z.object({ kind: z.literal("anonymous"), id: z.literal("anonymous") }).strict(),
+]);
+
+export async function resolveOwnerRadarAdminUrl(request: Request): Promise<string | null> {
+  const subject = RadarAdminOwnerSubjectSchema.safeParse({
+    kind: request.headers.get(AUTHZ_HEADER_AUTH_KIND),
+    id: request.headers.get(AUTHZ_HEADER_AUTH_ID),
+  });
+  if (!subject.success) return null;
+  if (subject.data.kind === "dashboard_session") return getRadarAdminUrl();
+
+  // Fresh local installs can intentionally run without login. In that mode,
+  // only the pipeline's non-forgeable loopback verdict represents the owner;
+  // CLI/internal/manage-scope credentials must not receive the private URL.
+  if (request.headers.get(AUTHZ_HEADER_PEER_LOCALITY) !== "loopback") return null;
+  if (await isAuthRequired(request)) return null;
+  return getRadarAdminUrl();
+}
+
+/** Parse opt-in CAS token from If-Match (preferred) or PATCH body. */
+function parseExpectedRevision(
+  request: Request,
+  body: Record<string, unknown>
+): number | undefined {
+  const ifMatch = request.headers.get("If-Match");
+  if (ifMatch !== null) {
+    const trimmed = ifMatch.replace(/^W\/"/, "").replace(/"$/, "").trim();
+    const parsed = Number(trimmed);
+    if (Number.isInteger(parsed) && parsed >= 0) return parsed;
+  }
+  const fromBody = body.expectedRevision;
+  if (typeof fromBody === "number" && Number.isInteger(fromBody) && fromBody >= 0) {
+    return fromBody;
+  }
+  return undefined;
+}
 
 /**
  * Settings keys whose change broadens attack surface. Spec §Security:
@@ -60,6 +121,9 @@ const SECURITY_IMPACTING_KEYS = [
   "localOnlyManageScopeBypassPrefixes",
   "requireLogin",
   "newPassword",
+  "oidcEnabled",
+  "oidcDisablePasswordLogin",
+  "oidcClientSecret",
 ] as const;
 
 /**
@@ -75,6 +139,8 @@ async function deriveAuditActor(request: Request): Promise<string> {
   } catch {
     /* fall through */
   }
+  const subject = readSubjectFromHeaders(request.headers);
+  if (subject.kind === "management_key" && subject.label === "local-cli-token") return "cli";
   try {
     if (await isCliTokenAuthValid(request)) return "cli";
   } catch {
@@ -124,7 +190,8 @@ function computeSettingsDiff(
 function attemptedKeysOf(body: Record<string, unknown> | null | undefined): string[] {
   if (!body || typeof body !== "object") return [];
   return Object.keys(body).filter(
-    (k) => k !== "currentPassword" && k !== "newPassword" && k !== "password"
+    (k) =>
+      k !== "currentPassword" && k !== "newPassword" && k !== "password" && k !== "expectedRevision"
   );
 }
 
@@ -158,6 +225,7 @@ export async function GET(request: Request) {
 
   try {
     const settings = await getSettings();
+    const settingsRevision = await getSettingsRevision();
     const { password, ...safeSettings } = settings;
 
     const runtimePorts = getRuntimePorts();
@@ -178,6 +246,7 @@ export async function GET(request: Request) {
     return NextResponse.json(
       {
         ...safeSettings,
+        settingsRevision,
         hasPassword: hasManagementPasswordConfigured(settings),
         runtimePorts,
         apiPort: runtimePorts.apiPort,
@@ -185,11 +254,20 @@ export async function GET(request: Request) {
         cloudConfigured: Boolean(cloudUrl),
         cloudUrl,
         machineId,
+        // Sidebar.tsx has no server-side feature-flag access (client component);
+        // this piggy-backs the RADAR_ENABLED gate onto the settings payload the
+        // sidebar already fetches on mount, so the "radar" item can hide itself
+        // without a dedicated round trip. See sidebarVisibility.ts's
+        // `isSidebarItemVisibleForFlags()`.
+        radarEnabled: isFeatureFlagEnabled("RADAR_ENABLED"),
+        // Owner-only operational link. This route is management-authenticated;
+        // the URL has no public default and is omitted from static client code.
+        radarAdminUrl: await resolveOwnerRadarAdminUrl(request),
         ...(cliproxyapiModelMapping !== null
           ? { cliproxyapi_model_mapping: cliproxyapiModelMapping }
           : {}),
       },
-      { headers: SETTINGS_RESPONSE_HEADERS }
+      { headers: settingsResponseHeaders(settingsRevision) }
     );
   } catch (error) {
     console.log("Error getting settings:", error);
@@ -216,6 +294,7 @@ export async function PATCH(request: Request) {
     );
   }
   const attemptedKeys = attemptedKeysOf(rawBody);
+  const expectedRevision = parseExpectedRevision(request, rawBody);
 
   try {
     // Zod validation
@@ -237,21 +316,39 @@ export async function PATCH(request: Request) {
     }
     const body: typeof validation.data & { password?: string } = { ...validation.data };
 
-    // Sanitize model lockout settings: clamp values to valid bounds so that
-    // stale DB values or hand-crafted requests don't bypass range validation.
+    // Sanitize model lockout settings: clamp values to valid bounds.
     if (body.modelLockout) {
       body.modelLockout = resolveModelLockoutSettings({
         modelLockout: body.modelLockout as Record<string, unknown>,
       }) as typeof body.modelLockout;
     }
 
-    // Security-impacting gate (T-011, spec AC-4 / AC-5). Computed from the
+    if (body.oidcEnabled === true) {
+      const current = await getSettings();
+      const subjects = Array.isArray(body.oidcAllowedSubjects)
+        ? (body.oidcAllowedSubjects as unknown[])
+        : ((current.oidcAllowedSubjects as unknown[] | undefined) ?? []);
+      const hasAtLeastOne = subjects.some((s) => typeof s === "string" && s.trim().length > 0);
+      if (!hasAtLeastOne) {
+        emitSettingsFailureAudit(request, actor, "OIDC_ALLOWED_SUBJECTS_REQUIRED", attemptedKeys);
+        return NextResponse.json(
+          {
+            error: {
+              code: "OIDC_ALLOWED_SUBJECTS_REQUIRED",
+              message:
+                "oidcAllowedSubjects must contain at least one subject or email when oidcEnabled is true",
+            },
+          },
+          { status: 400 }
+        );
+      }
+    }
+
     // VALIDATED body so we never trip on stray unknown keys. If any security
     // key is present, require currentPassword + verify against the stored
     // bcrypt hash. Dedupes with the previous inline newPassword reauth — the
     // password is verified at most once per PATCH.
     const touchedSecurityKeys = SECURITY_IMPACTING_KEYS.filter((k) => k in validation.data);
-    let storedPasswordHash = "";
     if (touchedSecurityKeys.length > 0) {
       const settings = await getSettings();
       // Lazy-hash any plaintext INITIAL_PASSWORD migration BEFORE we read the
@@ -260,12 +357,17 @@ export async function PATCH(request: Request) {
         settings,
         source: "settings.security_impacting_update",
       });
-      storedPasswordHash = getStoredManagementPassword(passwordState.settings);
+      const storedPasswordHash = getStoredManagementPassword(passwordState.settings);
       // Cold-boot exception: same condition the existing newPassword path
       // honoured before T-011 — when no password is configured yet AND login
       // is currently disabled, allow the first write to set policy (incl.
       // the password itself). Once a hash exists the gate always fires.
-      const isColdBoot = !storedPasswordHash && passwordState.settings.requireLogin === false;
+      // #8950: also treat the request as cold boot when newPassword is present
+      // without a stored hash, so the Security tab's two-step flow (enable
+      // requireLogin first, then set password) does not deadlock.
+      const isColdBoot =
+        !storedPasswordHash &&
+        (passwordState.settings.requireLogin === false || Boolean(body.newPassword));
       if (!isColdBoot) {
         if (!body.currentPassword) {
           emitSettingsFailureAudit(request, actor, "PASSWORD_REQUIRED", attemptedKeys);
@@ -296,6 +398,30 @@ export async function PATCH(request: Request) {
       }
     }
 
+    // #6540: reject a paid-only webSearchRouteModel target when hidePaidModels
+    // is on. Business-rule check (needs an async DB read), so it runs after
+    // Zod shape validation rather than as a Zod .refine(). Fails open on
+    // "unknown" (aliases/combo names) — only a positively-identified paid
+    // catalog entry is blocked.
+    if (typeof body.webSearchRouteModel === "string" && body.webSearchRouteModel.trim() !== "") {
+      const currentSettings = await getSettings();
+      if ((currentSettings as Record<string, unknown>)?.hidePaidModels === true) {
+        if (isPaidModelTarget(body.webSearchRouteModel) === "paid") {
+          emitSettingsFailureAudit(request, actor, "PAID_MODEL_TARGET_BLOCKED", attemptedKeys);
+          return NextResponse.json(
+            {
+              error: {
+                code: "PAID_MODEL_TARGET_BLOCKED",
+                message:
+                  "This field cannot target a paid-only model while 'Hide paid models' is enabled.",
+              },
+            },
+            { status: 400 }
+          );
+        }
+      }
+    }
+
     // Password rotation: hash the new value AFTER the gate has accepted the
     // currentPassword (or the cold-boot exception fired). The gate already
     // included `newPassword` in SECURITY_IMPACTING_KEYS, so no separate
@@ -305,10 +431,29 @@ export async function PATCH(request: Request) {
       delete body.newPassword;
     }
     delete body.currentPassword;
+    delete body.expectedRevision;
 
     // Snapshot BEFORE the write so the success row can record a real diff.
     const beforeSnapshot = (await getSettings()) as Record<string, unknown>;
-    const settings = await updateSettings(body);
+    let settings: Awaited<ReturnType<typeof getSettings>>;
+    try {
+      settings = await updateSettings(body, { expectedRevision });
+    } catch (error) {
+      if (error instanceof SettingsRevisionConflictError) {
+        emitSettingsFailureAudit(request, actor, "SETTINGS_REVISION_CONFLICT", attemptedKeys);
+        return NextResponse.json(
+          {
+            error: {
+              code: "SETTINGS_REVISION_CONFLICT",
+              message: "Settings changed since this snapshot; refresh and retry",
+              currentRevision: error.currentRevision,
+            },
+          },
+          { status: 409, headers: settingsResponseHeaders(error.currentRevision) }
+        );
+      }
+      throw error;
+    }
 
     // Sync CLIProxyAPI settings to upstream_proxy_config table
     const cpaUrl = rawBody.cliproxyapi_url as string | undefined;
@@ -392,7 +537,11 @@ export async function PATCH(request: Request) {
     }
 
     const { password, ...safeSettings } = settings;
-    return NextResponse.json(safeSettings, { headers: SETTINGS_RESPONSE_HEADERS });
+    const settingsRevision = await getSettingsRevision();
+    return NextResponse.json(
+      { ...safeSettings, settingsRevision },
+      { headers: settingsResponseHeaders(settingsRevision) }
+    );
   } catch (error) {
     console.log("Error updating settings:", error);
     return NextResponse.json({ error: "Failed to update settings" }, { status: 500 });

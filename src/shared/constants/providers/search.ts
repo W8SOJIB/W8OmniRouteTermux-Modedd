@@ -60,6 +60,23 @@ export const SEARCH_PROVIDERS = {
     authHint: "API key from app.tavily.com (format: tvly-...)",
     serviceKinds: ["webSearch", "webFetch"],
   },
+  firecrawl: {
+    id: "firecrawl",
+    alias: "fc",
+    name: "Firecrawl",
+    icon: "language",
+    color: "#FB923C",
+    textIcon: "FC",
+    website: "https://firecrawl.dev",
+    hasFree: true,
+    authHint:
+      "API key from firecrawl.dev/app/api-keys (or set your self-hosted Firecrawl base URL)",
+    notice: {
+      text: "Free tier: 1,000 credits/month. Powers /v1/web/fetch and /v1/search.",
+      apiKeyUrl: "https://firecrawl.dev/app/api-keys",
+    },
+    serviceKinds: ["webSearch", "webFetch"],
+  },
   "google-pse-search": {
     id: "google-pse-search",
     alias: "google-pse",
@@ -112,6 +129,18 @@ export const SEARCH_PROVIDERS = {
     authHint:
       "API key is optional. Set your SearXNG base URL. Some instances may require a bearer token for access.",
   },
+  "x-search": {
+    id: "x-search",
+    alias: "x_search",
+    name: "X Search (Grok)",
+    icon: "tag",
+    color: "#000000",
+    textIcon: "X",
+    website: "https://docs.x.ai/developers/tools/x-search",
+    authHint:
+      "SuperGrok OAuth (xai-oauth) or xAI API key. This is Grok X Search, not the X Developer MCP.",
+    serviceKinds: ["webSearch"],
+  },
   "ollama-search": {
     id: "ollama-search",
     alias: "ollama-search",
@@ -121,5 +150,18 @@ export const SEARCH_PROVIDERS = {
     textIcon: "OS",
     website: "https://ollama.com/settings/keys",
     authHint: "Same API key as Ollama Cloud (from ollama.com/settings/keys)",
+  },
+  context7: {
+    id: "context7",
+    alias: "context7",
+    name: "Context7 (library docs)",
+    icon: "menu_book",
+    color: "#6B4FBB",
+    textIcon: "C7",
+    website: "https://context7.com",
+    hasFree: true,
+    authHint:
+      "API key optional (ctx7sk-...) — anonymous tier works without a key; a key raises the rate limit",
+    serviceKinds: ["webSearch", "webFetch"],
   },
 };

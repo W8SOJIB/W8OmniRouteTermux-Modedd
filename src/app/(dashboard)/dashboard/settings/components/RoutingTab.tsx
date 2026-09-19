@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { Button, Card, Collapsible, Input, Select, Toggle } from "@/shared/components";
+import ModelSelectField from "@/shared/components/ModelSelectField";
 import { useTranslations } from "next-intl";
 import { useNotificationStore } from "@/store/notificationStore";
 import {
@@ -11,6 +12,7 @@ import {
 } from "@/shared/constants/cliCompatProviders";
 import { AI_PROVIDERS } from "@/shared/constants/providers";
 import { compareTr } from "@/shared/utils/turkishText";
+import { HERMES } from "./systemTransformsHermesDefaults";
 
 // Provider keys (mirror of open-sse/services/systemTransforms.ts).
 const PROVIDER_CLAUDE = "claude";
@@ -95,11 +97,12 @@ const DEFAULT_SYSTEM_TRANSFORMS_CLIENT = {
             ...DEFAULT_PARAGRAPH_REMOVAL_ANCHORS,
             ...OPENWEBUI_PARAGRAPH_ANCHORS,
             ...PI_PARAGRAPH_ANCHORS,
+            ...HERMES.anchors,
           ],
         },
         {
           kind: "drop_paragraph_if_starts_with",
-          prefixes: [...DEFAULT_IDENTITY_PREFIXES, "You are Open WebUI"],
+          prefixes: [...DEFAULT_IDENTITY_PREFIXES, "You are Open WebUI", ...HERMES.prefixes],
         },
         ...DEFAULT_TEXT_REPLACEMENTS.map((r) => ({
           kind: "replace_text" as const,
@@ -166,6 +169,7 @@ const DEFAULT_SYSTEM_TRANSFORMS_CLIENT = {
           entrypoint: "sdk-cli",
           versionFormat: "ex-machina",
           cchAlgo: "sha256-first-user",
+          buildRevision: "1f2",
         },
       ],
     },
@@ -174,17 +178,17 @@ const DEFAULT_SYSTEM_TRANSFORMS_CLIENT = {
 
 const PROVIDER_TILE_DISPLAY: Record<
   string,
-  { name: string; description: string; icon: string; tone: string }
+  { nameKey: string; descriptionKey: string; icon: string; tone: string }
 > = {
   [PROVIDER_CLAUDE]: {
-    name: "Claude (OAuth)",
-    description: "Native Claude provider with OAuth-issued tokens.",
+    nameKey: "routingClaudeProviderName",
+    descriptionKey: "routingClaudeProviderDescription",
     icon: "anthropic",
     tone: "indigo",
   },
   [PROVIDER_CC_BRIDGE]: {
-    name: "Claude-Code Bridge",
-    description: "Relay endpoints using API keys (anthropic-compatible-cc-*).",
+    nameKey: "routingCcBridgeName",
+    descriptionKey: "routingCcBridgeDescription",
     icon: "hub",
     tone: "purple",
   },
@@ -329,7 +333,7 @@ function StringListEditor({
         onClick={() => onChange([...items, ""])}
         className="self-start"
       >
-        {tCommon("add") || "Add entry"}
+        {t("routingAddEntry")}
       </Button>
     </div>
   );
@@ -561,7 +565,11 @@ function OpEditor({
         </div>
       );
     default:
-      return <p className="text-xs text-text-muted">Unknown op kind: {op?.kind}</p>;
+      return (
+        <p className="text-xs text-text-muted">
+          {t("routingUnknownOpKind", { kind: String(op?.kind ?? "") })}
+        </p>
+      );
   }
 }
 
@@ -619,16 +627,16 @@ function summarizeTransformOp(op: any, t: any): string {
 
 // Client-side validator — light shape check before we PATCH; the server
 // re-validates with the full zod schema in settingsSchemas.ts.
-function validateProviderTransformsConfig(value: unknown): string | null {
-  if (!value || typeof value !== "object") return "Config must be a JSON object";
+function validateProviderTransformsConfig(value: unknown, t: any): string | null {
+  if (!value || typeof value !== "object") return t("routingConfigMustBeObject");
   const cfg = value as { enabled?: unknown; pipeline?: unknown };
-  if (typeof cfg.enabled !== "boolean") return "`enabled` must be true or false";
-  if (!Array.isArray(cfg.pipeline)) return "`pipeline` must be an array of ops";
-  if (cfg.pipeline.length > 50) return "Pipeline cannot exceed 50 ops";
+  if (typeof cfg.enabled !== "boolean") return t("routingEnabledMustBeBoolean");
+  if (!Array.isArray(cfg.pipeline)) return t("routingPipelineMustBeArray");
+  if (cfg.pipeline.length > 50) return t("routingPipelineTooLong");
   for (let i = 0; i < cfg.pipeline.length; i++) {
     const op = cfg.pipeline[i] as { kind?: unknown };
     if (!op || typeof op !== "object" || typeof op.kind !== "string") {
-      return `Op #${i + 1}: missing or invalid \`kind\``;
+      return t("routingOpMissingKind", { index: i + 1 });
     }
     const validKinds = [
       "drop_paragraph_if_contains",
@@ -642,7 +650,7 @@ function validateProviderTransformsConfig(value: unknown): string | null {
       "obfuscate_words",
     ];
     if (!validKinds.includes(op.kind)) {
-      return `Op #${i + 1}: unknown kind "${op.kind}"`;
+      return t("routingOpUnknownKind", { index: i + 1, kind: op.kind });
     }
   }
   return null;
@@ -807,11 +815,11 @@ export default function RoutingTab() {
     } catch (err) {
       setJsonErrors((prev) => ({
         ...prev,
-        [providerId]: `Invalid JSON: ${(err as Error).message}`,
+        [providerId]: t("routingInvalidJson", { error: (err as Error).message }),
       }));
       return;
     }
-    const validationError = validateProviderTransformsConfig(parsed);
+    const validationError = validateProviderTransformsConfig(parsed, t);
     if (validationError) {
       setJsonErrors((prev) => ({ ...prev, [providerId]: validationError }));
       return;
@@ -1011,7 +1019,7 @@ export default function RoutingTab() {
             </option>
             {availableProvidersToAdd.map((p) => (
               <option key={p.id} value={p.id}>
-                {p.name} ({p.id})
+                {p.id === PROVIDER_CC_BRIDGE ? t("routingCcBridgeCatalogName") : p.name} ({p.id})
               </option>
             ))}
           </Select>
@@ -1033,12 +1041,11 @@ export default function RoutingTab() {
         <div className="flex flex-col gap-3">
           {Object.entries(systemTransforms.providers).map(([providerId, providerCfg]) => {
             const isBuiltin = BUILTIN_PROVIDERS.has(providerId);
-            const display = PROVIDER_TILE_DISPLAY[providerId] ?? {
-              name: providerId,
-              description: "Custom provider.",
-              icon: "extension",
-              tone: "purple",
-            };
+            const display = PROVIDER_TILE_DISPLAY[providerId];
+            const displayName = display ? t(display.nameKey) : providerId;
+            const displayDescription = display
+              ? t(display.descriptionKey)
+              : t("routingCustomProviderDescription");
             const draft = jsonDrafts[providerId] ?? JSON.stringify(providerCfg, null, 2);
             const errorMsg = jsonErrors[providerId] ?? null;
             const opCount = Array.isArray(providerCfg.pipeline) ? providerCfg.pipeline.length : 0;
@@ -1060,7 +1067,7 @@ export default function RoutingTab() {
                     <code className="text-xs font-mono rounded bg-surface px-1.5 py-0.5">
                       {providerId}
                     </code>
-                    <span className="text-sm font-medium">{display.name}</span>
+                    <span className="text-sm font-medium">{displayName}</span>
                   </div>
                 }
                 subtitle={
@@ -1075,7 +1082,7 @@ export default function RoutingTab() {
                       onChange={(checked) => toggleProviderEnabled(providerId, checked)}
                       disabled={loading}
                       ariaLabel={
-                        tCommon("enable") + " " + display.name + " " + t("systemTransforms")
+                        tCommon("enable") + " " + displayName + " " + t("systemTransforms")
                       }
                     />
                     {!isBuiltin && (
@@ -1092,7 +1099,7 @@ export default function RoutingTab() {
                   </>
                 }
               >
-                <p className="text-xs text-text-muted mb-3">{display.description}</p>
+                <p className="text-xs text-text-muted mb-3">{displayDescription}</p>
                 {providerSaveErrors[providerId] && (
                   <div
                     role="alert"
@@ -1205,13 +1212,13 @@ export default function RoutingTab() {
                     className="text-[11px] text-primary hover:underline"
                   >
                     {isJsonOpen
-                      ? "▾ " + tCommon("hide") + " JSON editor"
-                      : "▸ Import / export JSON"}
+                      ? `▾ ${t("routingJsonEditorHide")}`
+                      : `▸ ${t("routingJsonEditorImportExport")}`}
                   </button>
                   {isJsonOpen && (
                     <div className="mt-2">
                       <label className="text-[11px] font-medium text-text-muted block mb-1">
-                        JSON ({tCommon("edit")} &amp; Apply, or paste to import)
+                        {t("routingJsonEditorLabel")}
                       </label>
                       <textarea
                         value={draft}
@@ -1234,7 +1241,7 @@ export default function RoutingTab() {
                           size="sm"
                           icon="check"
                         >
-                          Apply JSON
+                          {t("routingApplyJson")}
                         </Button>
                         {hasDefault && (
                           <Button
@@ -1256,10 +1263,7 @@ export default function RoutingTab() {
           })}
         </div>
 
-        <p className="mt-3 text-[11px] text-text-muted">
-          All transform ops are idempotent on re-run. Changes take effect immediately on the next
-          request.
-        </p>
+        <p className="mt-3 text-[11px] text-text-muted">{t("routingTransformsFootnote")}</p>
       </Card>
 
       <Card>
@@ -1465,13 +1469,8 @@ export default function RoutingTab() {
               </span>
             </div>
             <div>
-              <h3 className="text-lg font-semibold">
-                {t("echoRequestedModelTitle") || "Echo requested model name in responses"}
-              </h3>
-              <p className="text-sm text-text-muted mt-1">
-                {t("echoRequestedModelDesc") ||
-                  "When enabled, the response model field echoes the alias or combo name the client requested instead of the upstream model name."}
-              </p>
+              <h3 className="text-lg font-semibold">{t("echoRequestedModelTitle")}</h3>
+              <p className="text-sm text-text-muted mt-1">{t("echoRequestedModelDesc")}</p>
             </div>
           </div>
           <div className="pt-1">
@@ -1494,26 +1493,15 @@ export default function RoutingTab() {
             </span>
           </div>
           <div className="flex-1">
-            <h3 className="text-lg font-semibold">
-              {t("webSearchRouteTitle") || "Web search routing"}
-            </h3>
-            <p className="text-sm text-text-muted mt-1">
-              {t("webSearchRouteDesc") ||
-                "When a request includes a native web_search tool, route the whole request to this model instead of the default — useful for providers that don't implement Anthropic's web_search server tool. Leave blank to disable."}
-            </p>
+            <h3 className="text-lg font-semibold">{t("webSearchRouteTitle")}</h3>
+            <p className="text-sm text-text-muted mt-1">{t("webSearchRouteDesc")}</p>
             <div className="mt-3">
-              <Input
-                value={
-                  typeof settings.webSearchRouteModel === "string"
-                    ? settings.webSearchRouteModel
-                    : ""
-                }
-                onChange={(e) => updateSetting({ webSearchRouteModel: e.target.value })}
-                placeholder={
-                  t("webSearchRoutePlaceholder") || "e.g. openrouter,anthropic/claude-3.5-sonnet"
-                }
+              <ModelSelectField
+                value={String(settings.webSearchRouteModel ?? "")}
+                onChange={(v) => updateSetting({ webSearchRouteModel: v })}
+                placeholder={t("webSearchRoutePlaceholder")}
                 disabled={loading}
-                aria-label={t("webSearchRouteTitle") || "Web search routing model"}
+                ariaLabel={t("webSearchRouteTitle")}
               />
             </div>
           </div>
@@ -1529,13 +1517,8 @@ export default function RoutingTab() {
               </span>
             </div>
             <div>
-              <h3 className="text-lg font-semibold">
-                {t("lkgpToggleTitle") || "Last Known Good Provider (LKGP)"}
-              </h3>
-              <p className="text-sm text-text-muted mt-1">
-                {t("lkgpToggleDesc") ||
-                  "When enabled, the router remembers which provider last served a successful response and tries it first on subsequent requests."}
-              </p>
+              <h3 className="text-lg font-semibold">{t("lkgpToggleTitle")}</h3>
+              <p className="text-sm text-text-muted mt-1">{t("lkgpToggleDesc")}</p>
             </div>
           </div>
           <div className="pt-1">
@@ -1561,19 +1544,18 @@ export default function RoutingTab() {
                 if (res.ok) {
                   setLkgpCacheStatus({
                     type: "success",
-                    message: t("lkgpCacheCleared") || "LKGP cache cleared successfully",
+                    message: t("lkgpCacheCleared"),
                   });
                 } else {
                   setLkgpCacheStatus({
                     type: "error",
-                    message:
-                      data.error || t("lkgpCacheClearFailed") || "Failed to clear LKGP cache",
+                    message: data.error || t("lkgpCacheClearFailed"),
                   });
                 }
               } catch {
                 setLkgpCacheStatus({
                   type: "error",
-                  message: t("errorOccurred") || "An error occurred",
+                  message: t("errorOccurred"),
                 });
               } finally {
                 setLkgpCacheLoading(false);
@@ -1583,7 +1565,7 @@ export default function RoutingTab() {
             <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
               delete_sweep
             </span>
-            {t("clearLkgpCache") || "Clear LKGP Cache"}
+            {t("clearLkgpCache")}
           </Button>
           {lkgpCacheStatus.message && (
             <span
@@ -1604,13 +1586,8 @@ export default function RoutingTab() {
               </span>
             </div>
             <div>
-              <h3 className="text-lg font-semibold">
-                {t("adaptiveVolumeRouting") || "Adaptive Volume Routing"}
-              </h3>
-              <p className="text-sm text-text-muted mt-1">
-                {t("adaptiveVolumeRoutingDesc") ||
-                  "Automatically adjusts traffic volume between providers based on real-time latency and error rates."}
-              </p>
+              <h3 className="text-lg font-semibold">{t("adaptiveVolumeRouting")}</h3>
+              <p className="text-sm text-text-muted mt-1">{t("adaptiveVolumeRoutingDesc")}</p>
             </div>
           </div>
           <div className="pt-1">

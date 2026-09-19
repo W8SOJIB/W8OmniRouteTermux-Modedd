@@ -27,14 +27,14 @@ const hostDetailRoute = await import(
 
 test.beforeEach(async () => {
   resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
   // Re-init DB with fresh migrations
   await import("../../src/lib/db/core.ts").then((m) => m.getDbInstance());
 });
 
 test.after(() => {
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("GET /hosts: returns empty list initially", async () => {

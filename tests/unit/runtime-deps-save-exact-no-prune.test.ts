@@ -45,7 +45,7 @@ function teardown(): void {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
-  if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+  if (tmpDir) rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
 function installLineFor(pkgPrefix: string): string | undefined {

@@ -37,7 +37,7 @@ async function resetStorage() {
 
   core.resetDbInstance();
   apiKeysDb.resetApiKeyState();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -135,7 +135,7 @@ test.beforeEach(async () => {
 
 test.after(async () => {
   await resetStorage();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("api keys route covers auth, create, masking, pagination fallback and cloud sync", async () => {
@@ -1202,7 +1202,7 @@ test("embeddings route handles responses provider nodes, invalid local nodes, an
     );
     assert.equal(localResponse.status, 200);
     assert.equal(fetchCalls[0].url, "http://localhost:7790/v1/embeddings");
-
+    localDb.invalidateDbCache("nodes");
     const remoteResponse = await withPrepareOverride(
       "SELECT * FROM provider_nodes",
       ({ statement }) =>

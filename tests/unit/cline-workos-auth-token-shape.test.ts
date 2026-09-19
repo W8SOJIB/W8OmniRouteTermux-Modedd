@@ -2,9 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  applyClineProtocolHeaders,
   buildClineHeaders,
+  buildClinepassHeaders,
   getClineAccessToken,
   getClineAuthorizationHeader,
+  resolveClineTaskId,
 } from "../../src/shared/utils/clineAuth.ts";
 import { buildProviderHeaders } from "../../open-sse/services/provider.ts";
 import { DefaultExecutor } from "../../open-sse/executors/default.ts";
@@ -32,23 +35,68 @@ test("getClineAuthorizationHeader builds a workos-prefixed bearer header", () =>
 });
 
 test("buildClineHeaders emits the full cline client header set", () => {
-  const headers = buildClineHeaders("abc123");
+  const headers = buildClineHeaders("abc123", {}, { taskId: "task-123" });
   assert.equal(headers.Authorization, "Bearer workos:abc123");
   assert.equal(headers["HTTP-Referer"], "https://cline.bot");
   assert.equal(headers["X-Title"], "Cline");
   assert.equal(headers["X-CLIENT-TYPE"], "omniroute");
+  assert.equal(headers["X-Task-ID"], "task-123");
   assert.equal(headers["X-IS-MULTIROOT"], "false");
-  // Branding must be OmniRoute, never 9Router.
-  assert.ok(/^OmniRoute\//.test(headers["User-Agent"]));
+  assert.ok(/^Cline\//.test(headers["User-Agent"]));
   assert.ok(!/9router/i.test(JSON.stringify(headers)));
 });
 
 test("buildClineHeaders merges extra headers and omits Authorization with no token", () => {
-  const headers = buildClineHeaders("", { Accept: "application/json" });
+  const headers = buildClineHeaders("", {
+    Accept: "application/json",
+    "x-task-id": "configured-task-must-not-leak",
+  });
   assert.equal(headers.Accept, "application/json");
   assert.ok(!("Authorization" in headers));
+  assert.ok(!("X-Task-ID" in headers));
+  assert.ok(!("x-task-id" in headers));
   // Client-identification headers are still present even without a token.
   assert.equal(headers["X-CLIENT-TYPE"], "omniroute");
+});
+
+test("resolveClineTaskId forwards client task identity but does not invent one", () => {
+  assert.equal(resolveClineTaskId({ "x-task-id": "client-task-123" }), "client-task-123");
+  assert.equal(resolveClineTaskId({}), undefined);
+  assert.equal(resolveClineTaskId(null), undefined);
+});
+
+test("required Cline protocol headers override conflicting configured casing", () => {
+  const headers = applyClineProtocolHeaders(
+    {
+      "user-agent": "other-client/1",
+      "x-client-type": "other-client",
+      "x-task-id": "stored-task",
+    },
+    { clientVersion: "3.8.49", taskId: "request-task" }
+  );
+
+  assert.equal(headers["User-Agent"], "Cline/3.8.49");
+  assert.equal(headers["X-CLIENT-TYPE"], "omniroute");
+  assert.equal(headers["X-Task-ID"], "request-task");
+  assert.ok(!("user-agent" in headers));
+  assert.ok(!("x-client-type" in headers));
+  assert.ok(!("x-task-id" in headers));
+});
+
+test("ClinePass BYOK and OAuth auth modes both carry the full protocol headers", () => {
+  const byok = buildClinepassHeaders({ apiKey: "sk-pass" }, undefined, {
+    taskId: "task-byok",
+  });
+  assert.equal(byok.Authorization, "Bearer sk-pass");
+  assert.equal(byok["X-Task-ID"], "task-byok");
+  assert.equal(byok["X-CLIENT-TYPE"], "omniroute");
+
+  const oauth = buildClinepassHeaders({ accessToken: "oauth-token" }, undefined, {
+    taskId: "task-oauth",
+  });
+  assert.equal(oauth.Authorization, "Bearer workos:oauth-token");
+  assert.equal(oauth["X-Task-ID"], "task-oauth");
+  assert.equal(oauth["X-CLIENT-TYPE"], "omniroute");
 });
 
 test("buildProviderHeaders uses the cline workos auth token shape", () => {
@@ -65,9 +113,28 @@ test("buildProviderHeaders honors an accessToken for cline", () => {
 
 test("DefaultExecutor.buildHeaders uses the cline workos auth token shape", () => {
   const executor = new DefaultExecutor("cline");
-  const headers = executor.buildHeaders({ apiKey: "tok-abc" }, true);
+  const headers = executor.buildHeaders({ apiKey: "tok-abc" }, true, {
+    "X-Task-ID": "task-from-client",
+  });
   assert.equal(headers.Authorization, "Bearer workos:tok-abc");
   assert.equal(headers["HTTP-Referer"], "https://cline.bot");
   assert.equal(headers["X-CLIENT-TYPE"], "omniroute");
   assert.equal(headers["X-Title"], "Cline");
+  assert.equal(headers["X-Task-ID"], "task-from-client");
+
+  const withoutTaskId = executor.buildHeaders({ apiKey: "tok-abc" }, true, {});
+  assert.ok(!("X-Task-ID" in withoutTaskId));
+});
+
+test("DefaultExecutor labels internal health checks separately from user traffic", () => {
+  const executor = new DefaultExecutor("cline");
+  const headers = executor.buildHeaders({ apiKey: "tok-abc" }, true, {
+    "X-Internal-Test": "combo-health-check",
+  });
+
+  assert.equal(headers["X-CLIENT-TYPE"], "omniroute-internal-health-check");
+
+  // BaseExecutor reapplies the required protocol headers immediately before dispatch.
+  applyClineProtocolHeaders(headers, { taskId: headers["X-Task-ID"] });
+  assert.equal(headers["X-CLIENT-TYPE"], "omniroute-internal-health-check");
 });

@@ -110,14 +110,14 @@ function cleanInstalledPluginDirs() {
     // Remove final dir and any staging remnants
     const base = path.join(DEFAULT_PLUGIN_DIR, name);
     try {
-      fs.rmSync(base, { recursive: true, force: true });
+      fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     } catch {}
     // Also clean any .staging-* leftovers
     if (fs.existsSync(DEFAULT_PLUGIN_DIR)) {
       for (const entry of fs.readdirSync(DEFAULT_PLUGIN_DIR)) {
         if (entry.startsWith(`${name}.staging-`)) {
           try {
-            fs.rmSync(path.join(DEFAULT_PLUGIN_DIR, entry), { recursive: true, force: true });
+            fs.rmSync(path.join(DEFAULT_PLUGIN_DIR, entry), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
           } catch {}
         }
       }
@@ -128,7 +128,7 @@ function cleanInstalledPluginDirs() {
 function cleanSourceDirs() {
   for (const d of activeDirs) {
     try {
-      fs.rmSync(d, { recursive: true, force: true });
+      fs.rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     } catch {}
   }
   activeDirs.length = 0;
@@ -137,7 +137,7 @@ function cleanSourceDirs() {
 test.beforeEach(() => {
   core.resetDbInstance();
   hooks.resetHooks();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
   cleanSourceDirs();
   cleanInstalledPluginDirs();
@@ -148,7 +148,7 @@ test.after(() => {
   cleanSourceDirs();
   cleanInstalledPluginDirs();
   try {
-    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   } catch {}
 });
 

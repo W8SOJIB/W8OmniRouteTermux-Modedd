@@ -22,6 +22,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AgentId } from "../types";
 import { MitmHandlerBase } from "./base";
+import { TOOL_RENAME_MAP } from "@omniroute/open-sse/services/claudeCodeToolRemapper";
 
 interface GeminiPart {
   text?: string;
@@ -172,7 +173,14 @@ export class AntigravityHandler extends MitmHandlerBase {
 
       let collected = "";
       await this.pipeSSE(upstream, res, (chunk) => {
-        collected += chunk.toString();
+        let chunkStr = chunk.toString();
+        for (const [lower, capitalized] of Object.entries(TOOL_RENAME_MAP)) {
+          chunkStr = chunkStr.replace(
+            new RegExp(`"name"\\s*:\\s*"${lower}"`, "g"),
+            `"name":"${capitalized}"`
+          );
+        }
+        collected += chunkStr;
       });
 
       const total = this.now() - startedAt;

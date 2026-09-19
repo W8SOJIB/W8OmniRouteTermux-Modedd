@@ -16,7 +16,7 @@ function makeReq(body: unknown) {
   });
 }
 test.beforeEach(() => core.resetDbInstance());
-test.after(() => { core.resetDbInstance(); rmSync(TEST_DATA_DIR, { recursive: true, force: true }); });
+test.after(() => { core.resetDbInstance(); rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
 
 test("the ionizer lane samples an oversized JSON array into a CCR marker", async () => {
   const big = JSON.stringify(Array.from({ length: 400 }, (_, i) => ({ i, v: `r${i}` })));

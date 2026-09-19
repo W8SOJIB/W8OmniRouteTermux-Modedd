@@ -1,24 +1,32 @@
 import {
-  getAllProviderLimitsCache,
   getProviderConnectionById,
   getProviderConnections,
+  updateProviderConnection,
+} from "@/lib/db/providers";
+import { getSettings, resolveProxyForConnection, updateSettings } from "@/lib/db/settings";
+import {
+  getAllProviderLimitsCache,
   getProviderLimitsCache,
-  getSettings,
-  resolveProxyForConnection,
   setProviderLimitsCache,
   setProviderLimitsCacheBatch,
-  updateProviderConnection,
-  updateSettings,
   type ProviderLimitsCacheEntry,
-} from "@/lib/localDb";
+} from "@/lib/db/providerLimits";
 import { syncToCloud } from "@/lib/cloudSync";
 import { setQuotaCache } from "@/domain/quotaCache";
-import { buildClaudeExtraUsageConnectionUpdate } from "@/lib/providers/claudeExtraUsage";
+import {
+  buildClaudeExtraUsageConnectionUpdate,
+  CLAUDE_EXTRA_USAGE_ERROR_SOURCE,
+  isClaudeExtraUsageBlockEnabled,
+  isClaudeExtraUsageQueued,
+} from "@/lib/providers/claudeExtraUsage";
+import { isConnectionUnavailableToAuxiliaryActivity } from "@/lib/exclusiveLeaseIsolation";
 import { clearRecoveredProviderState } from "@/sse/services/auth";
 import { getMachineId } from "@/shared/utils/machine";
 import { USAGE_SUPPORTED_PROVIDERS } from "@/shared/constants/providers";
+import { mergeProviderLimitsCacheEntry, toProviderLimitsCacheEntry } from "./providerLimitsCache";
 import { getExecutor } from "@omniroute/open-sse/executors/index.ts";
 import { getUsageForProvider } from "@omniroute/open-sse/services/usage.ts";
+import { cooldownUntilMs } from "@omniroute/open-sse/services/accountFallback.ts";
 import {
   rotationGroupFor,
   serializeRefresh,
@@ -27,6 +35,10 @@ import {
   extractCodeAssistOnboardTierId,
   extractCodeAssistSubscriptionTier,
 } from "@omniroute/open-sse/services/codeAssistSubscription.ts";
+import {
+  extractAntigravityProjectIdFromPayload,
+  getStoredAntigravityProjectId,
+} from "@omniroute/open-sse/services/antigravityProjectPersistence.ts";
 import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
 import { onUsageRecorded } from "./usageEvents";
 import {
@@ -35,7 +47,7 @@ import {
   normalizeUsageQuotasForProvider,
   sanitizeUsageQuotasForProvider,
 } from "./providerLimits/quotaNormalize";
-
+import { syncInChunksWithSpacing } from "./providerLimits/chunkedSpacingSync";
 type JsonRecord = Record<string, unknown>;
 type SyncSource = "manual" | "scheduled";
 
@@ -75,30 +87,36 @@ const PROVIDER_LIMITS_APIKEY_PROVIDERS = new Set([
   "vertex",
   "vertex-partner",
   "kimi-coding-apikey",
+  "kiro",
   // Qoder connections are PAT-based (authType "apikey"); the usage fetcher
   // exchanges the PAT for a job token and reads openapi.qoder.sh/user/status.
   "qoder",
+  "promptql", // PromptQL playground JWT → getCreditSummary USD credits
+  "pql",
+  // Adobe Firefly: web-cookie / JWT stored as apikey → credits/balance
+  "adobe-firefly",
+  "firefly",
+  // HyperAgent session cookie → billing/usage creditBlocks
+  "hyperagent",
+  "ha",
+  "firecrawl",
+  // Volcano Ark Plan subscriptions (agent-plan / coding-plan)
+  "volcengine-agent-plan",
+  "volcengine-coding-plan",
+  // Command Code API key → /alpha/billing/credits + windowLimits
+  "command-code",
+  "conol-web",
+  "cnl",
+  // Alibaba Coding Plan (console API key) + Qwen personal Token Plan (console cookie) — #9603
+  "bailian-coding-plan",
+  "qwen-cloud-token-plan",
+  // AgentRouter (New-API) console System Access Token + New-Api-User id (providerSpecificData)
+  "agentrouter",
 ]);
 const DEFAULT_PROVIDER_LIMITS_SYNC_INTERVAL_MINUTES = 70;
 const PROVIDER_LIMITS_AUTO_SYNC_SETTING_KEY = "provider_limits_auto_sync_last_run";
 const DEFAULT_PROVIDER_LIMITS_POST_USAGE_REFRESH_DELAY_MS = 5_000;
 const pendingPostUsageRefreshes = new Set<string>();
-
-function toProviderLimitsCacheEntry(
-  usage: JsonRecord,
-  source: SyncSource,
-  fetchedAt = new Date().toISOString()
-): ProviderLimitsCacheEntry {
-  const value = Number(usage.bankedResetCredits);
-  return {
-    quotas: isRecord(usage.quotas) ? usage.quotas : null,
-    plan: usage.plan ?? null,
-    message: typeof usage.message === "string" ? usage.message : null,
-    fetchedAt,
-    source,
-    bankedResetCredits: Number.isFinite(value) ? value : undefined,
-  };
-}
 
 function getProviderLimitsPostUsageRefreshDelayMs(): number {
   const raw = Number(process.env.PROVIDER_LIMITS_POST_USAGE_REFRESH_DELAY_MS ?? "");
@@ -187,7 +205,8 @@ export function isSupportedUsageConnection(connection: ProviderConnectionLike | 
 
   if (connection.authType === "oauth") return true;
   return (
-    connection.authType === "apikey" && PROVIDER_LIMITS_APIKEY_PROVIDERS.has(connection.provider)
+    (connection.authType === "apikey" || connection.authType === "api_key") &&
+    PROVIDER_LIMITS_APIKEY_PROVIDERS.has(connection.provider)
   );
 }
 
@@ -424,12 +443,125 @@ export function hasUsableQuota(usage: JsonRecord): boolean {
   return false;
 }
 
+// A window "still blocks" recovery when it governs quota and is either still
+// exhausted with a real reset that hasn't passed yet, or exhausted with no
+// parseable real reset at all (unknown-reset windows stay locked, matching
+// the pre-existing kimi-coding partial-refresh semantics).
+function windowStillExhaustedAfterRealReset(value: unknown, nowMs: number): boolean {
+  if (!isRecord(value)) return false;
+  if (value.unlimited === true) return false;
+  const remaining =
+    typeof value.remaining === "number"
+      ? value.remaining
+      : typeof value.remainingPercentage === "number"
+        ? value.remainingPercentage
+        : null;
+  if (remaining !== null && remaining > 0) return false;
+  if (value.resetAt == null) return true;
+  const resetMs = Date.parse(String(value.resetAt));
+  if (Number.isNaN(resetMs)) return true;
+  return resetMs > nowMs;
+}
+
+/**
+ * May an active cooldown be released because the REAL quota windows recovered?
+ *
+ * Only the synthetic-cooldown case (#10534) qualifies: lastErrorType
+ * "quota_exhausted" plus every governing window past its real reset with quota
+ * left. A window that is still exhausted — or whose reset is unknown/unparseable
+ * — keeps the connection locked, matching the kimi-coding partial-refresh
+ * semantics.
+ */
+function isQuotaExhaustedCooldownReleasable(
+  connection: Pick<
+    ProviderConnectionLike,
+    "lastErrorType" | "lastErrorSource" | "provider" | "providerSpecificData"
+  >,
+  usage: JsonRecord
+): boolean {
+  if (connection.lastErrorType !== "quota_exhausted") return false;
+  // An extra-usage block is a POLICY lock, not a quota window: the session and
+  // weekly windows genuinely look recovered in the very same fetch, so the
+  // window scan below would happily release it. It stays locked while the
+  // policy is on and upstream still reports extra usage queued.
+  if (
+    connection.lastErrorSource === CLAUDE_EXTRA_USAGE_ERROR_SOURCE &&
+    isClaudeExtraUsageBlockEnabled(connection.provider, connection.providerSpecificData) &&
+    isClaudeExtraUsageQueued(usage)
+  ) {
+    return false;
+  }
+  const quotas = usage?.quotas;
+  if (!isRecord(quotas)) return false;
+  const values = Object.values(quotas);
+  if (values.length === 0) return false;
+  const nowMs = Date.now();
+  return !values.some((value) => windowStillExhaustedAfterRealReset(value, nowMs));
+}
+
+/**
+ * Is an explicit cooldown still in the future?
+ *
+ * A rateLimitedUntil set by the upstream 429 handler is a hard statement and
+ * must never be overruled by a quota poll.
+ *
+ * Gate on the timestamp alone; lastErrorType stays irrelevant here.
+ */
+export function hasActiveCooldown(
+  connection: Pick<ProviderConnectionLike, "rateLimitedUntil">,
+  now: number = Date.now()
+): boolean {
+  if (!connection.rateLimitedUntil) return false;
+  // #3954: the rate_limited_until TEXT column holds an ISO string (dashboard/AUTH
+  // path) OR numeric epoch ms (setConnectionRateLimitUntil, the chat path). A bare
+  // `new Date(String(...))` yields Invalid Date for the numeric form, which read as
+  // "no cooldown" and let every poller wipe a chat-path-written lockout. Use the
+  // canonical parser connectionRecovery.ts already relies on.
+  const until = cooldownUntilMs(connection.rateLimitedUntil as string | number | null | undefined);
+  return Number.isFinite(until) && until > now;
+}
+
+/**
+ * Whether a connection test may wipe the persisted error/cooldown state.
+ *
+ * A successful probe proves the CREDENTIAL is valid; it does not prove an
+ * exhausted quota window reopened — the probe is a cheap auth/models call that
+ * never touches the chat quota a weekly cap applies to. The credential-health
+ * scheduler runs that probe against every connection every 300s, so without this
+ * gate a weekly-capped connection was reset to `active` / `rateLimitedUntil=null`
+ * within 30s of every restart and dispatched straight back into the same 429.
+ *
+ * Same rule as `maybeClearRecoveredQuotaState`: a future `rateLimitedUntil` is
+ * the 429 handler's hard statement and no poller may overrule it. Once the
+ * window elapses, the next probe clears the state normally.
+ */
+export function shouldClearErrorStateOnValidProbe(
+  connection: Pick<ProviderConnectionLike, "rateLimitedUntil">,
+  probeValid: boolean,
+  now: number = Date.now()
+): boolean {
+  return probeValid && !hasActiveCooldown(connection, now);
+}
+
 export async function maybeClearRecoveredQuotaState(
   connection: ProviderConnectionLike,
   usage: JsonRecord
 ): Promise<ProviderConnectionLike> {
   if (!hasUsableQuota(usage)) return connection;
   if (isTerminalStatusForQuotaRecovery(connection.testStatus)) return connection;
+  if (hasActiveCooldown(connection)) {
+    // #11355 made an active rateLimitedUntil an unconditional stop, which is right
+    // for an upstream-derived cooldown but over-broad for the one case #10534 was
+    // built for: a Claude-subscription 429 persists a SYNTHETIC 1h cooldown because
+    // the upstream sent no parseable reset. When the later poll shows every window
+    // that governs this connection has really reset WITH quota available, holding
+    // that synthetic cooldown just deadlocks the connection for an hour.
+    //
+    // Narrow by design: only lastErrorType "quota_exhausted" (the synthetic-cooldown
+    // writer) is eligible, and a single still-exhausted or unknown-reset window keeps
+    // the lock. Every other reason keeps #11355/#11277 semantics untouched.
+    if (!isQuotaExhaustedCooldownReleasable(connection, usage)) return connection;
+  }
 
   const hasTransientState =
     connection.testStatus === "unavailable" ||
@@ -558,10 +690,28 @@ async function syncAntigravitySubscriptionIfNeeded(
     changed = true;
   }
 
+  const discoveredProjectId = extractAntigravityProjectIdFromPayload(
+    subscriptionInfo as Record<string, unknown>
+  );
+  const storedProjectId = getStoredAntigravityProjectId(connection);
+  let nextProjectId: string | undefined;
+  if (discoveredProjectId && !storedProjectId) {
+    nextPsd.projectId = discoveredProjectId;
+    nextProjectId = discoveredProjectId;
+    changed = true;
+  }
+
   if (!changed) return connection;
 
-  await updateProviderConnection(connection.id, { providerSpecificData: nextPsd });
-  return { ...connection, providerSpecificData: nextPsd };
+  await updateProviderConnection(connection.id, {
+    ...(nextProjectId ? { projectId: nextProjectId, errorCode: null, lastError: null } : {}),
+    providerSpecificData: nextPsd,
+  });
+  return {
+    ...connection,
+    ...(nextProjectId ? { projectId: nextProjectId, errorCode: null, lastError: null } : {}),
+    providerSpecificData: nextPsd,
+  };
 }
 
 /** Persist refreshed Claude bootstrap fields into psd; writes only on diff. */
@@ -614,15 +764,18 @@ export function getProviderLimitsSyncIntervalMs(): number {
 const DEFAULT_PROVIDER_LIMITS_SYNC_SPACING_MS = 1500;
 
 /**
- * Spacing (ms) between consecutive OAuth provider-limits fetches in a bulk sync.
+ * Spacing (ms) applied between consecutive provider-limits fetch batches in a
+ * bulk sync, for BOTH the OAuth and local/API-key paths.
  *
  * OAuth providers (Codex/Claude/Kimi-coding/…) are fetched ONE AT A TIME with
  * this gap so a single host never bursts several simultaneous usage/refresh
  * requests to the same upstream — bursts read as automated traffic and
  * contribute to session termination / anomaly flags (and, for rotating-token
- * providers, to the Auth0 family-revocation race). Stateless API-key providers
- * keep the fast concurrent path. Tunable via `PROVIDER_LIMITS_SYNC_SPACING_MS`;
- * set to `"0"` to opt out.
+ * providers, to the Auth0 family-revocation race). Local/API-key connections
+ * (e.g. Ollama) keep their fast in-chunk concurrent path, but the gap is now
+ * also applied BETWEEN concurrency chunks so a local endpoint isn't hit by a
+ * simultaneous refresh burst either (#6916). Tunable via
+ * `PROVIDER_LIMITS_SYNC_SPACING_MS`; set to `"0"` to opt out on either path.
  */
 export function getProviderLimitsSyncSpacingMs(): number {
   const rawEnv = process.env.PROVIDER_LIMITS_SYNC_SPACING_MS;
@@ -630,8 +783,6 @@ export function getProviderLimitsSyncSpacingMs(): number {
   const raw = Number(rawEnv);
   return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_PROVIDER_LIMITS_SYNC_SPACING_MS;
 }
-
-const syncDelay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 export async function getLastProviderLimitsAutoSyncTime(): Promise<string | null> {
   try {
@@ -705,6 +856,9 @@ async function fetchLiveProviderLimitsWithOptions(
   connection: ProviderConnectionLike;
   usage: JsonRecord;
 }> {
+  if (await isConnectionUnavailableToAuxiliaryActivity(connectionId)) {
+    throw withStatus(new Error("Usage refresh deferred while an exclusive lease is active"), 409);
+  }
   let connection = (await getProviderConnectionById(
     connectionId
   )) as unknown as ProviderConnectionLike | null;
@@ -871,30 +1025,32 @@ export async function fetchAndPersistProviderLimits(
     allowRotatingRefresh: opts.allowRotatingRefresh,
   });
   const newCache = toProviderLimitsCacheEntry(usage, source);
+  const previous = getProviderLimitsCache(connectionId);
+  const cache = mergeProviderLimitsCacheEntry(connection.provider, newCache, previous);
 
   // Don't persist error-only entries (429 etc.) — would wipe prior good cache.
   // Serve the prior entry instead; only successful fetches update the cache.
-  const fetchFailed = !newCache.quotas && newCache.message;
-  if (fetchFailed) {
-    const previous = getProviderLimitsCache(connectionId);
-    if (previous?.quotas && Object.keys(previous.quotas).length > 0) {
-      const staleUsage: JsonRecord = {
-        ...usage,
-        quotas: previous.quotas,
-        plan: previous.plan ?? usage.plan ?? null,
-        bankedResetCredits: previous.bankedResetCredits,
-        message: null,
-        _stale: true,
-        _staleSince: previous.fetchedAt,
-        _staleReason: newCache.message,
-      };
-      return { connection, usage: staleUsage, cache: previous };
-    }
-    return { connection, usage, cache: newCache };
+  if (cache === previous && newCache.message) {
+    const staleUsage: JsonRecord = {
+      ...usage,
+      quotas: previous.quotas,
+      plan: previous.plan ?? usage.plan ?? null,
+      bankedResetCredits: previous.bankedResetCredits,
+      billing: previous.billing,
+      message: null,
+      _stale: true,
+      _staleSince: previous.fetchedAt,
+      _staleReason: newCache.message,
+    };
+    return { connection, usage: staleUsage, cache: previous };
   }
 
-  setProviderLimitsCache(connectionId, newCache);
-  return { connection, usage, cache: newCache };
+  const mergedUsage: JsonRecord = {
+    ...usage,
+    ...(cache.billing ? { billing: cache.billing } : {}),
+  };
+  setProviderLimitsCache(connectionId, cache);
+  return { connection, usage: mergedUsage, cache };
 }
 
 export async function syncAllProviderLimits(
@@ -910,9 +1066,19 @@ export async function syncAllProviderLimits(
   errors: Record<string, string>;
 }> {
   const { source = "manual", concurrency = 5 } = options;
+  const connectionRows = (await getProviderConnections({
+    isActive: true,
+  })) as unknown as ProviderConnectionLike[];
   const connections = (
-    (await getProviderConnections({ isActive: true })) as unknown as ProviderConnectionLike[]
-  ).filter(isSupportedUsageConnection);
+    await Promise.all(
+      connectionRows.map(async (connection) => ({
+        connection,
+        blocked: await isConnectionUnavailableToAuxiliaryActivity(connection.id),
+      }))
+    )
+  )
+    .filter(({ connection, blocked }) => isSupportedUsageConnection(connection) && !blocked)
+    .map(({ connection }) => connection);
   const cacheEntries: Array<{ connectionId: string; entry: ProviderLimitsCacheEntry }> = [];
   const caches: Record<string, ProviderLimitsCacheEntry> = {};
   const errors: Record<string, string> = {};
@@ -923,14 +1089,9 @@ export async function syncAllProviderLimits(
   ) => {
     if (result.status === "fulfilled") {
       const { cache } = result.value;
-      // Don't persist error-only entries; show prior cache or pass through.
-      if (!cache.quotas && cache.message) {
-        const previous = getProviderLimitsCache(connectionId);
-        if (previous?.quotas && Object.keys(previous.quotas).length > 0) {
-          caches[connectionId] = previous;
-        } else {
-          caches[connectionId] = cache;
-        }
+      const previous = getProviderLimitsCache(connectionId);
+      if (cache === previous) {
+        caches[connectionId] = cache;
         return;
       }
       cacheEntries.push({ connectionId, entry: cache });
@@ -949,35 +1110,32 @@ export async function syncAllProviderLimits(
     const { usage } = await fetchLiveProviderLimitsWithOptions(connection.id, {
       forceRefresh,
     });
-    const cache = toProviderLimitsCacheEntry(usage, source);
+    const nextCache = toProviderLimitsCacheEntry(usage, source);
+    const cache = mergeProviderLimitsCacheEntry(connection.provider, nextCache, existingCache);
     return { connectionId: connection.id, cache };
   };
 
-  // OAuth connections are processed STRICTLY SEQUENTIALLY with a spacing gap so a
-  // single host never bursts simultaneous usage/refresh requests to the same
-  // upstream (anomaly/session-termination guard; see getProviderLimitsSyncSpacingMs).
-  // Stateless API-key connections keep the fast chunked-concurrent path.
+  // OAuth connections are processed STRICTLY SEQUENTIALLY (chunk size 1) with a
+  // spacing gap so a single host never bursts simultaneous usage/refresh
+  // requests to the same upstream (anomaly/session-termination guard; see
+  // getProviderLimitsSyncSpacingMs). Local/API-key connections keep their fast
+  // in-chunk concurrent path, spaced BETWEEN chunks (#6916).
   const oauthConnections = connections.filter((c) => c.authType === "oauth");
   const otherConnections = connections.filter((c) => c.authType !== "oauth");
   const spacingMs = getProviderLimitsSyncSpacingMs();
 
-  for (let i = 0; i < otherConnections.length; i += concurrency) {
-    const chunk = otherConnections.slice(i, i + concurrency);
-    const results = await Promise.allSettled(chunk.map(fetchOne));
+  const recordChunk = (
+    chunk: ProviderConnectionLike[],
+    results: PromiseSettledResult<{ connectionId: string; cache: ProviderLimitsCacheEntry }>[]
+  ) => {
     results.forEach((result, index) => {
       const connectionId = chunk[index]?.id;
       if (connectionId) recordResult(connectionId, result);
     });
-  }
+  };
 
-  for (let i = 0; i < oauthConnections.length; i++) {
-    const connection = oauthConnections[i];
-    const [result] = await Promise.allSettled([fetchOne(connection)]);
-    recordResult(connection.id, result);
-    if (spacingMs > 0 && i < oauthConnections.length - 1) {
-      await syncDelay(spacingMs);
-    }
-  }
+  await syncInChunksWithSpacing(otherConnections, concurrency, spacingMs, fetchOne, recordChunk);
+  await syncInChunksWithSpacing(oauthConnections, 1, spacingMs, fetchOne, recordChunk);
 
   if (cacheEntries.length > 0) {
     setProviderLimitsCacheBatch(cacheEntries);

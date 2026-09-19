@@ -34,7 +34,7 @@ async function resetStorage() {
   modelSyncRoute.__resetLoopbackReadinessForTests();
   core.resetDbInstance();
   apiKeysDb.resetApiKeyState();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -42,7 +42,7 @@ test.after(() => {
   globalThis.fetch = originalFetch;
   core.resetDbInstance();
   apiKeysDb.resetApiKeyState();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 async function enableAuth() {
@@ -74,7 +74,7 @@ test("model sync route skips success log when fetched models do not change store
     if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`
     );
     return Response.json({
       models: [{ id: "custom-model-1", name: "Custom Model 1" }],
@@ -119,7 +119,7 @@ test("model sync route stores the real provider while keeping the account label"
     if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`
     );
     return Response.json({
       models: [{ id: "custom-model-2", name: "Custom Model 2" }],
@@ -204,7 +204,7 @@ test("model sync route propagates upstream failures and records an error log ent
     if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`
     );
     return Response.json({ error: "Provider upstream unavailable" }, { status: 502 });
   };
@@ -241,7 +241,7 @@ test("model sync route falls back to the upstream HTTP status when the models pa
     if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`
     );
     return Response.json({}, { status: 429 });
   };
@@ -277,7 +277,7 @@ test("model sync route reports invalid JSON /models responses without losing ups
     if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`
     );
     return new Response("<html>bad gateway</html>", {
       status: 200,
@@ -325,7 +325,7 @@ test("model sync route preserves previously synced models when the upstream omit
     if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`
     );
     return Response.json({});
   };
@@ -369,7 +369,7 @@ test("model sync route writes synced available models for Gemini connections", a
     if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`
     );
     return Response.json({
       models: [
@@ -433,7 +433,7 @@ test("model sync route writes synced available models for non-Gemini providers t
     if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`
     );
     return Response.json({
       models: [
@@ -471,6 +471,10 @@ test("model sync route writes synced available models for non-Gemini providers t
   ]);
 });
 
+// #10603 ("make upstream model sync opt-in and preserve manual overrides") also applies to
+// import/merge mode: a manual custom-model row sharing an id with a discovered model is kept
+// as the user-owned overlay instead of being demoted/removed. See the comment above the
+// "reports synced managed models separately from preserved manual models" test.
 test("model sync route import mode merges discovered models without deleting manual models", async () => {
   await resetStorage();
 
@@ -489,7 +493,7 @@ test("model sync route import mode merges discovered models without deleting man
     if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`
     );
     return Response.json({
       models: [{ id: "router-v4", name: "Router V4" }],
@@ -512,10 +516,13 @@ test("model sync route import mode merges discovered models without deleting man
   assert.equal(body.updatedCount, 0);
   assert.equal(body.syncedAliases, 1);
   assert.deepEqual(body.modelChanges, { added: 1, removed: 0, updated: 0, total: 1 });
-  assert.deepEqual(body.customModelChanges, { added: 0, removed: 1, updated: 0, total: 1 });
+  assert.deepEqual(body.customModelChanges, { added: 0, removed: 0, updated: 0, total: 0 });
   assert.deepEqual(
     body.models.map((model) => ({ id: model.id, source: model.source })),
-    [{ id: "manual-only", source: "manual" }]
+    [
+      { id: "manual-only", source: "manual" },
+      { id: "router-v4", source: "manual" },
+    ]
   );
   assert.deepEqual(
     body.importedModels.map((model) => ({ id: model.id, source: model.source })),
@@ -555,7 +562,7 @@ test("model sync route import mode ignores supported endpoint ordering changes",
     if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`
     );
     return Response.json({
       models: [
@@ -619,7 +626,7 @@ test("model sync route import mode reports updates without counting them as new 
     if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`
     );
     return Response.json({
       models: [
@@ -693,7 +700,7 @@ test("model sync route records added, removed, and updated model diffs with fall
     if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`
     );
     return Response.json({
       models: [
@@ -772,7 +779,7 @@ test("model sync route forwards cookies, filters built-ins, and syncs aliases fo
     if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`
     );
     assert.equal(init.headers.cookie, "session=test-cookie");
     assert.equal(
@@ -820,6 +827,13 @@ test("model sync route forwards cookies, filters built-ins, and syncs aliases fo
   assert.equal(logs[0].account, "External Sync");
 });
 
+// #10603 ("make upstream model sync opt-in and preserve manual overrides") changed
+// importManagedModels() so a manually configured custom-model row that shares an id with
+// a synced upstream model is no longer demoted/removed — it stays as the user-owned
+// metadata overlay and is merged over the synced base at read time (see the comment in
+// src/lib/providerModels/managedModelImport.ts). Only rows already tagged as an
+// imported/auto-sync source get pruned. This test predates that change; its expectations
+// below reflect the current preserve-manual-overrides behavior.
 test("model sync route reports synced managed models separately from preserved manual models", async () => {
   await resetStorage();
 
@@ -837,7 +851,7 @@ test("model sync route reports synced managed models separately from preserved m
     if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`
     );
     return Response.json({
       models: [{ id: "router-v4", name: "Router V4" }],
@@ -858,10 +872,13 @@ test("model sync route reports synced managed models separately from preserved m
   assert.equal(body.availableModelsCount, 2);
   assert.equal(body.importedCount, 1);
   assert.equal(body.updatedCount, 0);
-  assert.deepEqual(body.customModelChanges, { added: 0, removed: 1, updated: 0, total: 1 });
+  assert.deepEqual(body.customModelChanges, { added: 0, removed: 0, updated: 0, total: 0 });
   assert.deepEqual(
     body.models.map((model) => ({ id: model.id, source: model.source })),
-    [{ id: "manual-only", source: "manual" }]
+    [
+      { id: "manual-only", source: "manual" },
+      { id: "router-v4", source: "manual" },
+    ]
   );
   assert.deepEqual(
     (await modelsDb.getSyncedAvailableModels("openrouter")).map((model) => ({
@@ -902,7 +919,7 @@ test("model sync route uses provider-node prefixes when syncing compatible-provi
     if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`
     );
     return Response.json({
       models: [{ id: "sonnet-4-6", name: "Sonnet 4.6" }],
@@ -957,7 +974,7 @@ test("model sync route falls back to in-process discovery when internal self-fet
 
     fetchCalls.push(urlString);
 
-    if (urlString === `http://localhost/api/providers/${connection.id}/models?refresh=true`) {
+    if (urlString.includes("/models?refresh=true&excludeCustom=true")) {
       throw new Error("fetch failed");
     }
 
@@ -1004,7 +1021,7 @@ test("model sync route falls back to in-process discovery when internal self-fet
   // Route forces IPv4 origin (http://127.0.0.1:PORT) — never "localhost" — to avoid
   // ::1 (IPv6) resolution issues in containers. PORT defaults to 20128 when env unset.
   const expectedPort = process.env.OMNIROUTE_PORT || process.env.PORT || "20128";
-  const selfFetchUrl = `http://127.0.0.1:${expectedPort}/api/providers/${connection.id}/models?refresh=true`;
+  const selfFetchUrl = `http://127.0.0.1:${expectedPort}/api/providers/${connection.id}/models?refresh=true&excludeCustom=true`;
   assert.equal(
     fetchCalls.slice(0, 3).every((u) => u === selfFetchUrl),
     true,

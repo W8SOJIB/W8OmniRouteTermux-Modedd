@@ -1,7 +1,7 @@
 /**
  * Live Dashboard WebSocket Server
  *
- * Separate process (runs alongside Next.js on port 20129).
+ * Separate process (runs alongside Next.js on port 20132).
  * Forwards EventBus events to subscribed dashboard clients.
  *
  * Protocol:
@@ -11,6 +11,10 @@
  *   Server → Client: { type: "pong" }
  *   Server → Client: { type: "welcome", version, sessionId, channels, backlog }
  *   Server → Client: { type: "error", code, message }
+ *
+ * Liveness: besides the application ping/pong above, the server sends a protocol-level
+ * ping (RFC 6455 §5.5.2) each HEARTBEAT_INTERVAL_MS. Conformant clients answer it with a
+ * pong control frame automatically, so a quiet-but-alive subscriber survives.
  */
 
 import { WebSocketServer, WebSocket } from "ws";
@@ -27,6 +31,7 @@ import { emit, on, onAny, getEventHistory, type HistoryEntry } from "@/lib/event
 import type { DashboardEventName, DashboardEventMap, DashboardChannel } from "@/lib/events/types";
 
 import { CHANNEL_EVENTS, getChannelForEvent } from "@/lib/events/types";
+import { isAutomatedTestProcess, isBuildProcess } from "@/shared/utils/testProcess";
 
 import {
   buildAllowedOrigins,
@@ -36,7 +41,7 @@ import {
 
 // ── Config ────────────────────────────────────────────────────────────────
 
-const DEFAULT_PORT = 20129;
+const DEFAULT_PORT = 20132;
 // Loopback by default. Opt-in to LAN exposure via LIVE_WS_HOST=0.0.0.0 — the
 // caller is then responsible for fronting it with a TLS terminator + origin
 // allow-list. Mirrors the route guard "local-only by default" posture.
@@ -427,8 +432,13 @@ function startHeartbeat(server: WebSocketServer): void {
         clients.delete(clientId);
         continue;
       }
-      // Send ping
+      // Send the application-level heartbeat response for clients that still rely on it.
       sendTo(client.ws, { type: "pong" } as WsServerMessage);
+      // Protocol-level ping: the client's automatic pong reply is what keeps a
+      // silent-but-alive subscriber alive, while a half-open socket stays silent and is
+      // still reaped. Nothing here refreshes lastActivity — only a received pong does,
+      // so #10452 holds.
+      client.ws.ping();
     }
   }, HEARTBEAT_INTERVAL_MS);
   // Don't keep the process alive solely for the heartbeat (it is also cleared on close).
@@ -564,6 +574,13 @@ export async function startLiveDashboardServer(
       console.error("[LiveWS] Client error %s: %s", clientId, err.message);
       clients.delete(clientId);
     });
+
+    // A control-frame pong (RFC 6455 §5.5.3) from the client is the only signal that
+    // proves the socket is not half-open (see startHeartbeat).
+    ws.on("pong", () => {
+      const current = clients.get(clientId);
+      if (current) current.lastActivity = Date.now();
+    });
   });
 
   // Heartbeat
@@ -607,12 +624,7 @@ export async function startLiveDashboardServer(
 // Build/test environments never auto-start regardless of the flag.
 
 function isBuildOrTest(): boolean {
-  return (
-    process.env.NEXT_PHASE === "phase-production-build" ||
-    process.env.NODE_ENV === "test" ||
-    process.env.VITEST !== undefined ||
-    process.argv.some((arg) => arg.includes("test"))
-  );
+  return isBuildProcess() || isAutomatedTestProcess();
 }
 
 export function isLiveWsEnabled(): boolean {

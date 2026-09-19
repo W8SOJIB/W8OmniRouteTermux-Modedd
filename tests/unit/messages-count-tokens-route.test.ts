@@ -20,7 +20,7 @@ type CountTokensResponse = {
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -42,7 +42,7 @@ test.beforeEach(async () => {
 
 test.after(async () => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("messages/count_tokens uses real provider count when Claude-compatible upstream supports it", async () => {
@@ -212,6 +212,38 @@ test("messages/count_tokens falls back to estimate when real upstream count fail
     const body = (await response.json()) as CountTokensResponse;
     assert.equal(body.input_tokens, 1); // tiktoken: "abcd"=1
     assert.equal(body.source, "local");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("messages/count_tokens rejects an impossible provider count and uses the local estimate", async () => {
+  await seedConnection("anthropic", { apiKey: "sk-ant-impossible-count" });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ input_tokens: 336409 }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+
+  try {
+    const response = await POST(
+      new Request("http://localhost/api/v1/messages/count_tokens", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "anthropic/claude-opus-4.6",
+          messages: [{ role: "user", content: "hello world" }],
+        }),
+      })
+    );
+
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as CountTokensResponse;
+    assert.equal(body.input_tokens, 2);
+    assert.equal(body.source, "local");
+    assert.equal(body.provider, undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }

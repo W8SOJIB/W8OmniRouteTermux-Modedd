@@ -34,6 +34,91 @@ test("every x-loopback-only path matches a LOCAL_ONLY prefix in routeGuard.ts", 
   }
 });
 
+test("GET /api/openapi/spec documents its conditional management auth contract", () => {
+  const operation = paths["/api/openapi/spec"]?.get;
+
+  assert.deepEqual(operation?.security, [{ ManagementSessionAuth: [] }]);
+  assert.match(operation?.description ?? "", /When `requireLogin` is enabled/);
+  assert.equal(
+    operation?.responses?.["401"]?.$ref,
+    "#/components/responses/ManagementAuthenticationRequired"
+  );
+  assert.equal(
+    operation?.responses?.["403"]?.$ref,
+    "#/components/responses/ManagementInvalidToken"
+  );
+});
+
+test("POST /api/openapi/try documents its bounded management proxy contract", () => {
+  const operation = paths["/api/openapi/try"]?.post;
+
+  assert.ok(operation, "POST /api/openapi/try must be present in docs/openapi.yaml");
+  assert.deepEqual(operation.security, [{ BearerAuth: [] }, { ManagementSessionAuth: [] }]);
+  assert.match(operation.description ?? "", /same-origin/);
+  assert.match(operation.description ?? "", /When `requireLogin` is disabled/);
+
+  const requestBody = operation.requestBody;
+  const requestSchema = requestBody?.content?.["application/json"]?.schema;
+  assert.equal(requestBody?.required, true);
+  assert.equal(requestSchema?.type, "object");
+  assert.deepEqual(requestSchema?.required, ["path"]);
+  assert.deepEqual(requestSchema?.properties?.method?.enum, [
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "HEAD",
+    "OPTIONS",
+  ]);
+  assert.equal(requestSchema?.properties?.method?.default, "GET");
+  assert.equal(requestSchema?.properties?.path?.minLength, 1);
+  assert.equal(
+    requestSchema?.properties?.path?.pattern,
+    "^/(?:api/|v1/|v1beta/|a2a|\\.well-known/agent\\.json)"
+  );
+  assert.equal(requestSchema?.properties?.headers?.type, "object");
+  assert.deepEqual(requestSchema?.properties?.headers?.additionalProperties, {
+    type: "string",
+  });
+  assert.deepEqual(requestSchema?.properties?.headers?.default, {});
+  assert.ok("body" in requestSchema.properties);
+
+  const successSchema = operation.responses?.["200"]?.content?.["application/json"]?.schema;
+  assert.equal(successSchema?.type, "object");
+  assert.equal(successSchema?.additionalProperties, false);
+  assert.deepEqual(successSchema?.required, [
+    "status",
+    "statusText",
+    "headers",
+    "body",
+    "latencyMs",
+    "contentType",
+  ]);
+  assert.equal(successSchema?.properties?.status?.type, "integer");
+  assert.equal(successSchema?.properties?.status?.minimum, 0);
+  assert.equal(successSchema?.properties?.statusText?.type, "string");
+  assert.equal(successSchema?.properties?.headers?.type, "object");
+  assert.deepEqual(successSchema?.properties?.headers?.additionalProperties, {
+    type: "string",
+  });
+  assert.match(successSchema?.properties?.body?.description ?? "", /10,000 characters/);
+  assert.equal(successSchema?.properties?.latencyMs?.type, "integer");
+  assert.equal(successSchema?.properties?.latencyMs?.minimum, 0);
+  assert.equal(successSchema?.properties?.contentType?.type, "string");
+
+  const badRequestSchema = operation.responses?.["400"]?.content?.["application/json"]?.schema;
+  assert.equal(badRequestSchema?.oneOf?.length, 2);
+  assert.equal(badRequestSchema?.oneOf?.[0]?.$ref, "#/components/schemas/ValidationErrorResponse");
+  assert.equal(badRequestSchema?.oneOf?.[1]?.properties?.error?.type, "string");
+  assert.equal(
+    operation.responses?.["401"]?.$ref,
+    "#/components/responses/ManagementAuthenticationRequired"
+  );
+  assert.equal(operation.responses?.["403"]?.$ref, "#/components/responses/ManagementInvalidToken");
+  assert.equal(operation.responses?.["503"]?.$ref, "#/components/responses/InternalError");
+});
+
 test("every x-always-protected path matches ALWAYS_PROTECTED_API_PATHS in routeGuard.ts", () => {
   for (const [pathStr, methods] of Object.entries(paths)) {
     if (!methods || typeof methods !== "object") continue;

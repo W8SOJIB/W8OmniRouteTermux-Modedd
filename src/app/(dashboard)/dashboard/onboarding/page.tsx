@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { useDisplayBaseUrl } from "@/shared/hooks";
+import { FreeProviderOnboardingCard } from "./steps/FreeProviderOnboardingCard";
 import { TierTour } from "./steps/TierTour";
 
 const STEP_IDS = ["welcome", "tiers", "security", "provider", "test", "done"];
@@ -25,7 +26,7 @@ export default function OnboardingWizard() {
   const baseUrl = useDisplayBaseUrl();
   const [step, setStep] = useState(0);
   const [loading, setLoading] = useState(true);
-  const [apiEndpoint, setApiEndpoint] = useState(`${baseUrl}/api/v1`);
+  const apiEndpoint = `${baseUrl}/api/v1`;
 
   // Security step state
   const [password, setPassword] = useState("");
@@ -45,20 +46,11 @@ export default function OnboardingWizard() {
 
   // Check if setup is already complete
   useEffect(() => {
-    const resolveApiEndpoint = (apiPort) => {
-      if (typeof window === "undefined") return;
-      const protocol = window.location.protocol;
-      const hostname = window.location.hostname;
-      const effectiveApiPort = apiPort || 20128;
-      setApiEndpoint(`${protocol}//${hostname}:${effectiveApiPort}/api/v1`);
-    };
-
     const checkSetup = async () => {
       try {
         const res = await fetch("/api/settings");
         if (res.ok) {
           const settings = await res.json();
-          resolveApiEndpoint(settings?.apiPort);
           if (settings.setupComplete) {
             router.replace("/dashboard");
             return;
@@ -274,7 +266,12 @@ export default function OnboardingWizard() {
             >
               {currentStep.icon}
             </span>
-            <h2 className="text-2xl font-bold text-text-main mb-1">{currentStep.title}</h2>
+            <h2 className="text-2xl font-bold text-text-main">{currentStep.title}</h2>
+            {currentStep.id === "tiers" && (
+              <p className="mx-auto mt-2 max-w-md text-sm leading-relaxed text-text-muted text-balance">
+                {t("tier.subtitle")}
+              </p>
+            )}
           </div>
 
           {/* Step Content */}
@@ -283,7 +280,7 @@ export default function OnboardingWizard() {
             {currentStep.id === "welcome" && (
               <div className="text-center space-y-4">
                 <p className="text-text-muted">{t("welcomeDesc")}</p>
-                <div className="grid grid-cols-3 gap-3 mt-6">
+                <div className="mt-6 grid grid-cols-3 gap-3 items-stretch">
                   {[
                     { icon: "swap_horiz", label: t("multiProvider") },
                     { icon: "monitoring", label: t("usageTracking") },
@@ -291,12 +288,14 @@ export default function OnboardingWizard() {
                   ].map((f) => (
                     <div
                       key={f.icon}
-                      className="bg-white/[0.03] rounded-xl p-3 text-center border border-white/[0.06]"
+                      className="h-full bg-white/[0.03] rounded-xl p-3 text-center border border-white/[0.06]"
                     >
-                      <span className="material-symbols-outlined text-primary text-[24px] mb-1 block">
-                        {f.icon}
-                      </span>
-                      <span className="text-xs text-text-muted">{f.label}</span>
+                      <div className="flex h-full flex-col items-center justify-center">
+                        <span className="material-symbols-outlined text-primary text-[24px] mb-1 block">
+                          {f.icon}
+                        </span>
+                        <span className="text-xs text-text-muted">{f.label}</span>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -319,6 +318,11 @@ export default function OnboardingWizard() {
                   />
                   {t("skipPassword")}
                 </label>
+                {skipSecurity && (
+                  <p className="text-xs text-amber-400 text-center animate-in fade-in duration-200">
+                    {t("securityDescSkipWarning")}
+                  </p>
+                )}
                 {!skipSecurity && (
                   <div className="space-y-3">
                     <input
@@ -359,25 +363,40 @@ export default function OnboardingWizard() {
             {currentStep.id === "provider" && (
               <div className="space-y-4">
                 <p className="text-sm text-text-muted text-center">{t("providerDesc")}</p>
-                <div className="grid grid-cols-3 gap-2">
-                  {COMMON_PROVIDERS.map((p) => (
-                    <button
-                      key={p.id}
-                      onClick={() => {
-                        setSelectedProvider(p.id);
-                        setProviderName(p.name);
-                      }}
-                      className={`p-3 rounded-xl border text-center text-xs font-medium transition-all cursor-pointer ${
-                        selectedProvider === p.id
-                          ? "border-primary/60 bg-primary/10 text-primary"
-                          : "border-white/10 bg-white/[0.03] text-text-muted hover:border-white/20"
-                      }`}
-                    >
-                      {p.name}
-                    </button>
-                  ))}
-                </div>
-                {selectedProvider && (
+                {skipSecurity && (
+                  <div className="text-center p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg animate-in fade-in duration-200">
+                    <p className="text-sm text-amber-400">{t("providerRequiresPassword")}</p>
+                  </div>
+                )}
+                {!skipSecurity && <FreeProviderOnboardingCard />}
+                {!skipSecurity && (
+                  <div className="flex items-center gap-3 text-[11px] text-text-muted">
+                    <span className="h-px flex-1 bg-white/10" />
+                    <span>{t("freeProviders.orUseApiKey")}</span>
+                    <span className="h-px flex-1 bg-white/10" />
+                  </div>
+                )}
+                {!skipSecurity && (
+                  <div className="grid grid-cols-3 gap-2">
+                    {COMMON_PROVIDERS.map((p) => (
+                      <button
+                        key={p.id}
+                        onClick={() => {
+                          setSelectedProvider(p.id);
+                          setProviderName(p.name);
+                        }}
+                        className={`p-3 rounded-xl border text-center text-xs font-medium transition-all cursor-pointer ${
+                          selectedProvider === p.id
+                            ? "border-primary/60 bg-primary/10 text-primary"
+                            : "border-white/10 bg-white/[0.03] text-text-muted hover:border-white/20"
+                        }`}
+                      >
+                        {p.name}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {!skipSecurity && selectedProvider && (
                   <div className="space-y-3 mt-4">
                     <input
                       type="password"
@@ -499,7 +518,7 @@ export default function OnboardingWizard() {
                   {skipSecurity ? t("skipAndContinue") : t("setPassword")}
                 </button>
               )}
-              {currentStep.id === "provider" && (
+              {currentStep.id === "provider" && !skipSecurity ? (
                 <button
                   onClick={handleAddProvider}
                   disabled={!selectedProvider || !providerKey}
@@ -507,7 +526,7 @@ export default function OnboardingWizard() {
                 >
                   {t("addProvider")}
                 </button>
-              )}
+              ) : null}
               {currentStep.id === "test" && (
                 <button
                   onClick={handleNext}

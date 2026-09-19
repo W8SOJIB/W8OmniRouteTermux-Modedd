@@ -15,7 +15,7 @@ function makeReq(body: unknown) {
   });
 }
 test.beforeEach(() => core.resetDbInstance());
-test.after(() => { core.resetDbInstance(); rmSync(TEST_DATA_DIR, { recursive: true, force: true }); });
+test.after(() => { core.resetDbInstance(); rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
 test("ranks a high-savings engine above a no-op for repetitive tool output", async () => {
   const text = ["$ npm install",
     "npm warn deprecated glob@7.2.3: no longer supported",

@@ -64,6 +64,11 @@ export const CAVEMAN_INSTRUCTION_BY_LANGUAGE = {
     full: `Jawab sangat singkat ala caveman pintar. Hapus kata pengisi (hanya/sangat/sebenarnya), salam sopan santun. Kalimat pendek/tidak lengkap OK. Gunakan sinonim pendek. Pertahankan semua substansi teknis, kode, error, URL, & identifier secara persis. ${SHARED_BOUNDARIES}`,
     ultra: `Jawab ultra singkat. Kompresi maksimal. Gunakan singkatan umum (DB/auth/config/req/res/fn/impl), hilangkan kata hubung, gunakan panah untuk kausalitas (X → Y). Satu kata jika cukup. Jangan singkat simbol kode, nama API, string error, URL, atau identifier. ${SHARED_BOUNDARIES}`,
   },
+  vi: {
+    lite: `Trả lời súc tích. Bỏ từ đệm, sáo rỗng, rào đón. Giữ nguyên câu hoàn chỉnh, thuật ngữ kỹ thuật, code, lỗi, URL và định danh. ${SHARED_BOUNDARIES}`,
+    full: `Trả lời cộc lốc như người tối cổ thông minh. Bỏ mạo từ, từ đệm, sáo rỗng, rào đón. Chấp nhận câu rút gọn. Dùng từ đồng nghĩa ngắn. Giữ nguyên mọi nội dung kỹ thuật, code, lỗi, URL và định danh. ${SHARED_BOUNDARIES}`,
+    ultra: `Trả lời cực kỳ cộc lốc. Nén tối đa. Như điện tín. Viết tắt (DB/auth/config/req/res/fn/impl), bỏ liên từ, dùng mũi tên cho quan hệ nhân quả (X → Y). Một từ nếu một từ là đủ. Không bao giờ viết tắt ký hiệu code, tên API, chuỗi lỗi, URL hoặc định danh. ${SHARED_BOUNDARIES}`,
+  },
 } as const;
 
 const CAVEMAN_OUTPUT_MARKER = "[OmniRoute Caveman Output Mode]";

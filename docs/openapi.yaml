@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: OmniRoute API
-  version: 3.8.46
+  version: 3.8.50
   description: |
     OmniRoute is a local-first AI API proxy router. It provides an OpenAI-compatible
     endpoint that routes requests to multiple AI providers with load balancing,
@@ -49,8 +49,15 @@ tags:
     description: Provider connection management
   - name: Provider Nodes
     description: Provider node configuration
+  - name: Proxy Subscriptions
+    description: >-
+      Operator-supplied proxy subscription links (Karing-style). Nodes are fetched,
+      parsed, and synced into the provider/account pool on create, refresh, or the
+      background scheduler tick.
   - name: API Keys
     description: API key management
+  - name: Session Leases
+    description: Client-neutral exclusive managed session connection leases
   - name: Combos
     description: Routing combo management
   - name: Settings
@@ -98,6 +105,76 @@ tags:
       See docs/frameworks/TRAFFIC_INSPECTOR.md.
 
 paths:
+  /api/v1/session-leases:
+    post:
+      tags:
+        - Session Leases
+      summary: Acquire, renew, or release an exclusive managed connection lease
+      description: |
+        Requires an API key with `lease:exclusive` and an explicit non-empty
+        `allowedConnections` policy. The opaque owner is bound to the authenticated API key;
+        the lease owns an eligible connection, not a provider or model. Managed inference
+        requests present the owner and exact generation headers. Temporary foreign occupancy
+        returns 429 `WAITING_FOR_CAPACITY` with `Retry-After`.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: X-OmniRoute-Lease-Owner
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: ^vlo_[A-Za-z0-9_-]{43}$
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [action, model]
+                  properties:
+                    action: { type: string, const: acquire }
+                    model: { type: string, minLength: 1, maxLength: 512 }
+                - type: object
+                  required: [action, generation]
+                  properties:
+                    action: { type: string, const: renew }
+                    generation: { type: integer, minimum: 1 }
+                - type: object
+                  required: [action, generation]
+                  properties:
+                    action: { type: string, const: release }
+                    generation: { type: integer, minimum: 1 }
+                    reason:
+                      type: string
+                      enum: [OWNER_EXIT, CLIENT_CANCELLED]
+      responses:
+        "200":
+          description: Lease lifecycle state without connection or credential disclosure
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExclusiveConnectionLeaseLifecycle"
+        "400":
+          description: Missing or invalid lease context/action
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: Managed lease scope or key configuration required
+        "409":
+          description: Stale generation, missing binding, or connection fence rejection
+        "415":
+          description: Lifecycle mutations require application/json
+        "429":
+          description: Eligible managed connections are held by foreign active leases
+          headers:
+            Retry-After:
+              schema: { type: integer, minimum: 1, maximum: 3600 }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExclusiveConnectionLeaseCapacity"
   # --- Playground + Search Tools (plans 17+18) ---
   /api/playground/improve-prompt:
     post:
@@ -1126,6 +1203,13 @@ paths:
               schema:
                 type: string
               description: Number of fallback attempts (only present when > 0).
+            X-OmniRoute-Decision:
+              schema:
+                type: string
+              description: >-
+                Routing decision trace: `strategy=<name>; provider=<alias>; latency_ms=<n>`.
+                `<name>` is the combo strategy (e.g. `priority`, `weighted`, `fusion`) or
+                `single` for a non-combo request. Emitted on every completion response.
             X-OmniRoute-Request-Id:
               schema:
                 type: string
@@ -1308,13 +1392,49 @@ paths:
               required: [input, model]
               properties:
                 input:
+                  description: >-
+                    Text, token IDs, or up to 32 canonical multimodal items. Structured media
+                    input is accepted only when the resolved registry model advertises the
+                    requested modalities. URL sources must be public HTTPS and are fetched
+                    server-side into bounded inline media (redirect revalidation, timeout,
+                    size limits, public DNS checks, and connection pinning) before provider
+                    submission. Inline media is limited to 8 MiB decoded per item and 16 MiB
+                    decoded per request. Canonical items are translated to provider-native
+                    request shapes (Jina modality-keyed objects / Gemini embedContent parts)
+                    rather than forwarded unchanged.
                   oneOf:
                     - type: string
                     - type: array
+                      minItems: 1
                       items:
                         type: string
+                    - type: array
+                      minItems: 1
+                      items:
+                        type: integer
+                        minimum: 0
+                    - type: array
+                      minItems: 1
+                      items:
+                        type: array
+                        minItems: 1
+                        items:
+                          type: integer
+                          minimum: 0
+                    - type: array
+                      minItems: 1
+                      maxItems: 32
+                      items:
+                        $ref: "#/components/schemas/EmbeddingMultimodalItem"
                 model:
                   type: string
+                dimensions:
+                  type: integer
+                  minimum: 1
+                encoding_format:
+                  type: string
+                  enum: [float, base64]
+              additionalProperties: true
       responses:
         "200":
           description: >-
@@ -1322,6 +1442,38 @@ paths:
             cost-telemetry headers (see `POST /api/v1/chat/completions`); media
             cost is computed per modality when pricing is available, otherwise
             `0` (fail-open).
+
+  /api/v1/multimodal-embeddings:
+    post:
+      tags: [Embeddings]
+      summary: Create embeddings (Jina multimodal-embeddings alias)
+      description: >-
+        Same handler as `POST /api/v1/embeddings`. Provided so Jina-compatible
+        clients that call `/v1/multimodal-embeddings` do not receive HTTP 404
+        `unknown_route`.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input, model]
+              additionalProperties: true
+      responses:
+        "200":
+          description: Embedding vectors (same contract as POST /api/v1/embeddings).
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    get:
+      tags: [Embeddings]
+      summary: List embedding models (Jina multimodal-embeddings alias)
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Embedding model catalog (same as GET /api/v1/embeddings).
 
   /api/v1/providers/{provider}/embeddings:
     post:
@@ -1696,6 +1848,16 @@ paths:
         "200":
           description: Provider model list
 
+  /api/providers/cursor/agent-availability:
+    get:
+      tags: [Providers]
+      summary: Check cursor-agent availability
+      description: "Credential-free, informational check for whether cursor-agent is installed and authenticated on this host — backs the dashboard's dismissible install-nudge banner. Returns only cursorAgentAvailable (boolean); never tokens or machineId."
+      x-loopback-only: true
+      responses:
+        "200":
+          description: Availability result
+
   /api/providers/test-batch:
     post:
       tags: [Providers]
@@ -1907,14 +2069,62 @@ paths:
           description: Created combo
 
   /api/combos/{id}:
-    patch:
+    get:
       tags: [Combos]
-      summary: Update combo
+      summary: Get combo by ID
       parameters:
         - $ref: "#/components/parameters/ResourceId"
       responses:
         "200":
+          description: Combo details
+        "404":
+          description: Combo not found
+    put:
+      tags: [Combos]
+      summary: Update combo
+      description: >-
+        Partial update: the body is merged onto the stored combo, so a field left out keeps
+        its current value. An array that IS sent replaces the stored one outright.
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
           description: Updated combo
+        "400":
+          description: Invalid body, or the resulting combo fails validation
+        "404":
+          description: Combo not found
+        "409":
+          description: Name already taken, or the combo is quota-share managed
+    patch:
+      tags: [Combos]
+      summary: Update combo
+      description: >-
+        Partial update: the body is merged onto the stored combo, so a field left out keeps
+        its current value. An array that IS sent replaces the stored one outright.
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Updated combo
+        "400":
+          description: Invalid body, or the resulting combo fails validation
+        "404":
+          description: Combo not found
+        "409":
+          description: Name already taken, or the combo is quota-share managed
     delete:
       tags: [Combos]
       summary: Delete combo
@@ -2200,6 +2410,36 @@ paths:
       responses:
         "200":
           description: RTK filter catalog and diagnostics
+
+  /api/context/rtk/import:
+    post:
+      tags: [Compression]
+      summary: Validate or install an RTK TOML schema v1 filter file
+      security:
+        - ManagementSessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, content]
+              additionalProperties: false
+              properties:
+                action:
+                  type: string
+                  enum: [validate, install]
+                content:
+                  type: string
+                  maxLength: 1048576
+                overwrite:
+                  type: boolean
+                  description: Replace an existing global file and create a backup
+      responses:
+        "200":
+          description: Filter metadata, inline-test outcomes, warnings, and installation status
+        "400":
+          description: Invalid TOML, schema, regular expression, inline test, or install request
 
   /api/context/rtk/test:
     post:
@@ -2490,6 +2730,273 @@ paths:
         "200":
           description: Ollama model tags
 
+  # ─── Proxy Subscriptions ───────────────────────────────────────
+
+  /api/v1/management/proxy-subscriptions:
+    get:
+      tags: [Proxy Subscriptions]
+      summary: List proxy subscriptions
+      description: >-
+        Lists all operator-supplied proxy subscription links. Also starts the
+        background auto-refresh scheduler (idempotent) so enabled subscriptions
+        stay in sync. Credentials embedded in `url` are redacted in the response.
+      security:
+        - ManagementSessionAuth: []
+      responses:
+        "200":
+          description: Subscription list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ProxySubscription"
+        "401":
+          $ref: "#/components/responses/ManagementAuthenticationRequired"
+        "403":
+          $ref: "#/components/responses/ManagementInvalidToken"
+    post:
+      tags: [Proxy Subscriptions]
+      summary: Create a proxy subscription
+      description: >-
+        Creates a subscription record. If `mode` is `rule`, at least one entry in
+        `ruleProviders` is required. `updateIntervalMinutes` defaults to 60 and
+        `enabled` defaults to `false` when omitted or not exactly `true`.
+      security:
+        - ManagementSessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, url]
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+                url:
+                  type: string
+                  minLength: 1
+                mode:
+                  type: string
+                  enum: [global, rule]
+                  default: global
+                ruleProviders:
+                  type: array
+                  items:
+                    type: string
+                  description: Required (non-empty) when mode is "rule".
+                localCoreEndpoint:
+                  type: string
+                  nullable: true
+                updateIntervalMinutes:
+                  type: integer
+                  default: 60
+                enabled:
+                  type: boolean
+                  default: false
+      responses:
+        "201":
+          description: Created subscription (url redacted)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProxySubscription"
+        "400":
+          description: Missing name/url, or ruleProviders empty while mode is "rule"
+        "401":
+          $ref: "#/components/responses/ManagementAuthenticationRequired"
+        "403":
+          $ref: "#/components/responses/ManagementInvalidToken"
+
+  /api/v1/management/proxy-subscriptions/{id}:
+    get:
+      tags: [Proxy Subscriptions]
+      summary: Get a proxy subscription
+      security:
+        - ManagementSessionAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Subscription detail (url redacted)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProxySubscription"
+        "401":
+          $ref: "#/components/responses/ManagementAuthenticationRequired"
+        "403":
+          $ref: "#/components/responses/ManagementInvalidToken"
+        "404":
+          description: Subscription not found
+    patch:
+      tags: [Proxy Subscriptions]
+      summary: Update a proxy subscription
+      description: >-
+        Partial update — only fields present in the body are changed
+        (name/url/mode/ruleProviders/localCoreEndpoint/updateIntervalMinutes/enabled).
+      security:
+        - ManagementSessionAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                url:
+                  type: string
+                mode:
+                  type: string
+                  enum: [global, rule]
+                ruleProviders:
+                  type: array
+                  items:
+                    type: string
+                localCoreEndpoint:
+                  type: string
+                  nullable: true
+                updateIntervalMinutes:
+                  type: integer
+                enabled:
+                  type: boolean
+      responses:
+        "200":
+          description: Updated subscription (url redacted)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProxySubscription"
+        "401":
+          $ref: "#/components/responses/ManagementAuthenticationRequired"
+        "403":
+          $ref: "#/components/responses/ManagementInvalidToken"
+        "404":
+          description: Subscription not found
+    delete:
+      tags: [Proxy Subscriptions]
+      summary: Delete a proxy subscription
+      description: Removes the subscription record and unbinds/drops its synced proxy_registry rows.
+      security:
+        - ManagementSessionAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: boolean
+        "401":
+          $ref: "#/components/responses/ManagementAuthenticationRequired"
+        "403":
+          $ref: "#/components/responses/ManagementInvalidToken"
+        "404":
+          description: Subscription not found
+
+  /api/v1/management/proxy-subscriptions/{id}/nodes:
+    get:
+      tags: [Proxy Subscriptions]
+      summary: Get a subscription's last-parsed node summary
+      description: >-
+        Returns the last-parsed node list without re-fetching the (possibly slow)
+        subscription URL.
+      security:
+        - ManagementSessionAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Last-parsed node summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  name:
+                    type: string
+                  mode:
+                    type: string
+                    enum: [global, rule]
+                  enabled:
+                    type: boolean
+                  status:
+                    type: string
+                    enum: [ok, error, empty]
+                  error:
+                    type: string
+                    nullable: true
+                  lastFetchedAt:
+                    type: string
+                    format: date-time
+                    nullable: true
+                  nodes:
+                    type: array
+                    items: {}
+        "401":
+          $ref: "#/components/responses/ManagementAuthenticationRequired"
+        "403":
+          $ref: "#/components/responses/ManagementInvalidToken"
+        "404":
+          description: Subscription not found
+
+  /api/v1/management/proxy-subscriptions/{id}/refresh:
+    post:
+      tags: [Proxy Subscriptions]
+      summary: Refresh a proxy subscription
+      description: >-
+        Re-fetches and re-parses the subscription URL, syncs its nodes into
+        `proxy_registry`, and (re)binds the pool.
+      security:
+        - ManagementSessionAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Sync result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscriptionId:
+                    type: string
+                  nodes:
+                    type: integer
+                  needsCore:
+                    type: integer
+                  boundProxies:
+                    type: integer
+                  status:
+                    type: string
+                    enum: [ok, error, empty]
+                  error:
+                    type: string
+                    nullable: true
+                  applied:
+                    type: boolean
+        "401":
+          $ref: "#/components/responses/ManagementAuthenticationRequired"
+        "403":
+          $ref: "#/components/responses/ManagementInvalidToken"
+        "404":
+          description: Subscription not found
+
   # ─── Usage & Analytics ─────────────────────────────────────────
 
   /api/usage/analytics:
@@ -2603,6 +3110,201 @@ paths:
       responses:
         "200":
           description: Updated budget configuration
+
+  /api/usage/cache-health:
+    get:
+      tags: [Usage]
+      summary: Get prompt-cache health summary
+      description: |
+        Summarizes the `write/read` cache ratio from `call_logs` for a time window:
+        distribution (p50/p90/p99/max of cache-write tokens), warm/cold/rewrite/uncached
+        call counts, the "heavy write" outlier share (10x the window median, floored at
+        1024 tokens — Anthropic's cache-creation minimum), and a per-model breakdown.
+        Only successful (`status = 200`) calls with a non-null cache column are counted.
+      parameters:
+        - name: range
+          in: query
+          schema:
+            type: string
+            enum: [1h, 24h, 7d, 30d]
+            default: 24h
+        - name: model
+          in: query
+          description: Filter to one model or requested-model alias (1-200 chars).
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+      responses:
+        "200":
+          description: Cache health summary for the requested window
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  totalCalls:
+                    type: integer
+                  cacheReadTotal:
+                    type: integer
+                  cacheWriteTotal:
+                    type: integer
+                  writeReadRatio:
+                    type: number
+                  warmCalls:
+                    type: integer
+                  coldCalls:
+                    type: integer
+                  rewriteCalls:
+                    type: integer
+                  uncachedCalls:
+                    type: integer
+                  writeP50:
+                    type: integer
+                  writeP90:
+                    type: integer
+                  writeP99:
+                    type: integer
+                  writeMax:
+                    type: integer
+                  heavyWriteCalls:
+                    type: integer
+                  heavyWriteCallShare:
+                    type: number
+                  heavyWriteTokenShare:
+                    type: number
+                  heavyWriteThreshold:
+                    type: integer
+                  verdict:
+                    type: string
+                    enum: [healthy, degraded, thrash, no-data]
+                  byModel:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        model:
+                          type: string
+                        calls:
+                          type: integer
+                        cacheReadTotal:
+                          type: integer
+                        cacheWriteTotal:
+                          type: integer
+                        writeReadRatio:
+                          type: number
+                        heavyWriteCalls:
+                          type: integer
+                  timeRange:
+                    type: string
+                  since:
+                    type: string
+                    format: date-time
+                  truncated:
+                    type: boolean
+                    description: True when the window held more than 5000 rows and only the newest were summarized.
+        "400":
+          description: Invalid query parameters
+
+  /api/usage/model-latency-stats:
+    get:
+      tags: [Usage]
+      summary: Get per-model/provider latency statistics
+      description: >-
+        Aggregates `usage_history` rows into per-(provider, model) latency stats
+        (avg/p50/p95/p99, std-dev, TTFT, tokens/sec) over a rolling window. Falls
+        back from successful-only to all-sample rows when the successful count is
+        below `minSamples`.
+      security:
+        - ManagementSessionAuth: []
+      parameters:
+        - name: windowHours
+          in: query
+          schema:
+            type: number
+            minimum: 0
+            exclusiveMinimum: true
+            maximum: 720
+            default: 24
+        - name: minSamples
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: maxRows
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50000
+            default: 10000
+        - name: provider
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+        - name: model
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+      responses:
+        "200":
+          description: Latency stats keyed by provider/model, plus the window used
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        provider:
+                          type: string
+                        model:
+                          type: string
+                        key:
+                          type: string
+                        totalRequests:
+                          type: integer
+                        successfulRequests:
+                          type: integer
+                        successRate:
+                          type: number
+                        avgLatencyMs:
+                          type: number
+                        p50LatencyMs:
+                          type: number
+                        p95LatencyMs:
+                          type: number
+                        p99LatencyMs:
+                          type: number
+                        latencyStdDev:
+                          type: number
+                        windowHours:
+                          type: number
+                        avgTtftMs:
+                          type: number
+                        avgE2ELatencyMs:
+                          type: number
+                        avgTokensPerSecond:
+                          type: number
+                  windowHours:
+                    type: number
+                  generatedAt:
+                    type: string
+                    format: date-time
+        "400":
+          description: Invalid query parameters
+        "401":
+          $ref: "#/components/responses/ManagementAuthenticationRequired"
+        "403":
+          $ref: "#/components/responses/ManagementInvalidToken"
 
   # ─── Pricing ───────────────────────────────────────────────────
 
@@ -3283,6 +3985,33 @@ paths:
         "400":
           description: Invalid request body
 
+  /api/services/9router/auto-restart-adopted:
+    post:
+      tags: [Embedded Services]
+      summary: Toggle 9Router auto-restart-when-adopted
+      description: >-
+        When enabled, an externally-adopted (not OmniRoute-spawned) 9Router
+        process is restarted under OmniRoute's own supervisor on the next
+        health-check cycle instead of being left as adopted-only.
+        **LOCAL_ONLY** — loopback only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+      responses:
+        "204":
+          description: Flag updated
+        "400":
+          description: Invalid request body
+        "500":
+          description: Update failed
+
   /api/services/cliproxy/install:
     post:
       tags: [Embedded Services]
@@ -3444,6 +4173,33 @@ paths:
         "400":
           description: Invalid request body
 
+  /api/services/cliproxy/auto-restart-adopted:
+    post:
+      tags: [Embedded Services]
+      summary: Toggle CLIProxyAPI auto-restart-when-adopted
+      description: >-
+        When enabled, an externally-adopted (not OmniRoute-spawned) CLIProxyAPI
+        process is restarted under OmniRoute's own supervisor on the next
+        health-check cycle instead of being left as adopted-only.
+        **LOCAL_ONLY** — loopback only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+      responses:
+        "204":
+          description: Flag updated
+        "400":
+          description: Invalid request body
+        "500":
+          description: Update failed
+
   /api/services/mux/install:
     post:
       tags: [Embedded Services]
@@ -3604,6 +4360,33 @@ paths:
         "400":
           description: Invalid request body
 
+  /api/services/mux/auto-restart-adopted:
+    post:
+      tags: [Embedded Services]
+      summary: Toggle Mux auto-restart-when-adopted
+      description: >-
+        When enabled, an externally-adopted (not OmniRoute-spawned) Mux
+        process is restarted under OmniRoute's own supervisor on the next
+        health-check cycle instead of being left as adopted-only.
+        **LOCAL_ONLY** — loopback only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+      responses:
+        "204":
+          description: Flag updated
+        "400":
+          description: Invalid request body
+        "500":
+          description: Update failed
+
   /api/services/bifrost/install:
     post:
       tags: [Embedded Services]
@@ -3713,6 +4496,459 @@ paths:
           description: Auto-start flag updated
         "400":
           description: Invalid request body
+
+  /api/services/bifrost/auto-restart-adopted:
+    post:
+      tags: [Embedded Services]
+      summary: Toggle Bifrost auto-restart-when-adopted
+      description: >-
+        When enabled, an externally-adopted (not OmniRoute-spawned) Bifrost
+        process is restarted under OmniRoute's own supervisor on the next
+        health-check cycle instead of being left as adopted-only.
+        **LOCAL_ONLY** — loopback only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+      responses:
+        "204":
+          description: Flag updated
+        "400":
+          description: Invalid request body
+        "500":
+          description: Update failed
+
+  /api/services/dario/install:
+    post:
+      tags: [Embedded Services]
+      summary: Install Dario from npm
+      description: >-
+        Installs the `@askalf/dario` npm package (Claude-account-pool proxy) under
+        DATA_DIR/services/dario/. Uses execFile (no shell interpolation — hard rule
+        #13). **LOCAL_ONLY** — loopback only.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                version:
+                  type: string
+                  default: latest
+                  description: npm version tag or semver to install
+      responses:
+        "200":
+          description: Install succeeded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  installedVersion:
+                    type: string
+                  path:
+                    type: string
+        "400":
+          description: Invalid request body
+        "500":
+          description: npm install failed
+
+  /api/services/dario/start:
+    post:
+      tags: [Embedded Services]
+      summary: Start Dario
+      description: >-
+        Spawns the Dario process. Idempotent if already running.
+        **LOCAL_ONLY** — loopback only.
+      responses:
+        "200":
+          description: Service started (or already running)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceStatus"
+        "409":
+          description: Dario is not installed
+        "503":
+          description: Start failed
+
+  /api/services/dario/stop:
+    post:
+      tags: [Embedded Services]
+      summary: Stop Dario
+      description: >-
+        Gracefully stops Dario. Idempotent — returns a stopped status even if no
+        supervisor is currently tracking the process.
+        **LOCAL_ONLY** — loopback only.
+      responses:
+        "200":
+          description: Service stopped
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceStatus"
+        "500":
+          description: Stop failed
+
+  /api/services/dario/restart:
+    post:
+      tags: [Embedded Services]
+      summary: Restart Dario
+      description: >-
+        Equivalent to stop() then start() under the operation lock.
+        **LOCAL_ONLY** — loopback only.
+      responses:
+        "200":
+          description: Service restarted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceStatus"
+        "409":
+          description: Dario is not installed
+        "503":
+          description: Restart failed
+
+  /api/services/dario/update:
+    post:
+      tags: [Embedded Services]
+      summary: Update Dario to a newer npm version
+      description: >-
+        Stops the service (if running), installs the newer npm version, then
+        restarts it if it was running before the update. **LOCAL_ONLY** — loopback
+        only.
+      responses:
+        "200":
+          description: Update result (no-op if already on the latest version)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  updated:
+                    type: boolean
+                  installedVersion:
+                    type: string
+                  latestVersion:
+                    type: string
+                  oldVersion:
+                    type: string
+                    nullable: true
+                  newVersion:
+                    type: string
+        "500":
+          description: Update failed
+
+  /api/services/dario/status:
+    get:
+      tags: [Embedded Services]
+      summary: Get Dario status
+      description: >-
+        Returns combined live supervisor state and DB metadata, including the
+        auto-start / auto-restart-adopted flags and whether an update is available.
+        **LOCAL_ONLY** — loopback only.
+      responses:
+        "200":
+          description: Status response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceStatusExtended"
+        "500":
+          description: Status read failed
+
+  /api/services/dario/auto-start:
+    post:
+      tags: [Embedded Services]
+      summary: Toggle Dario auto-start
+      description: >-
+        When enabled, Dario starts automatically on the next OmniRoute boot.
+        **LOCAL_ONLY** — loopback only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+      responses:
+        "204":
+          description: Auto-start flag updated
+        "400":
+          description: Invalid request body
+        "500":
+          description: Update failed
+
+  /api/services/dario/auto-restart-adopted:
+    post:
+      tags: [Embedded Services]
+      summary: Toggle Dario auto-restart-when-adopted
+      description: >-
+        When enabled, an externally-adopted (not OmniRoute-spawned) Dario process
+        is restarted under OmniRoute's own supervisor on the next health-check
+        cycle instead of being left as adopted-only.
+        **LOCAL_ONLY** — loopback only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+      responses:
+        "204":
+          description: Flag updated
+        "400":
+          description: Invalid request body
+        "500":
+          description: Update failed
+
+  /api/services/dario/admin/login-start:
+    post:
+      tags: [Embedded Services]
+      summary: Start a Dario account-pool login (device-code style)
+      description: >-
+        Forwards to the running Dario instance's `POST /admin/login/start` using
+        the stored admin token. The operator opens the returned `authorize_url`,
+        approves in their own Claude account, then posts the displayed code to
+        `/admin/login-complete`. **LOCAL_ONLY** — loopback only.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                alias:
+                  type: string
+                  description: Optional account alias; Dario assigns one if omitted.
+      responses:
+        "200":
+          description: Login challenge created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  alias:
+                    type: string
+                  authorize_url:
+                    type: string
+                  expires_at:
+                    type: string
+                  instructions:
+                    type: string
+        "400":
+          description: Invalid request body
+        "401":
+          description: Missing or invalid admin auth
+        "502":
+          description: Dario did not respond or Dario is not running
+
+  /api/services/dario/admin/login-complete:
+    post:
+      tags: [Embedded Services]
+      summary: Complete a Dario account-pool login
+      description: >-
+        Forwards to the running Dario instance's `POST /admin/login/complete`.
+        On success the account becomes routable immediately (Dario hot-reloads
+        its pool). **LOCAL_ONLY** — loopback only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [alias, code]
+              properties:
+                alias:
+                  type: string
+                code:
+                  type: string
+      responses:
+        "200":
+          description: Account added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  alias:
+                    type: string
+                  status:
+                    type: string
+                  expires_at:
+                    type: string
+        "400":
+          description: Invalid request body
+        "401":
+          description: Missing or invalid admin auth
+        "502":
+          description: Dario did not respond or Dario is not running
+
+  /api/services/dario/admin/accounts:
+    get:
+      tags: [Embedded Services]
+      summary: List Dario account-pool accounts
+      description: >-
+        Forwards to the running Dario instance's `GET /admin/accounts`.
+        **LOCAL_ONLY** — loopback only.
+      responses:
+        "200":
+          description: Account list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accounts:
+                    type: array
+                    items:
+                      type: object
+                  count:
+                    type: integer
+        "401":
+          description: Missing or invalid admin auth
+        "502":
+          description: Dario did not respond or Dario is not running
+    delete:
+      tags: [Embedded Services]
+      summary: Remove a Dario account-pool account
+      description: >-
+        Forwards to the running Dario instance's `DELETE /admin/accounts/<alias>`.
+        The alias is taken from a `?alias=` query param or a `{ alias }` JSON body.
+        **LOCAL_ONLY** — loopback only.
+      parameters:
+        - name: alias
+          in: query
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                alias:
+                  type: string
+      responses:
+        "200":
+          description: Account removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  alias:
+                    type: string
+                  removed:
+                    type: boolean
+        "400":
+          description: Missing alias
+        "401":
+          description: Missing or invalid admin auth
+        "502":
+          description: Dario did not respond or Dario is not running
+
+  /api/services/dario/admin/import-from-omniroute:
+    get:
+      tags: [Embedded Services]
+      summary: List OmniRoute claude connections eligible for Dario import
+      description: >-
+        Returns eligible OmniRoute `claude` OAuth provider connections (metadata
+        only — id/name/email/org tier, never tokens) so the UI can offer a picker
+        when more than one exists. **LOCAL_ONLY** — loopback only.
+      responses:
+        "200":
+          description: Eligible connections
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connections:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string
+                        email:
+                          type: string
+                          nullable: true
+                        organizationType:
+                          type: string
+                          nullable: true
+                        organizationRateLimitTier:
+                          type: string
+                          nullable: true
+        "401":
+          description: Missing or invalid admin auth
+    post:
+      tags: [Embedded Services]
+      summary: Import an OmniRoute claude connection's OAuth tokens into Dario
+      description: >-
+        Writes the source connection's access/refresh token pair directly into
+        Dario's own account-file store (`~/.dario/accounts/<alias>.json`), reusing
+        the shared Claude Code OAuth client_id, then restarts the Dario supervisor
+        so it picks up the new account. **LOCAL_ONLY** — loopback only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [connectionId]
+              properties:
+                connectionId:
+                  type: string
+                alias:
+                  type: string
+                  description: Optional custom alias; derived from the source email if omitted.
+      responses:
+        "200":
+          description: Account imported
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  alias:
+                    type: string
+                  imported:
+                    type: boolean
+                  sourceConnectionId:
+                    type: string
+                  sourceEmail:
+                    type: string
+                    nullable: true
+        "400":
+          description: Invalid request body, unsupported connection, or missing tokens
+        "401":
+          description: Missing or invalid admin auth
+        "404":
+          description: Connection not found
+        "500":
+          description: Import failed
 
   /api/services/{name}/logs:
     get:
@@ -4024,6 +5260,49 @@ paths:
         "200":
           description: Session cleared
 
+  /api/auth/oidc/login:
+    get:
+      tags: [System]
+      summary: Start OIDC login for the dashboard admin gate
+      description: |
+        Builds an authorization URL from the configured OIDC issuer/client (discovered
+        via `{issuer}/.well-known/openid-configuration`, falling back to `{issuer}/authorize`),
+        sets a short-lived `oidc_state` cookie, and redirects the browser. Password login
+        remains available as a fallback while OIDC is enabled.
+      responses:
+        "302":
+          description: Redirect to the identity provider's authorization endpoint
+        "400":
+          description: OIDC is not configured (missing issuer, client id/secret, or disabled)
+
+  /api/auth/oidc/callback:
+    get:
+      tags: [System]
+      summary: Complete OIDC login for the dashboard admin gate
+      description: |
+        Validates the `state` cookie, exchanges the authorization `code` for tokens,
+        verifies the ID token against the issuer's JWKS (audience = client id), and —
+        if `oidcAllowedSubjects` is configured — checks the token's `sub`/`email` against
+        that allowlist. On success it mints the same 30-day `auth_token` dashboard-session
+        JWT used by password login and redirects to `/dashboard`.
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "302":
+          description: >-
+            Redirect to `/dashboard` on success, or to
+            `/login?oidc_error={missing_code|invalid_state|not_configured|token_exchange|token_response|no_id_token|subject_not_allowed|id_token_invalid|server_misconfigured}`
+            on failure.
+
   /api/init:
     get:
       tags: [System]
@@ -4108,6 +5387,102 @@ paths:
         "200":
           description: Sync initialized
 
+  # ─── Background Jobs (local-only administration) ───────────────
+
+  /api/jobs:
+    get:
+      tags: [System]
+      summary: List registered background jobs
+      description: Local-only runtime administration. Returns each registered job and its latest run.
+      x-internal: true
+      responses:
+        "200":
+          description: Registered jobs
+        "500":
+          description: Failed to list jobs
+
+  /api/jobs/{id}/enable:
+    post:
+      tags: [System]
+      summary: Enable a background job
+      description: Local-only runtime administration. Enables the job and restarts its timer.
+      x-internal: true
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Job enabled
+        "404":
+          description: Job not found
+        "500":
+          description: Failed to enable job
+
+  /api/jobs/{id}/disable:
+    post:
+      tags: [System]
+      summary: Disable a background job
+      description: Local-only runtime administration. Disables the job and stops its timer.
+      x-internal: true
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Job disabled
+        "404":
+          description: Job not found
+        "500":
+          description: Failed to disable job
+
+  /api/jobs/{id}/run-now:
+    post:
+      tags: [System]
+      summary: Trigger a background job
+      description: >-
+        Local-only runtime administration. Starts the job, or waits for an in-flight
+        run before queueing the next one, subject to OMNIROUTE_RUNNOW_TIMEOUT_MS.
+      x-internal: true
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Job trigger accepted
+        "404":
+          description: Job not found
+        "500":
+          description: Failed to trigger job
+
+  /api/jobs/{id}/runs:
+    get:
+      tags: [System]
+      summary: Read background-job run history
+      description: Local-only runtime administration. Returns newest-first run history for one job.
+      x-internal: true
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Job run history
+        "404":
+          description: Job not found
+        "500":
+          description: Failed to load job runs
+
   # ─── Resilience & Monitoring ────────────────────────────────────
 
   /api/resilience:
@@ -4130,6 +5505,70 @@ paths:
         "200":
           description: Updated resilience configuration
 
+  /api/resilience/connections:
+    get:
+      tags: [System]
+      summary: Inspect connection resilience state
+      description: >-
+        Local-only operational view of per-connection cooldowns, provider circuit
+        breakers, model lockouts, and recent breaker transitions. Credential columns
+        are excluded by an explicit database whitelist.
+      x-internal: true
+      parameters:
+        - name: windowMs
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 86400000
+            default: 3600000
+        - name: provider
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+      responses:
+        "200":
+          description: Connection, breaker, lockout, window, and degradation metadata
+        "400":
+          description: Invalid query parameters
+        "500":
+          description: Failed to collect resilience state
+
+  /api/telegram/update:
+    post:
+      tags: [System]
+      summary: Receive Telegram updates or Mini App messages
+      description: >-
+        Public Telegram integration endpoint. Bot updates are acknowledged after
+        reply dispatch is queued. Mini App requests must include Telegram-signed
+        initData, which is verified with TELEGRAM_BOT_TOKEN before chat proxying.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              properties:
+                initData:
+                  type: string
+                message:
+                  type: string
+                update_id:
+                  type: integer
+      responses:
+        "200":
+          description: Update acknowledged or Mini App reply returned
+        "400":
+          description: Invalid JSON, request shape, or missing Mini App message
+        "401":
+          description: Invalid Mini App initData signature
+        "503":
+          description: Telegram integration is not configured
+
   /api/resilience/reset:
     post:
       tags: [System]
@@ -4137,6 +5576,32 @@ paths:
       responses:
         "200":
           description: Circuit breakers reset
+
+  /api/health:
+    get:
+      tags: [System]
+      summary: Liveness probe
+      description: >-
+        Unauthenticated liveness probe. Returns `{ status, timestamp }` and nothing
+        else — version, uptime and memory stay behind the authenticated
+        `GET /api/monitoring/health`. Sent with
+        `Cache-Control: no-store, no-cache, must-revalidate`.
+      security: []
+      responses:
+        "200":
+          description: Service is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, timestamp]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                  timestamp:
+                    type: string
+                    format: date-time
 
   /api/monitoring/health:
     get:
@@ -4176,6 +5641,241 @@ paths:
       responses:
         "200":
           description: Caches cleared
+
+  /api/modality-bridge/stats:
+    get:
+      tags: [System]
+      summary: Get Modality Bridge telemetry
+      description: In-memory per-modality bridge counters (attempts, successes, bridged, cacheHits, failures, totalLatencyMs, latencySamples, averageLatencyMs, lastUsedAt). The bridged field is the backward-compatible success count. Latency averages include sampled operations only; an unsampled Vision or Audio operation does not fabricate a zero-millisecond sample. Counters reset on process restart.
+      security:
+        - ManagementSessionAuth: []
+      responses:
+        "200":
+          description: Per-modality bridge stats (vision, audio, video)
+        "401":
+          description: Unauthorized
+
+  /api/modality-bridge/video/runtime:
+    get:
+      x-loopback-only: true
+      tags: [System]
+      summary: Get Video Bridge runtime status
+      description: Requires trusted loopback locality before authentication or probing, then management authentication. Returns sanitized FFmpeg and ffprobe availability and versions. The response never contains commands, paths, or stderr.
+      security:
+        - ManagementSessionAuth: []
+      responses:
+        "200":
+          description: Video Bridge runtime availability
+        "401":
+          description: Unauthorized
+        "403":
+          description: Localhost access required
+
+  /api/modality-bridge/video/extract:
+    post:
+      x-loopback-only: true
+      tags: [System]
+      summary: Extract bounded Video Bridge frames through the internal broker
+      description: Internal per-process-authenticated trusted-loopback broker. Accepts at most 50 MiB of video bytes; URLs, paths, executable names, and command arguments are not part of the contract. The body pipeline and streamed handler reader both enforce the input cap. The broker applies fixed FFmpeg/ffprobe confinement, a single extraction slot with four pending jobs/100 MiB queued input, a 4 MiB per-frame cap, and a 32 MiB total response cap. Optional focus bounds and scene-aware sampling are deterministic and bounded. Transcript provenance is a metadata contract on the parent video part, not an instruction to run speech-to-text. This is not a public upload API.
+      security: []
+      parameters:
+        - in: query
+          name: frames
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 16
+        - in: query
+          name: samplingPolicy
+          required: false
+          description: Optional deterministic sampling policy. Scene-aware detection falls back to uniform sampling on detector failure.
+          schema:
+            type: string
+            enum: [uniform, scene_aware, segment_aware]
+            default: uniform
+        - in: query
+          name: start
+          required: false
+          description: Optional focus-window start in seconds. The broker clamps it to the media duration.
+          schema:
+            type: number
+            minimum: 0
+        - in: query
+          name: end
+          required: false
+          description: Optional focus-window end in seconds. It must be greater than the normalized start.
+          schema:
+            type: number
+            minimum: 0
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              maxLength: 52428800
+      responses:
+        "200":
+          description: Sanitized duration and bounded JPEG data-URI frames
+        "400":
+          description: Invalid fixed broker contract
+        "403":
+          description: Authenticated trusted-loopback broker identity required
+        "413":
+          description: Input exceeds the 50 MiB byte limit
+        "422":
+          description: Media rejected or extraction failed
+        "499":
+          description: Client request aborted
+        "503":
+          description: Queue capacity is exhausted, or FFmpeg/ffprobe is unavailable on PATH
+          headers:
+            Retry-After:
+              description: Present with value 1 when queue capacity is exhausted
+              schema:
+                type: integer
+                minimum: 1
+        "504":
+          description: Fixed 120-second broker extraction deadline exceeded
+
+  /api/modality-bridge/video/drilldown:
+    get:
+      x-loopback-only: true
+      tags: [System]
+      summary: Read a bounded Video Bridge drill-down slice
+      description: Internal loopback/token-authenticated lookup into a short-lived cache isolated by an opaque principal, session, and media reference. It never downloads media or starts a subprocess; start/end and frame count only select already materialized, canonicalized JPEG frames whose dimensions were derived from their bytes. This cache substrate is not yet wired to the transparent Video Bridge request path and does not yet expose multi-resolution selection.
+      security: []
+      parameters:
+        - in: header
+          name: x-omniroute-video-bridge-principal
+          required: true
+          description: Canonical visible-ASCII, opaque non-secret principal ID; production tenant derivation is required before enabling a caller
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+            pattern: "^[!-~]{1,256}$"
+        - in: query
+          name: sessionId
+          required: true
+          description: Canonical opaque ID without surrounding whitespace
+          schema: { type: string, minLength: 1, maxLength: 128 }
+        - in: query
+          name: videoRef
+          required: true
+          description: Canonical opaque reference without surrounding whitespace
+          schema: { type: string, minLength: 1, maxLength: 4096 }
+        - in: query
+          name: start
+          required: false
+          schema: { type: number, minimum: 0 }
+        - in: query
+          name: end
+          required: false
+          schema: { type: number, minimum: 0 }
+        - in: query
+          name: frames
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 16 }
+      responses:
+        "200": { description: Bounded cached frame slice with derivation audit metadata }
+        "403": { description: Trusted loopback/token identity and principal required }
+        "404": { description: Drill-down session or media key was not found }
+    post:
+      x-loopback-only: true
+      tags: [System]
+      summary: Store a bounded Video Bridge drill-down result
+      description: Internal lifecycle operation for explicitly authorized callers. The short-lived cache is isolated by principal, session, and media reference; enforces independent per-principal and global retained-byte quotas; accepts canonical Base64 only after a warning-sensitive bounded full JPEG decode/re-encode; strips trailing polyglot bytes; retains and charges only the canonical JPEG output; derives resolution from decoded bytes; and does not alter the primary request cost. The JSON wire budget includes Base64 overhead for the 32 MiB decoded-input ceiling.
+      security: []
+      parameters:
+        - in: header
+          name: x-omniroute-video-bridge-principal
+          required: true
+          description: Canonical visible-ASCII, opaque non-secret principal ID; production tenant derivation is required before enabling a caller
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+            pattern: "^[!-~]{1,256}$"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sessionId, videoRef, derivation, durationSeconds, frames]
+              properties:
+                sessionId:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+                  description: Canonical opaque ID without surrounding whitespace
+                videoRef:
+                  type: string
+                  minLength: 1
+                  maxLength: 4096
+                  description: Canonical opaque reference without surrounding whitespace
+                derivation:
+                  type: object
+                  additionalProperties: false
+                  required: [parentContentHash, policy, version]
+                  properties:
+                    parentContentHash:
+                      type: string
+                      pattern: "^sha256:[a-f0-9]{64}$"
+                    policy:
+                      type: string
+                      pattern: "^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$"
+                    version:
+                      type: string
+                      pattern: "^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$"
+                durationSeconds: { type: number, exclusiveMinimum: 0, maximum: 600 }
+                frames:
+                  type: array
+                  minItems: 1
+                  maxItems: 16
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [timestampSeconds, dataUri]
+                    properties:
+                      timestampSeconds: { type: number, minimum: 0 }
+                      dataUri:
+                        type: string
+                        minLength: 27
+                        maxLength: 5592431
+                        description: Canonical Base64 data URI whose decoded bytes pass a warning-sensitive bounded full JPEG decode/re-encode; trailing bytes are discarded and width and height are derived server-side
+      responses:
+        "201": { description: Drill-down result stored }
+        "403": { description: Trusted loopback/token identity and principal required }
+        "413": { description: Payload exceeds the bounded session budget }
+        "499": { description: Caller cancelled before the derivation was committed }
+    delete:
+      x-loopback-only: true
+      tags: [System]
+      summary: Delete a Video Bridge drill-down session
+      security: []
+      parameters:
+        - in: header
+          name: x-omniroute-video-bridge-principal
+          required: true
+          description: Canonical visible-ASCII, opaque non-secret principal ID; production tenant derivation is required before enabling a caller
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+            pattern: "^[!-~]{1,256}$"
+        - in: query
+          name: sessionId
+          required: true
+          description: Canonical opaque ID without surrounding whitespace
+          schema: { type: string, minLength: 1, maxLength: 128 }
+      responses:
+        "200": { description: Session entries removed }
+        "403": { description: Trusted loopback/token identity and principal required }
 
   /api/cache/stats:
     get:
@@ -5252,7 +6952,11 @@ paths:
         Returns a structured JSON catalog parsed from this `openapi.yaml`,
         including info, servers, tags, schemas, and a flat list of endpoints
         (method, path, tags, summary, security, parameters, responses).
-        Used by the in-app API explorer.
+        Used by the in-app API explorer. When `requireLogin` is enabled, this
+        management endpoint requires an authenticated dashboard session;
+        otherwise it is available without authentication.
+      security:
+        - ManagementSessionAuth: []
       responses:
         "200":
           description: Parsed OpenAPI catalog
@@ -5306,8 +7010,110 @@ paths:
                       type: string
         "404":
           description: openapi.yaml file not found on disk
+        "401":
+          $ref: "#/components/responses/ManagementAuthenticationRequired"
+        "403":
+          $ref: "#/components/responses/ManagementInvalidToken"
         "500":
           description: Failed to parse OpenAPI spec
+
+  /api/openapi/try:
+    post:
+      tags: [System]
+      summary: Proxy an API Explorer request to an OmniRoute endpoint
+      description: >-
+        Executes an API Explorer request through a server-side, same-origin proxy. The target
+        must start with `/api/`, `/v1/`, `/v1beta/`, `/a2a`, or
+        `/.well-known/agent.json`; protocol-relative and cross-origin targets are rejected.
+        Hop-by-hop, proxy, host, cookie, and forwarding headers supplied in `headers` are
+        stripped, while any dashboard cookie on the original request is forwarded separately.
+        When `requireLogin` is disabled, the management-auth bypass mirrors the runtime setting;
+        otherwise a management Bearer credential or dashboard session is required. Failures
+        caught after authentication, including request JSON parsing, fetch, and response-body
+        parsing failures, are returned in the normal HTTP 200 result envelope so the Explorer
+        can display them; `status: 0` identifies that caught-failure path.
+      security:
+        - BearerAuth: []
+        - ManagementSessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                method:
+                  type: string
+                  enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]
+                  default: GET
+                path:
+                  type: string
+                  minLength: 1
+                  pattern: "^/(?:api/|v1/|v1beta/|a2a|\\.well-known/agent\\.json)"
+                  description: Same-origin OmniRoute API path, optionally including a query string.
+                headers:
+                  type: object
+                  default: {}
+                  additionalProperties:
+                    type: string
+                  description: >-
+                    Headers to forward after removing connection, content-length, cookie, host,
+                    keep-alive, proxy-authenticate, proxy-authorization, te, trailer,
+                    transfer-encoding, upgrade, x-forwarded-for, x-forwarded-host, and
+                    x-forwarded-proto headers.
+                body:
+                  description: >-
+                    Optional JSON value. A truthy value is serialized unless it is already a
+                    string, and is not forwarded when `method` is `GET`.
+      responses:
+        "200":
+          description: Upstream response or displayable caught-failure envelope
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status, statusText, headers, body, latencyMs, contentType]
+                properties:
+                  status:
+                    type: integer
+                    minimum: 0
+                    description: Upstream HTTP status, or 0 when request processing throws.
+                  statusText:
+                    type: string
+                  headers:
+                    type: object
+                    additionalProperties:
+                      type: string
+                  body:
+                    description: >-
+                      Parsed JSON, response text truncated after 10,000 characters, or a sanitized
+                      caught-error object.
+                  latencyMs:
+                    type: integer
+                    minimum: 0
+                  contentType:
+                    type: string
+        "400":
+          description: Invalid request body or non-same-origin path
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ValidationErrorResponse"
+                  - type: object
+                    required: [error]
+                    properties:
+                      error:
+                        type: string
+                        example: Path must be same-origin
+        "401":
+          $ref: "#/components/responses/ManagementAuthenticationRequired"
+        "403":
+          $ref: "#/components/responses/ManagementInvalidToken"
+        "503":
+          $ref: "#/components/responses/InternalError"
 
   # ─── Agent Skills Catalog ────────────────────────────────────────────────────
 
@@ -5540,9 +7346,18 @@ paths:
         - Images
       summary: Document OCR
       description: >-
-        Mistral OCR–compatible document OCR endpoint. Accepts a JSON body
-        referencing a document/image and returns extracted text. Success
-        responses carry the `X-OmniRoute-*` cost-telemetry headers.
+        Multi-provider document OCR endpoint (Mistral OCR–compatible request
+        and response shape). Accepts a JSON body referencing a document/image
+        and returns extracted text. `model` selects the provider via a
+        `provider/model` prefix (e.g. `mistral/mistral-ocr-latest`,
+        `azure-document-intelligence/prebuilt-read`,
+        `vertex-deepseek-ocr/deepseek-ocr-maas`); a bare model id (e.g.
+        `mistral-ocr-latest`) resolves to its registered provider, and an
+        omitted `model` defaults to Mistral. Azure Document Intelligence is
+        asynchronous upstream — the handler polls the returned operation
+        until it succeeds or fails before responding, so this endpoint can
+        take longer to return for that provider. Success responses carry the
+        `X-OmniRoute-*` cost-telemetry headers.
       security:
         - BearerAuth: []
       requestBody:
@@ -5554,6 +7369,12 @@ paths:
               properties:
                 model:
                   type: string
+                  description: >-
+                    `provider/model` id or bare model id. Registered ids:
+                    `mistral/mistral-ocr-latest`,
+                    `azure-document-intelligence/prebuilt-read`,
+                    `vertex-deepseek-ocr/deepseek-ocr-maas`. Defaults to
+                    `mistral-ocr-latest` when omitted.
                 document:
                   type: object
       responses:
@@ -5596,6 +7417,145 @@ paths:
           description: English translation of the audio.
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/v1/voices:
+    get:
+      tags: [Audio]
+      summary: List ElevenLabs voices
+      description: >-
+        Proxies `GET https://api.elevenlabs.io/v1/voices` using the stored
+        `elevenlabs` provider credentials (the caller never sends `xi-api-key`).
+        The incoming query string is forwarded unchanged.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: ElevenLabs voice list, relayed verbatim.
+        "401":
+          description: No usable `elevenlabs` credential is configured.
+        "429":
+          description: Every configured `elevenlabs` credential is rate limited.
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/v1/speech-to-text:
+    post:
+      tags: [Audio]
+      summary: ElevenLabs speech-to-text
+      description: >-
+        Streams the request body to `POST https://api.elevenlabs.io/v1/speech-to-text`
+        using the stored `elevenlabs` provider credentials. `content-type` and
+        `accept` are forwarded; the upstream body is relayed unchanged.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: Transcription payload, relayed verbatim from ElevenLabs.
+        "401":
+          description: No usable `elevenlabs` credential is configured.
+        "429":
+          description: Every configured `elevenlabs` credential is rate limited.
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/v1/text-to-speech/{voiceId}:
+    post:
+      tags: [Audio]
+      summary: ElevenLabs text-to-speech
+      description: >-
+        Streams the request body to
+        `POST https://api.elevenlabs.io/v1/text-to-speech/{voiceId}` using the stored
+        `elevenlabs` provider credentials. `voiceId` must match `^[A-Za-z0-9_-]+$`
+        or the request is rejected with 400 before any upstream call.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: voiceId
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[A-Za-z0-9_-]+$"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                text:
+                  type: string
+      responses:
+        "200":
+          description: Audio stream, relayed verbatim from ElevenLabs.
+        "400":
+          description: Invalid ElevenLabs voice ID.
+        "401":
+          description: No usable `elevenlabs` credential is configured.
+        "429":
+          description: Every configured `elevenlabs` credential is rate limited.
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/v1/explain/routing:
+    get:
+      tags: [Telemetry]
+      summary: Routing explainability snapshot
+      description: >-
+        Returns the most recent routing events (bounded in-memory ring buffer) plus
+        the per-provider/model quality snapshot from `open-sse/services/routing`.
+        Routing metadata only — never prompts, bodies, headers or credentials.
+        Auth mirrors `/api/v1/combos`: a valid Bearer API key or a dashboard
+        session; with `REQUIRE_API_KEY=false` anonymous reads are allowed.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Events/quality rows to return; clamped to 1–500 (default 50).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 50
+      responses:
+        "200":
+          description: Routing explain payload.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object:
+                    type: string
+                    enum: [routing_explain]
+                  sinks:
+                    type: array
+                    items:
+                      type: string
+                  otelEnabled:
+                    type: boolean
+                  events:
+                    type: array
+                    items:
+                      type: object
+                  quality:
+                    type: array
+                    items:
+                      type: object
+                  otel:
+                    type: object
         "401":
           $ref: "#/components/responses/Unauthorized"
         "500":
@@ -5748,12 +7708,18 @@ components:
     BearerAuth:
       type: http
       scheme: bearer
-      description: API key obtained from the OmniRoute dashboard
+      description: >
+        Two bearer families are accepted. Inference API keys (typically `sk-…`)
+        authorize `/v1/*`. Management routes also accept `oma_live_…` Access Tokens
+        (Settings → Access Tokens / `omniroute connect`) and API keys whose metadata
+        includes `manage` or `admin` scope. See docs/guides/MANAGEMENT-AUTH.md.
+        Bearer credentials are accepted on management routes that use this scheme;
+        they are not rejected solely for being Bearer.
     ManagementSessionAuth:
       type: apiKey
       in: cookie
       name: auth_token
-      description: Dashboard management session cookie for protected management routes
+      description: Dashboard management session cookie (auth_token) for protected management routes. Distinct from Bearer Access Tokens and API keys. See docs/guides/MANAGEMENT-AUTH.md.
 
   parameters:
     ResourceId:
@@ -5837,6 +7803,73 @@ components:
             requestId: 0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d
 
   schemas:
+    ExclusiveConnectionLeaseLifecycle:
+      type: object
+      required: [state, generation, acquiredAt, renewedAt, expiresAt]
+      properties:
+        state: { type: string, enum: [ACTIVE, RELEASED] }
+        generation: { type: integer, minimum: 1 }
+        acquiredAt: { type: string, format: date-time }
+        renewedAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+    ExclusiveConnectionLeaseCapacity:
+      type: object
+      required: [state, error, reason, retryAfter, eligibleCount, freeCount]
+      properties:
+        state: { type: string, const: WAITING_FOR_CAPACITY }
+        error:
+          type: object
+          required: [type, code, message]
+          properties:
+            type: { type: string, const: lease_error }
+            code: { type: string, const: LEASE_CAPACITY_UNAVAILABLE }
+            message: { type: string }
+        reason: { type: string, const: NO_FREE_ELIGIBLE_CONNECTION }
+        retryAfter: { type: integer, minimum: 1, maximum: 3600 }
+        eligibleCount: { type: integer, minimum: 0 }
+        freeCount: { type: integer, minimum: 0 }
+    EmbeddingMultimodalItem:
+      oneOf:
+        - type: object
+          required: [type, text]
+          properties:
+            type:
+              type: string
+              const: text
+            text:
+              type: string
+              minLength: 1
+        - type: object
+          required: [type, source]
+          properties:
+            type:
+              type: string
+              enum: [image, audio, video, document]
+            source:
+              oneOf:
+                - type: object
+                  required: [type, url]
+                  properties:
+                    type:
+                      type: string
+                      const: url
+                    url:
+                      type: string
+                      format: uri
+                      description: Public HTTPS URL.
+                - type: object
+                  required: [type, data, media_type]
+                  properties:
+                    type:
+                      type: string
+                      const: base64
+                    data:
+                      type: string
+                      format: byte
+                    media_type:
+                      type: string
+      description: Provider-neutral structured embedding input item.
+
     PlaygroundPreset:
       type: object
       required:
@@ -7066,6 +9099,66 @@ components:
         owned_by:
           type: string
 
+    ProxySubscription:
+      type: object
+      description: >-
+        An operator-supplied proxy subscription link (Karing-style). `url` is
+        redacted (credentials stripped) whenever the record is returned by the API.
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        url:
+          type: string
+          description: >-
+            Redacted subscription URL. May be a local/loopback address
+            (e.g. `http://127.0.0.1:8080/list`) — local-first fetch targets
+            are allowed by default (`OMNIROUTE_ALLOW_LOCAL_PROVIDER_URLS`);
+            cloud-metadata / link-local endpoints (169.254.0.0/16) are always
+            blocked.
+        enabled:
+          type: boolean
+        mode:
+          type: string
+          enum: [global, rule]
+        ruleProviders:
+          type: array
+          items:
+            type: string
+          nullable: true
+        localCoreEndpoint:
+          type: string
+          nullable: true
+        updateIntervalMinutes:
+          type: integer
+        lastFetchedAt:
+          type: string
+          format: date-time
+          nullable: true
+        status:
+          type: string
+          enum: [ok, error, empty]
+        error:
+          type: string
+          nullable: true
+        lastNodes:
+          type: array
+          items: {}
+          nullable: true
+        lastErrorAt:
+          type: string
+          format: date-time
+          nullable: true
+        consecutiveFailures:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
     ProviderConnection:
       type: object
       properties:
@@ -7131,12 +9224,20 @@ components:
 
     ComboCreate:
       type: object
-      required: [name, model]
+      required: [name, models]
       properties:
         name:
           type: string
-        model:
-          type: string
+        models:
+          type: array
+          minItems: 1
+          items:
+            oneOf:
+              - type: string
+                description: "provider/model reference"
+              - type: object
+                description: "structured combo step (provider, model, weight, ...)"
+                additionalProperties: true
         strategy:
           type: string
           enum:
@@ -7158,14 +9259,3 @@ components:
             - context-optimized
             - fusion
           default: priority
-        nodes:
-          type: array
-          items:
-            type: object
-            properties:
-              connectionId:
-                type: string
-              weight:
-                type: integer
-              priority:
-                type: integer

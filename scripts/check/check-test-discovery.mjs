@@ -92,6 +92,9 @@ export const COLLECTORS = [
   { glob: "tests/integration/combo-matrix/*.test.ts", sources: ["package.json"] },
   // Node native runner — test:combo:live (gated real-upstream smoke; RUN_COMBO_LIVE=1 + VPS creds)
   { glob: "tests/integration/combo-live/*.live.test.ts", sources: ["package.json"] },
+  // Node native runner — test:boundary:live (gated real-upstream smoke; RUN_BOUNDARY_LIVE=1,
+  // hits omniroute.vhost2.harre.dynv6.net — never runs unopted in CI)
+  { glob: "tests/boundary/*.live.test.ts", sources: ["package.json"] },
   // Node native runner — test:system
   { glob: "tests/e2e/system-failover.test.ts", sources: ["package.json"] },
   // vitest.mcp.config.ts — test:vitest
@@ -104,17 +107,49 @@ export const COLLECTORS = [
     glob: "open-sse/services/__tests__/antigravity-quota-family.test.ts",
     sources: ["vitest.mcp.config.ts"],
   },
+  // #8890 landed this suite here without wiring a runner, so it had never run once.
+  {
+    glob: "open-sse/services/__tests__/fail-fast-concurrency-gate.test.ts",
+    sources: ["vitest.mcp.config.ts"],
+  },
   { glob: "tests/unit/autoCombo/**/*.test.ts", sources: ["vitest.mcp.config.ts"] },
+  { glob: "src/lib/memory/__tests__/generic-backend.test.ts", sources: ["vitest.mcp.config.ts"] },
   { glob: "tests/unit/encryption.spec.ts", sources: ["vitest.mcp.config.ts"] },
   { glob: "src/shared/components/**/*.test.tsx", sources: ["vitest.mcp.config.ts"] },
   { glob: "src/shared/hooks/__tests__/**/*.test.tsx", sources: ["vitest.mcp.config.ts"] },
   { glob: "src/app/(dashboard)/**/__tests__/**/*.test.tsx", sources: ["vitest.mcp.config.ts"] },
-  // vitest.config.ts via test:vitest:ui (roda com path-filter `tests/unit/ui`, então o
-  // conjunto EFETIVO é a interseção do include `tests/unit/**/*.test.tsx` com o filtro)
+  // vitest.config.ts via test:vitest:ui. The script uses the config-wide include list.
   {
-    glob: "tests/unit/ui/**/*.test.tsx",
+    glob: "tests/unit/**/*.test.tsx",
     sources: ["package.json", "vitest.config.ts"],
-    anchors: { "package.json": "tests/unit/ui", "vitest.config.ts": "tests/unit/**/*.test.tsx" },
+    anchors: { "package.json": "test:vitest:ui", "vitest.config.ts": "tests/unit/**/*.test.tsx" },
+  },
+  // vitest.config.ts include — open-sse/__tests__ files collected by vitest.config.ts.
+  // These were previously listed as orphans because the COLLECTORS only modelled the
+  // tests/unit/**/*.test.tsx include; the open-sse globs were missing. Both the top-level
+  // glob and the more-specific services sub-path glob from vitest.config.ts are listed so
+  // the drift-check anchors remain exact matches to the config file text.
+  {
+    glob: "open-sse/**/__tests__/**/*.test.ts",
+    sources: ["vitest.config.ts"],
+    anchors: { "vitest.config.ts": "open-sse/**/__tests__/**/*.test.ts" },
+  },
+  // vitest.config.ts include — src/lib/memory and src/lib/skills __tests__ collected by vitest.config.ts.
+  {
+    glob: "src/lib/memory/__tests__/**/*.test.ts",
+    sources: ["vitest.config.ts"],
+    anchors: { "vitest.config.ts": "src/lib/memory/__tests__/**/*.test.ts" },
+  },
+  {
+    glob: "src/lib/skills/__tests__/**/*.test.ts",
+    sources: ["vitest.config.ts"],
+    anchors: { "vitest.config.ts": "src/lib/skills/__tests__/**/*.test.ts" },
+  },
+  // vitest.config.ts include — single-file entry for the .test.ts encryption file.
+  {
+    glob: "tests/unit/encryption.test.ts",
+    sources: ["vitest.config.ts"],
+    anchors: { "vitest.config.ts": "tests/unit/encryption.test.ts" },
   },
   // Playwright — test:e2e (o script passa tests/e2e/*.spec.ts; testMatch **/*.spec.ts)
   { glob: "tests/e2e/*.spec.ts", sources: ["package.json"] },
@@ -123,6 +158,13 @@ export const COLLECTORS = [
   {
     glob: "tests/e2e/protocol-clients.test.ts",
     sources: ["scripts/dev/run-protocol-clients-tests.mjs"],
+  },
+  // Playwright — suíte de homologação real (npm run homolog, L4 UI): run.mjs invoca
+  // `playwright test -c tests/homolog/ui/playwright.config.ts` (testMatch **/*.spec.ts).
+  {
+    glob: "tests/homolog/ui/*.spec.ts",
+    sources: ["scripts/homolog/run.mjs"],
+    anchors: { "scripts/homolog/run.mjs": "tests/homolog/ui/playwright.config.ts" },
   },
 ];
 

@@ -12,7 +12,10 @@ import {
   hasSelfUsageScope,
   normalizeSelfServiceScopesForCreate,
 } from "../../src/shared/constants/selfServiceScopes.ts";
-import { createKeySchema, updateKeyPermissionsSchema } from "../../src/shared/validation/schemas.ts";
+import {
+  createKeySchema,
+  updateKeyPermissionsSchema,
+} from "../../src/shared/validation/schemas.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -42,6 +45,30 @@ test("api key validation accepts more than sixteen scopes", () => {
 
   assert.equal(createKeySchema.safeParse({ name: "heavy-scope-key", scopes }).success, true);
   assert.equal(updateKeyPermissionsSchema.safeParse({ scopes }).success, true);
+});
+
+test("lease scope requires an explicit non-empty connection allowlist", () => {
+  const connection = "00000000-0000-4000-8000-000000000001";
+  assert.equal(
+    createKeySchema.safeParse({ name: "invalid managed key", scopes: ["lease:exclusive"] }).success,
+    false
+  );
+  // Partial PATCH validity depends on the authoritative stored-row + mutation check.
+  assert.equal(updateKeyPermissionsSchema.safeParse({ scopes: ["lease:exclusive"] }).success, true);
+  assert.equal(
+    updateKeyPermissionsSchema.safeParse({
+      scopes: ["lease:exclusive"],
+      allowedConnections: [],
+    }).success,
+    false
+  );
+  assert.equal(
+    updateKeyPermissionsSchema.safeParse({
+      scopes: ["lease:exclusive"],
+      allowedConnections: [connection],
+    }).success,
+    true
+  );
 });
 
 test("api key create route normalizes omitted scopes to self-service usage", () => {

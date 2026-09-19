@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
 import {
@@ -6,9 +6,15 @@ import {
   resolveKiroRegion,
   buildKiroModelsEndpoints,
   fetchKiroAvailableModels,
+  clearKiroModelCache,
+  isObsoleteKiroModelAlias,
 } from "../../open-sse/services/kiroModels.ts";
 
-const FALLBACK = [{ id: "auto-kiro", name: "Auto" }, { id: "claude-sonnet-4.6" }];
+const FALLBACK = [{ id: "claude-sonnet-4.5" }, { id: "deepseek-3.2" }];
+
+beforeEach(() => {
+  clearKiroModelCache();
+});
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -33,6 +39,82 @@ test("parseKiroModels reads CodeWhisperer ListAvailableModels shape", () => {
   );
   assert.equal(models[1].name, "Claude Sonnet 4.6");
   assert.equal(models[0].owned_by, "kiro");
+});
+
+test("parseKiroModels preserves live prompt-caching capability metadata", () => {
+  const [model] = parseKiroModels({
+    models: [
+      {
+        modelId: "claude-sonnet-4.5",
+        modelName: "Claude Sonnet 4.5",
+        promptCaching: {
+          supportsPromptCaching: true,
+          minimumTokensPerCacheCheckpoint: 1024,
+          maximumCacheCheckpointsPerRequest: 4,
+        },
+      },
+    ],
+  });
+
+  assert.deepEqual(model.promptCaching, {
+    supportsPromptCaching: true,
+    minimumTokensPerCacheCheckpoint: 1024,
+    maximumCacheCheckpointsPerRequest: 4,
+  });
+});
+
+test("parseKiroModels keeps nonnumeric prompt-caching limits unknown", () => {
+  const [model] = parseKiroModels({
+    models: [
+      {
+        modelId: "claude-sonnet-4.5",
+        promptCaching: {
+          supportsPromptCaching: true,
+          minimumTokensPerCacheCheckpoint: null,
+          maximumCacheCheckpointsPerRequest: false,
+        },
+      },
+    ],
+  });
+
+  assert.deepEqual(model.promptCaching, {
+    supportsPromptCaching: true,
+    minimumTokensPerCacheCheckpoint: null,
+    maximumCacheCheckpointsPerRequest: null,
+  });
+});
+
+test("fetchKiroAvailableModels carries upstream prompt-caching metadata to model variants", async () => {
+  const fetchImpl = (async () =>
+    jsonResponse({
+      models: [
+        {
+          modelId: "claude-sonnet-4.5",
+          promptCaching: {
+            supportsPromptCaching: true,
+            minimumTokensPerCacheCheckpoint: 1024,
+            maximumCacheCheckpointsPerRequest: 4,
+          },
+        },
+      ],
+    })) as unknown as typeof fetch;
+
+  const result = await fetchKiroAvailableModels({
+    accessToken: "tok",
+    providerSpecificData: {},
+    fetchImpl,
+    fallbackModels: FALLBACK,
+  });
+
+  assert.ok(result.models.length >= 1);
+  for (const model of result.models) {
+    assert.equal(model.upstreamModelId, "claude-sonnet-4.5");
+    assert.deepEqual(model.promptCaching, {
+      supportsPromptCaching: true,
+      minimumTokensPerCacheCheckpoint: 1024,
+      maximumCacheCheckpointsPerRequest: 4,
+    });
+  }
 });
 
 test("resolveKiroRegion prefers stored region, then profileArn, else us-east-1", () => {
@@ -133,6 +215,58 @@ test("fetchKiroAvailableModels: retries with profileArn when origin-only fails",
   assert.ok(calls[1].includes("profileArn=arn%3Aaws%3Acodewhisperer"));
 });
 
+test("fetchKiroAvailableModels only exposes a functional Thinking alias", async () => {
+  const fetchImpl = (async () =>
+    jsonResponse({
+      models: [
+        { modelId: "claude-sonnet-5" },
+        { modelId: "claude-sonnet-4.5" },
+        { modelId: "deepseek-3.2" },
+      ],
+    })) as unknown as typeof fetch;
+
+  const result = await fetchKiroAvailableModels({
+    accessToken: "tok",
+    providerSpecificData: { authMethod: "builder-id" },
+    fetchImpl,
+  });
+
+  assert.deepEqual(
+    result.models.map((model) => model.id),
+    ["claude-sonnet-5", "claude-sonnet-5-thinking", "claude-sonnet-4.5", "deepseek-3.2"]
+  );
+});
+
+test("isObsoleteKiroModelAlias filters stale cached aliases", () => {
+  assert.equal(isObsoleteKiroModelAlias("auto-kiro"), true);
+  assert.equal(isObsoleteKiroModelAlias("claude-sonnet-5-agentic"), true);
+  assert.equal(isObsoleteKiroModelAlias("claude-sonnet-4.5-thinking"), true);
+  assert.equal(isObsoleteKiroModelAlias("claude-sonnet-5-thinking"), false);
+  assert.equal(isObsoleteKiroModelAlias("claude-sonnet-4.5"), false);
+});
+
+test("fetchKiroAvailableModels sends auth-method headers for API key and External IdP", async () => {
+  const seen: Array<Headers> = [];
+  const fetchImpl = (async (_url: string, init?: RequestInit) => {
+    seen.push(new Headers(init?.headers));
+    return jsonResponse({ models: [{ modelId: "claude-sonnet-5" }] });
+  }) as unknown as typeof fetch;
+
+  await fetchKiroAvailableModels({
+    accessToken: "api-key",
+    providerSpecificData: { authMethod: "api_key", clientId: "api-client" },
+    fetchImpl,
+  });
+  await fetchKiroAvailableModels({
+    accessToken: "external-token",
+    providerSpecificData: { authMethod: "external_idp", clientId: "external-client" },
+    fetchImpl,
+  });
+
+  assert.equal(seen[0].get("tokentype"), "API_KEY");
+  assert.equal(seen[1].get("tokentype"), "EXTERNAL_IDP");
+});
+
 test("fetchKiroAvailableModels: falls back to static catalog when no token", async () => {
   const result = await fetchKiroAvailableModels({
     accessToken: "",
@@ -142,7 +276,7 @@ test("fetchKiroAvailableModels: falls back to static catalog when no token", asy
   assert.equal(result.source, "fallback");
   assert.deepEqual(
     result.models.map((m) => m.id),
-    ["auto-kiro", "claude-sonnet-4.6"]
+    ["claude-sonnet-4.5", "deepseek-3.2"]
   );
 });
 
@@ -158,6 +292,6 @@ test("fetchKiroAvailableModels: falls back when every upstream attempt fails", a
   assert.equal(result.source, "fallback");
   assert.deepEqual(
     result.models.map((m) => m.id),
-    ["auto-kiro", "claude-sonnet-4.6"]
+    ["claude-sonnet-4.5", "deepseek-3.2"]
   );
 });

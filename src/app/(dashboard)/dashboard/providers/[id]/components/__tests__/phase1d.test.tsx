@@ -119,6 +119,31 @@ describe("phase-1d extractions (#3501)", () => {
     expect(c).toBeDefined();
   });
 
+  it("ConnectionRow toggles Provider Quota visibility", () => {
+    const onToggleQuotaVisibility = vi.fn();
+    const c = renderComponent(
+      <ConnectionRow
+        connection={{ id: "conn-quota", name: "Hidden quota", quotaVisible: false }}
+        isOAuth={false}
+        isFirst={true}
+        isLast={true}
+        onMoveUp={vi.fn()}
+        onMoveDown={vi.fn()}
+        onToggleActive={vi.fn()}
+        onToggleRateLimit={vi.fn()}
+        onToggleQuotaVisibility={onToggleQuotaVisibility}
+        onRetest={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+      />
+    );
+
+    const button = c.querySelector('button[aria-pressed="false"]') as HTMLButtonElement;
+    expect(button).not.toBeNull();
+    act(() => button.click());
+    expect(onToggleQuotaVisibility).toHaveBeenCalledWith(true);
+  });
+
   it("ConnectionRow renders cooldown badge when rateLimitedUntil is in the future", () => {
     const conn = {
       id: "conn-3",
@@ -152,6 +177,8 @@ describe("phase-1d extractions (#3501)", () => {
     const c = renderComponent(
       <ModelCompatPopover
         t={(k: string) => k}
+        providerId="openai"
+        modelId="gpt-test"
         effectiveModelNormalize={() => false}
         effectiveModelPreserveDeveloper={() => true}
         getUpstreamHeadersRecord={() => ({})}
@@ -165,6 +192,8 @@ describe("phase-1d extractions (#3501)", () => {
     const c = renderComponent(
       <ModelCompatPopover
         t={(k: string) => k}
+        providerId="openai"
+        modelId="gpt-test"
         effectiveModelNormalize={() => true}
         effectiveModelPreserveDeveloper={() => false}
         getUpstreamHeadersRecord={() => ({ "X-Custom": "value" })}
@@ -180,22 +209,14 @@ describe("phase-1d extractions (#3501)", () => {
 
   it("SiliconFlowEndpointModal mounts when isOpen=false (renders nothing visible)", () => {
     const c = renderComponent(
-      <SiliconFlowEndpointModal
-        isOpen={false}
-        onSelect={vi.fn()}
-        onClose={vi.fn()}
-      />
+      <SiliconFlowEndpointModal isOpen={false} onSelect={vi.fn()} onClose={vi.fn()} />
     );
     expect(c).toBeDefined();
   });
 
   it("SiliconFlowEndpointModal mounts when isOpen=true without throwing", () => {
     const c = renderComponent(
-      <SiliconFlowEndpointModal
-        isOpen={true}
-        onSelect={vi.fn()}
-        onClose={vi.fn()}
-      />
+      <SiliconFlowEndpointModal isOpen={true} onSelect={vi.fn()} onClose={vi.fn()} />
     );
     expect(c).toBeDefined();
   });

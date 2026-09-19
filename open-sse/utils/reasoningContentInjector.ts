@@ -1,5 +1,6 @@
 /**
- * Thinking-mode upstreams (DeepSeek V4 Flash, Kimi, MiniMax, ...) require
+ * Thinking-mode upstreams (DeepSeek V4 Flash, Kimi, MiniMax, xiaomi-tokenplan
+ * mimo, ...) require
  * `reasoning_content` to be echoed back on every assistant message in the
  * conversation history. Standard OpenAI clients do not preserve that field
  * across turns, so we inject a non-empty placeholder before forwarding.
@@ -26,11 +27,46 @@ const THINKING_MODEL_PATTERNS: RegExp[] = [
   /\bkimi\b/i,
   /\bk2\b/i, // moonshot kimi k2 family alias
   /\bminimax\b/i,
+  /\bmimo\b/i, // xiaomi-tokenplan mimo family (e.g. xiaomi-tokenplan/mimo-v2.5-pro)
 ];
+const K3_AUTHENTIC_REASONING_PATTERN = /(?:^|\/)(?:kimi-)?k3(?:$|-)/i;
+const NATIVE_K27_AUTHENTIC_REASONING_PATTERN = /(?:^|\/)kimi-k2\.7-code(?:$|-)/i;
+
+/**
+ * K3 requires authentic reasoning regardless of which provider serves it.
+ * Native Moonshot K2.7 retains the same preserved-thinking contract. Empty
+ * protocol markers remain valid only after client content and replay miss.
+ */
+export function requiresAuthenticReasoningContent(provider: unknown, model: unknown): boolean {
+  const normalizedModel = String(model ?? "").trim();
+  if (K3_AUTHENTIC_REASONING_PATTERN.test(normalizedModel)) return true;
+
+  const normalizedProvider = String(provider ?? "")
+    .trim()
+    .toLowerCase();
+  return (
+    (normalizedProvider === "moonshot" || normalizedProvider === "kimi") &&
+    NATIVE_K27_AUTHENTIC_REASONING_PATTERN.test(normalizedModel)
+  );
+}
 
 export function isThinkingMessageModel(model: string | undefined | null): boolean {
   if (!model || typeof model !== "string") return false;
   return THINKING_MODEL_PATTERNS.some((re) => re.test(model));
+}
+
+export function shouldInjectReasoningContentPlaceholder(
+  provider: unknown,
+  model: string | undefined | null
+): boolean {
+  const normalizedProvider = String(provider ?? "")
+    .trim()
+    .toLowerCase();
+  return (
+    (normalizedProvider === "moonshot" || normalizedProvider === "kimi") &&
+    !requiresAuthenticReasoningContent(normalizedProvider, model) &&
+    isThinkingMessageModel(model)
+  );
 }
 
 function hasNonEmptyReasoningContent(message: JsonRecord): boolean {

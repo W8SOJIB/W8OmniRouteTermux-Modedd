@@ -3,6 +3,7 @@ import { parseSSEDataPayload } from "./streamHelpers.ts";
 import {
   backfillResponsesCompletedOutput,
   normalizeResponsesSseIds,
+  normalizeResponsesCompletedUsage,
   pushUniqueResponsesOutputItems,
   stringifyIdValue,
   stripResponsesLifecycleEcho,
@@ -30,6 +31,7 @@ export type PassthroughTailProcessorContext = {
   emitConvertedOutput: (output: string) => void;
   pushProviderPayload: (payload: unknown) => void;
   pushClientPayload: (payload: unknown) => void;
+  sanitizeUsagePayload: (payload: unknown) => boolean;
   setPassthroughResponsesId: (value: string) => void;
   setUsage: (value: unknown) => void;
   addTotalContentLength: (value: number) => void;
@@ -37,7 +39,6 @@ export type PassthroughTailProcessorContext = {
   appendPassthroughReasoning: (value: string) => void;
   getResponsesReasoningKey: (payload: Record<string, unknown>) => string | null;
   markResponsesReasoningSummarySeen: (key: string) => void;
-  ensureVisibleResponsesReasoningSummary: (payload: Record<string, unknown>) => boolean;
   emitSyntheticResponsesReasoningSummary: (payload: Record<string, unknown>) => void;
   passthroughResponsesOutputItems: unknown[];
   passthroughResponsesPendingFunctionCalls: Map<string, JsonRecord>;
@@ -45,6 +46,7 @@ export type PassthroughTailProcessorContext = {
   setPassthroughResponsesCurrentFunctionCallKey: (value: string | null) => void;
   hasPassthroughToolCalls: () => boolean;
   toResponsesCompletedWithToolCalls: (parsed: JsonRecord) => JsonRecord;
+  restoreOpenAIToolNames: (parsed: JsonRecord) => boolean;
 };
 
 function asRecord(value: unknown): JsonRecord {
@@ -136,12 +138,8 @@ function handleResponsesTailPayload(
     }
   }
   if (parsed.type === "response.output_item.done" && parsed.item) {
-    const reasoningSummaryInjected = context.ensureVisibleResponsesReasoningSummary(parsed);
     context.emitSyntheticResponsesReasoningSummary(parsed);
     pushUniqueResponsesOutputItems(context.passthroughResponsesOutputItems, [parsed.item]);
-    if (reasoningSummaryInjected) {
-      output = `data: ${JSON.stringify(parsed)}\n\n`;
-    }
     const item = asRecord(parsed.item);
     if (item.type === "function_call") {
       const pendingKey = getFunctionCallPendingKey(item);
@@ -179,13 +177,20 @@ function handleResponsesTailPayload(
   const outputPayload = textualToolCallBackfilled
     ? context.toResponsesCompletedWithToolCalls(parsed)
     : parsed;
+  const usageNormalized = normalizeResponsesCompletedUsage(outputPayload);
   const stripped = stripResponsesLifecycleEcho(outputPayload);
   const backfilled = backfillResponsesCompletedOutput(
     outputPayload,
     context.passthroughResponsesOutputItems
   );
 
-  if (stripped || backfilled || textualToolCallBackfilled || responsesIdsNormalized) {
+  if (
+    stripped ||
+    backfilled ||
+    textualToolCallBackfilled ||
+    responsesIdsNormalized ||
+    usageNormalized
+  ) {
     output = `data: ${JSON.stringify(outputPayload)}\n\n`;
   }
 
@@ -280,6 +285,9 @@ export function processBufferedPassthroughLine(
     }
 
     const parsed = parsedPassthroughData as JsonRecord;
+    if (context.sanitizeUsagePayload(parsed)) {
+      output = `data: ${JSON.stringify(parsed)}\n\n`;
+    }
     const parsedType = typeof parsed.type === "string" ? parsed.type : "";
     const isResponses = parsedType.startsWith("response.");
     const isClaude = context.isClaudeEventPayload(parsed);
@@ -287,7 +295,9 @@ export function processBufferedPassthroughLine(
     if (isResponses) {
       output = handleResponsesTailPayload(parsed, output, context);
     } else if (!isClaude) {
+      const restoredToolName = context.restoreOpenAIToolNames(parsed);
       handleOpenAiTailPayload(parsed, context);
+      if (restoredToolName) output = `data: ${JSON.stringify(parsed)}\n\n`;
     }
 
     context.pushClientPayload(parsed);

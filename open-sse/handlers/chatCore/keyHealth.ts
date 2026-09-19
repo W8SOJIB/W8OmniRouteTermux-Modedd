@@ -31,10 +31,22 @@ type KeyHealthLog = {
 export function recordKeyHealthStatus(
   status: number,
   creds: Record<string, unknown> | null | undefined,
-  log?: KeyHealthLog
+  log?: KeyHealthLog,
+  transport?: string
 ): void {
+  // CLIProxyAPI owns a shared external credential pool. Its auth failures cannot be
+  // attributed to the native OmniRoute connection selected before proxy dispatch.
+  if (transport === "cliproxyapi") return;
+
   const connId = creds?.connectionId as string | undefined;
   if (!connId) return;
+
+  // #9827: a keyless (noauth) connection has no key to fail. Upstream 401s on
+  // the anonymous path (e.g. Pollinations premium models that require a key)
+  // must not poison the connection's key-health state — doing so flips the whole
+  // anonymous pool to "all accounts unavailable". Mirrors the cliproxyapi guard
+  // above: there is nothing to record when no key material exists.
+  if (!creds?.apiKey && !creds?.accessToken) return;
 
   const psd = creds.providerSpecificData as Record<string, unknown> | undefined;
   const extraKeys = (psd?.extraApiKeys as string[] | undefined) ?? [];

@@ -10,7 +10,7 @@
  * .next/standalone -> outDir (cp)                              Y               Y           Y    SHARED
  * .next/static -> outDir/.next/static (cp)                    Y               Y           Y    SHARED
  * public/ -> outDir/public/ (cp)                              Y               Y           Y    SHARED
- * wreq-js/rust -> outDir/node_modules/wreq-js/rust            Y               -           -    SHARED (native asset)
+ * wreq-js -> outDir/node_modules/wreq-js                     Y               Y           Y    SHARED (extra module)
  * better-sqlite3/build -> outDir/node_modules/better-sqlite3/ Y               -           -    SHARED (native asset)
  * @swc/helpers -> outDir/node_modules/@swc/helpers             Y               Y           Y    SHARED (extra module)
  * pino-abstract-transport -> outDir/node_modules/...          Y               -           -    SHARED (extra module)
@@ -22,6 +22,7 @@
  * scripts/dev/standalone-server-ws.mjs -> outDir/server-ws    Y               Y           -    SHARED (extra module)
  * scripts/dev/peer-stamp.mjs -> outDir/peer-stamp.mjs         Y               Y           -    SHARED (extra module)
  * scripts/dev/responses-ws-proxy.mjs -> outDir/responses-ws-  Y               Y           -    SHARED (extra module)
+ * scripts/dev/head-response-guard.cjs -> outDir/head-respons  Y               Y           -    SHARED (extra module)
  * scripts/build/runtime-env.mjs -> outDir/build/runtime-env   Y               -           -    SHARED (extra module)
  * scripts/build/bootstrap-env.mjs -> outDir/build/bootstrap-  Y               -           -    SHARED (extra module)
  * scripts/dev/healthcheck.mjs -> outDir/healthcheck.mjs       Y               -           -    SHARED (extra module)
@@ -38,7 +39,8 @@
  * prune + validate (pack-artifact-policy)                      -               Y           -    UNIQUE (prepublish)
  * data/ dir creation                                           -               Y           -    UNIQUE (prepublish)
  * --- electron-UNIQUE ---
- * better-sqlite3 + keytar native strip (ABI rebuild)           -               -           Y    UNIQUE (electron)
+ * better-sqlite3 prebuild verify + compile-input strip          -               -           Y    UNIQUE (electron)
+ * Turbopack hashed-module symlink materialize (node_modules)   -               -           Y    SHARED (opt-in: materializeSymlinks)
  * symlink guard (assertBundleIsPackagable)                     -               -           Y    UNIQUE (electron)
  * removeGeneratedElectronArtifacts                             -               -           Y    UNIQUE (electron)
  */
@@ -46,6 +48,7 @@
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
+import { colocateLlmlinguaOptionals, SEED_PACKAGES } from "./colocateOptionals.mjs";
 
 /**
  * Check whether a path exists (async).
@@ -72,16 +75,29 @@ async function exists(targetPath) {
  * (relative to projectRoot) and destination (relative to outDir) can be joined
  * for either path/platform. @type {{label:string, src:string[], dest:string[]}[]}
  */
-const NATIVE_ASSET_ENTRIES = [
-  {
-    label: "wreq-js native runtime",
-    src: ["node_modules", "wreq-js", "rust"],
-    dest: ["node_modules", "wreq-js", "rust"],
-  },
+export const NATIVE_ASSET_ENTRIES = [
   {
     label: "better-sqlite3 native binary",
     src: ["node_modules", "better-sqlite3", "build"],
     dest: ["node_modules", "better-sqlite3", "build"],
+  },
+  {
+    label: "better-sqlite3 prebuilt native binaries",
+    src: ["node_modules", "better-sqlite3", "prebuilds"],
+    dest: ["node_modules", "better-sqlite3", "prebuilds"],
+  },
+  {
+    // onnxruntime-node's dist/binding.js dlopen()s a platform-specific
+    // libonnxruntime.so.1 shipped under bin/napi-v3/<platform>/<arch>/ — a
+    // *dynamic* native load Next.js's standalone file trace can't see (same
+    // blind spot class as the LLMLingua closure below, just for a .so instead
+    // of a JS import). Without this the standalone bundle boots with
+    // "Error: libonnxruntime.so.1: cannot open shared object file: No such
+    // file or directory" the first time transformers/llmlingua actually try
+    // to run ONNX inference.
+    label: "onnxruntime-node native binaries (libonnxruntime .so + .node addon)",
+    src: ["node_modules", "onnxruntime-node", "bin"],
+    dest: ["node_modules", "onnxruntime-node", "bin"],
   },
   {
     // TPROXY IP_TRANSPARENT addon (Fase 3 / Epic A). Built by build-tproxy-native
@@ -96,6 +112,15 @@ const NATIVE_ASSET_ENTRIES = [
 
 /** @type {{label:string, src:string[], dest:string[]}[]} */
 const EXTRA_MODULE_ENTRIES = [
+  {
+    // tlsClient.ts intentionally resolves wreq-js through a runtime-dynamic
+    // require so Turbopack cannot rewrite the package name to a hashed external.
+    // That also makes the package invisible to static tracing, so copy the whole
+    // module—not only rust/—into every standalone artifact.
+    label: "wreq-js TLS runtime",
+    src: ["node_modules", "wreq-js"],
+    dest: ["node_modules", "wreq-js"],
+  },
   {
     label: "@swc/helpers",
     src: ["node_modules", "@swc", "helpers"],
@@ -114,6 +139,25 @@ const EXTRA_MODULE_ENTRIES = [
   { label: "split2", src: ["node_modules", "split2"], dest: ["node_modules", "split2"] },
   { label: "migrations", src: ["src", "lib", "db", "migrations"], dest: ["migrations"] },
   { label: "MITM server", src: ["src", "mitm", "server.cjs"], dest: ["src", "mitm", "server.cjs"] },
+  {
+    // #9451: server.cjs requires 6 shims from ./_internal/ (bypass, ingest,
+    // forwardTarget, aliasConfig, standaloneRouting, rootCaShim) which the MITM
+    // child process loads via require(). Next.js's standalone tracer never sees
+    // them (server.cjs is a separate node process, not imported by the main
+    // server), so the _internal/ directory must be copied explicitly or the MITM
+    // child crashes with MODULE_NOT_FOUND at boot.
+    label: "MITM _internal shims (#9451)",
+    src: ["src", "mitm", "_internal"],
+    dest: ["src", "mitm", "_internal"],
+  },
+  {
+    // #9451: rootCaShim.cjs does `await import("selfsigned")` for dynamic SSL
+    // certificate generation. The MITM child is not traced by Next.js, so the
+    // package is absent from the Docker standalone bundle without this entry.
+    label: "selfsigned (MITM rootCaShim dynamic import — #9451)",
+    src: ["node_modules", "selfsigned"],
+    dest: ["node_modules", "selfsigned"],
+  },
   {
     label: "run-standalone script",
     src: ["scripts", "dev", "run-standalone.mjs"],
@@ -135,14 +179,34 @@ const EXTRA_MODULE_ENTRIES = [
     dest: ["peer-stamp.mjs"],
   },
   {
+    label: "main-server timeouts (server-ws.mjs dependency, #7003/#7065-class)",
+    src: ["scripts", "dev", "main-server-timeouts.mjs"],
+    dest: ["main-server-timeouts.mjs"],
+  },
+  {
+    label: "systemd sd_notify helper (server-ws.mjs dependency)",
+    src: ["scripts", "dev", "systemd-notify.mjs"],
+    dest: ["systemd-notify.mjs"],
+  },
+  {
     label: "HTTP method guard (server-ws.mjs dependency)",
     src: ["scripts", "dev", "http-method-guard.cjs"],
     dest: ["http-method-guard.cjs"],
   },
   {
+    label: "HEAD response guard (server-ws.mjs dependency)",
+    src: ["scripts", "dev", "head-response-guard.cjs"],
+    dest: ["head-response-guard.cjs"],
+  },
+  {
     label: "responses-ws-proxy (server-ws.mjs dependency)",
     src: ["scripts", "dev", "responses-ws-proxy.mjs"],
     dest: ["responses-ws-proxy.mjs"],
+  },
+  {
+    label: "ChatGPT Web Codex MCP tunnel entrypoint",
+    src: ["bin", "chatgpt-web-codex-mcp.mjs"],
+    dest: ["bin", "chatgpt-web-codex-mcp.mjs"],
   },
   {
     label: "webdav-handler (server-ws.mjs dependency)",
@@ -166,6 +230,21 @@ const EXTRA_MODULE_ENTRIES = [
     dest: ["build", "bootstrap-env.mjs"],
   },
   {
+    label: "normalizeBasePath helper",
+    src: ["scripts", "build", "normalizeBasePath.mjs"],
+    dest: ["build", "normalizeBasePath.mjs"],
+  },
+  {
+    label: "docker basePath entrypoint",
+    src: ["scripts", "docker", "ensure-docker-base-path.mjs"],
+    dest: ["docker", "ensure-docker-base-path.mjs"],
+  },
+  {
+    label: "docker basePath patcher",
+    src: ["scripts", "docker", "patch-standalone-base-path.mjs"],
+    dest: ["docker", "patch-standalone-base-path.mjs"],
+  },
+  {
     label: "healthcheck script",
     src: ["scripts", "dev", "healthcheck.mjs"],
     dest: ["healthcheck.mjs"],
@@ -175,6 +254,32 @@ const EXTRA_MODULE_ENTRIES = [
     label: "playwright-core (dynamic import by gemini-web executor)",
     src: ["node_modules", "playwright-core"],
     dest: ["node_modules", "playwright-core"],
+  },
+  {
+    // esbuild's `--packages=external` leaves `undici` as a static top-level ESM
+    // import in the compiled MCP server bundle (dist/open-sse/mcp-server/server.js),
+    // resolved at module-link time. Next.js's standalone output-file tracer (nft)
+    // sometimes emits a hollow dist/node_modules/undici/ (package.json only), which
+    // SHADOWS the fully-populated sibling node_modules/undici and crashes
+    // `omniroute --mcp` at startup. See #7701.
+    label: "undici (MCP server static import — #7701)",
+    src: ["node_modules", "undici"],
+    dest: ["node_modules", "undici"],
+  },
+  {
+    // Turbopack's standalone tracer can emit a hollow node_modules/ws/ directory
+    // for the externalized `ws` package (no package.json / index.js), which then
+    // shadows the real install at runtime and crashes instrumentation with:
+    // "Cannot find package '<bundle>/node_modules/ws/index.js'" (#OmniRoute v3.8.50 live bug).
+    // Overlay the full source package so the bundled server resolves the real entrypoint.
+    label: "ws (externalized runtime package shadow fix)",
+    src: ["node_modules", "ws"],
+    dest: ["node_modules", "ws"],
+  },
+  {
+    label: "sql.js WASM fallback runtime",
+    src: ["node_modules", "sql.js"],
+    dest: ["node_modules", "sql.js"],
   },
   {
     label: "sqlite-vec wrapper (vector memory - loaded at runtime via createRequire)",
@@ -197,7 +302,7 @@ const EXTRA_MODULE_ENTRIES = [
 ];
 
 /**
- * Copy native standalone assets (wreq-js rust/, better-sqlite3 build/).
+ * Copy native standalone assets (better-sqlite3 build/prebuilds and TPROXY).
  *
  * The destination is derived as <rootDir>/<distDir>/standalone/node_modules/...
  * for backward compatibility with existing callers and tests.
@@ -247,6 +352,11 @@ async function syncNativeAssetsToDir(projectRoot, outDir, fsImpl, log) {
     if (!(await exists(sourcePath))) continue;
 
     const destinationPath = path.join(outDir, ...entry.dest);
+    // See resolvesToSamePath/clearStaleDest (sync copy path, same module) — the same
+    // ERR_FS_CP_EINVAL/ERR_FS_CP_DIR_TO_NON_DIR races apply to fsImpl.cp here.
+    if (resolvesToSamePath(sourcePath, destinationPath)) continue;
+    clearStaleDest(destinationPath);
+
     const mkdir =
       typeof fsImpl.mkdir === "function" ? fsImpl.mkdir.bind(fsImpl) : fs.mkdir.bind(fs);
     await mkdir(path.dirname(destinationPath), { recursive: true });
@@ -283,6 +393,9 @@ async function syncExtraModulesToDir(projectRoot, outDir, fsImpl, log) {
     if (!(await exists(sourcePath))) continue;
 
     const destPath = path.join(outDir, ...entry.dest);
+    if (resolvesToSamePath(sourcePath, destPath)) continue;
+    clearStaleDest(destPath);
+
     const mkdir =
       typeof fsImpl.mkdir === "function" ? fsImpl.mkdir.bind(fsImpl) : fs.mkdir.bind(fs);
     await mkdir(path.dirname(destPath), { recursive: true });
@@ -431,8 +544,48 @@ function copyStaticAndPublic({ distDir, relDistDir, projectRoot, resolvedOutDir 
 }
 
 /**
- * Copy native assets (wreq-js, better-sqlite3) and extra runtime modules/sidecars
- * (pino, migrations, MITM server, helper scripts, sqlite-vec platform packages, …)
+ * Two independent copy passes assemble a bundle: the bulk "standalone -> outDir" tree
+ * copy (step 1 of assembleStandalone) can already have carried a prior entry's result
+ * into `dest` (e.g. an absolute pnpm-store symlink, or a directory) BEFORE this entry's
+ * own copy runs. `fs.cpSync`/`fs.cp` refuse to overwrite in two such cases even with
+ * `force: true`:
+ *   - dest already resolves (via symlink chain) to the exact same real path as src ->
+ *     ERR_FS_CP_EINVAL "src and dest cannot be the same".
+ *   - dest exists with a different node type than src (file/symlink vs directory) ->
+ *     ERR_FS_CP_DIR_TO_NON_DIR / ERR_FS_CP_NON_DIR_TO_DIR.
+ * Under heavy concurrent build I/O this manifested non-deterministically across
+ * different EXTRA_MODULE_ENTRIES/NATIVE_ASSET_ENTRIES on every retry. Resolve both
+ * cases up front: skip entirely when dest is already the right target, otherwise clear
+ * whatever stale node occupies dest (via lstat, so it also removes a broken symlink)
+ * so the fresh copy always lands cleanly.
+ *
+ * @param {string} src
+ * @param {string} dest
+ * @returns {boolean} true when dest already IS src's target and no copy is needed
+ */
+function resolvesToSamePath(src, dest) {
+  if (path.resolve(src) === path.resolve(dest)) return true;
+  if (!fsSync.existsSync(dest)) return false;
+  try {
+    return fsSync.realpathSync(src) === fsSync.realpathSync(dest);
+  } catch {
+    return false;
+  }
+}
+
+/** @see resolvesToSamePath — clears whatever stale node sits at `dest` before a copy. */
+function clearStaleDest(dest) {
+  try {
+    fsSync.lstatSync(dest);
+  } catch {
+    return;
+  }
+  fsSync.rmSync(dest, { recursive: true, force: true });
+}
+
+/**
+ * Copy native assets (better-sqlite3 and TPROXY) and extra runtime modules/sidecars
+ * (wreq-js, pino, migrations, MITM server, helper scripts, sqlite-vec platform packages, …)
  * into the assembled bundle. Missing sources are skipped silently.
  *
  * @param {string} projectRoot
@@ -443,6 +596,8 @@ function copyNativeAssetsAndExtraModules(projectRoot, resolvedOutDir) {
     const src = path.join(projectRoot, ...asset.src);
     if (!fsSync.existsSync(src)) continue;
     const dest = path.join(resolvedOutDir, ...asset.dest);
+    if (resolvesToSamePath(src, dest)) continue;
+    clearStaleDest(dest);
     fsSync.mkdirSync(path.dirname(dest), { recursive: true });
     fsSync.cpSync(src, dest, { recursive: true, force: true });
     console.log(`[assembleStandalone] Copied native asset: ${asset.label}`);
@@ -452,10 +607,213 @@ function copyNativeAssetsAndExtraModules(projectRoot, resolvedOutDir) {
     const src = path.join(projectRoot, ...mod.src);
     if (!fsSync.existsSync(src)) continue;
     const dest = path.join(resolvedOutDir, ...mod.dest);
+    if (resolvesToSamePath(src, dest)) continue;
+    clearStaleDest(dest);
     fsSync.mkdirSync(path.dirname(dest), { recursive: true });
     fsSync.cpSync(src, dest, { recursive: true, force: true });
     console.log(`[assembleStandalone] Synced module: ${mod.label}`);
   }
+}
+
+/**
+ * Next/Turbopack standalone output can leave behind hollow top-level package
+ * directories for externalized runtime deps (directory exists, but contains no
+ * files). Those empty placeholders shadow the real repo-level install and make
+ * runtime ESM externals fail with "Cannot find package '<bundle>/node_modules/<pkg>/index.js'"
+ * even though the dependency is present in the source tree.
+ *
+ * Repair strategy: for each empty top-level package dir already present in the
+ * assembled bundle, if the same package exists in the project root node_modules,
+ * replace the hollow directory with a full recursive copy from the source install.
+ * This keeps the fix narrowly scoped to packages the standalone already expects.
+ *
+ * @param {string} projectRoot
+ * @param {string} bundleNodeModules
+ * @returns {{repaired: number, packages: string[]}}
+ */
+function repairEmptyExternalPackageDirs(projectRoot, bundleNodeModules) {
+  const summary = { repaired: 0, packages: [] };
+  const sourceNodeModules = path.join(projectRoot, "node_modules");
+  if (!fsSync.existsSync(bundleNodeModules) || !fsSync.existsSync(sourceNodeModules)) {
+    return summary;
+  }
+
+  for (const name of fsSync.readdirSync(bundleNodeModules)) {
+    if (name.startsWith(".") || name.startsWith("@")) continue;
+
+    const bundlePkgDir = path.join(bundleNodeModules, name);
+    const sourcePkgDir = path.join(sourceNodeModules, name);
+
+    let bundleStat;
+    try {
+      bundleStat = fsSync.statSync(bundlePkgDir);
+    } catch {
+      continue;
+    }
+    if (!bundleStat.isDirectory()) continue;
+
+    let bundleEntries = [];
+    try {
+      bundleEntries = fsSync.readdirSync(bundlePkgDir);
+    } catch {
+      continue;
+    }
+    if (bundleEntries.length > 0 || !fsSync.existsSync(sourcePkgDir)) continue;
+
+    let sourceStat;
+    try {
+      sourceStat = fsSync.statSync(sourcePkgDir);
+    } catch {
+      continue;
+    }
+    if (!sourceStat.isDirectory()) continue;
+    // See resolvesToSamePath/clearStaleDest above: bundlePkgDir can itself be a
+    // symlink to sourcePkgDir's realpath whose target momentarily read as empty
+    // under heavy concurrent build I/O (a transient readdirSync race, not a real
+    // hollow placeholder), or a stale non-directory node from an earlier pass.
+    if (resolvesToSamePath(sourcePkgDir, bundlePkgDir)) continue;
+    clearStaleDest(bundlePkgDir);
+
+    fsSync.cpSync(sourcePkgDir, bundlePkgDir, { recursive: true, force: true });
+    summary.repaired += 1;
+    summary.packages.push(name);
+  }
+
+  return summary;
+}
+
+/**
+ * Materialize Turbopack "hashed external module" symlinks inside a bundled
+ * node_modules dir into real, self-contained directories.
+ *
+ * Next.js/Turbopack standalone output emits entries like
+ *   better-sqlite3-90e2652d1716b047 -> <buildMachineAbsPath>/node_modules/better-sqlite3
+ * as ABSOLUTE symlinks into the build machine's tree. cpSync preserves symlinks and
+ * electron-builder preserves extraResources symlinks verbatim, so the packaged app
+ * ships dangling links pointing at e.g. /Users/runner/work/... On the end-user machine
+ * those targets don't exist → the instrumentation hook throws
+ * ERR_MODULE_NOT_FOUND: Cannot find package 'ws-<hash>' → server boot fails.
+ * (issues #6724, #6594). Windows is doubly broken because it can't follow POSIX
+ * symlinks at all.
+ *
+ * The fix: for every symlink under the given node_modules (top level + one level of
+ * scoped @scope/ dirs), replace it with a REAL directory copy of its dereferenced
+ * target — a dereference is the only option that is correct on every OS (Windows
+ * included) and survives the machine that built it. If the link is already dangling
+ * (target absent), fall back to copying a sibling real package whose name is the
+ * hashed name with its trailing `-<hex>` suffix stripped; if none exists, drop the
+ * dangling link so it cannot poison module resolution.
+ *
+ * @param {string} nodeModulesDir - absolute path to a bundled node_modules directory
+ * @returns {{ materialized: number, relinked: number, removed: number }}
+ */
+export function materializeBundledSymlinks(nodeModulesDir) {
+  const summary = { materialized: 0, relinked: 0, removed: 0 };
+  if (!fsSync.existsSync(nodeModulesDir)) return summary;
+
+  const entries = [];
+  for (const name of fsSync.readdirSync(nodeModulesDir)) {
+    const entryPath = path.join(nodeModulesDir, name);
+    if (name.startsWith("@") && fsSync.lstatSync(entryPath).isDirectory()) {
+      // Scoped packages live one level deeper (@scope/pkg).
+      for (const scoped of fsSync.readdirSync(entryPath)) {
+        entries.push(path.join(entryPath, scoped));
+      }
+      continue;
+    }
+    entries.push(entryPath);
+  }
+
+  for (const entryPath of entries) {
+    let stat;
+    try {
+      stat = fsSync.lstatSync(entryPath);
+    } catch {
+      continue;
+    }
+    if (!stat.isSymbolicLink()) continue;
+
+    let realTarget = null;
+    try {
+      realTarget = fsSync.realpathSync(entryPath);
+    } catch {
+      realTarget = null;
+    }
+
+    if (realTarget && fsSync.existsSync(realTarget)) {
+      // Dereference: copy the resolved real files in place of the link.
+      fsSync.rmSync(entryPath, { recursive: true, force: true });
+      fsSync.cpSync(realTarget, entryPath, { recursive: true, dereference: true });
+      summary.materialized += 1;
+      continue;
+    }
+
+    // Dangling link (e.g. absolute path into the build machine that no longer
+    // exists). Try a sibling real package named without the trailing -<hex> hash.
+    const baseName = path.basename(entryPath).replace(/-[0-9a-f]{8,}$/i, "");
+    const sibling = path.join(path.dirname(entryPath), baseName);
+    if (baseName !== path.basename(entryPath) && fsSync.existsSync(sibling)) {
+      let siblingStat = null;
+      try {
+        siblingStat = fsSync.lstatSync(sibling);
+      } catch {
+        siblingStat = null;
+      }
+      if (siblingStat && siblingStat.isDirectory()) {
+        fsSync.rmSync(entryPath, { recursive: true, force: true });
+        fsSync.cpSync(sibling, entryPath, { recursive: true, dereference: true });
+        summary.relinked += 1;
+        continue;
+      }
+    }
+
+    // Nothing to resolve to — drop the dangling link so it cannot shadow resolution.
+    console.warn(
+      `[assembleStandalone] Dropping dangling module symlink (target missing): ${entryPath}`
+    );
+    fsSync.rmSync(entryPath, { recursive: true, force: true });
+    summary.removed += 1;
+  }
+
+  return summary;
+}
+
+/**
+ * Sync an Electron-ABI-rebuilt native module into any hashed/plain copies of
+ * that module already materialized inside a nested node_modules dir.
+ *
+ * materializeBundledSymlinks() turns Turbopack hashed-module symlinks (e.g.
+ * `better-sqlite3-90e2652d1716b047`) into real directory copies of the
+ * Node-ABI build. A later step in prepare-electron-standalone.mjs rebuilds
+ * better-sqlite3 against the Electron ABI at the bundle root — but the
+ * hashed copy under the nested node_modules still holds the stale Node-ABI
+ * build, and the server's hashed `require("better-sqlite3-<hash>")` resolves
+ * to it, not the rebuilt root module. Previously that hashed copy was simply
+ * deleted, which caused MODULE_NOT_FOUND and a silent fallback to the sql.js
+ * WASM driver in the packaged app (issue #6794 follow-up). Overwriting each
+ * matching entry with the rebuilt root module keeps the hashed require
+ * resolving to a working, ABI-correct native driver instead.
+ *
+ * @param {string} rootModuleDir - absolute path to the already-rebuilt module (e.g. <standalone>/node_modules/better-sqlite3)
+ * @param {string} nodeModulesDir - absolute path to the nested node_modules dir to scan
+ * @returns {{ synced: number }}
+ */
+export function syncRebuiltNativeModuleIntoHashedEntries(rootModuleDir, nodeModulesDir) {
+  const summary = { synced: 0 };
+  if (!fsSync.existsSync(rootModuleDir) || !fsSync.existsSync(nodeModulesDir)) return summary;
+
+  const baseName = path.basename(rootModuleDir);
+  const pattern = new RegExp(`^${baseName}(-[0-9a-f]{8,})?$`, "i");
+
+  for (const name of fsSync.readdirSync(nodeModulesDir)) {
+    if (!pattern.test(name)) continue;
+    const entryPath = path.join(nodeModulesDir, name);
+    fsSync.rmSync(entryPath, { recursive: true, force: true });
+    fsSync.cpSync(rootModuleDir, entryPath, { recursive: true, dereference: true });
+    summary.synced += 1;
+  }
+
+  return summary;
 }
 
 /**
@@ -474,6 +832,7 @@ function copyNativeAssetsAndExtraModules(projectRoot, resolvedOutDir) {
  * @param {boolean} [opts.sanitizePaths]         - replace build-machine abs paths with "." (default false)
  * @param {boolean} [opts.patchTurbopackChunks]  - strip hashed externals from .next/server js files (default false)
  * @param {boolean} [opts.copyNatives]           - copy native assets + extra modules (default true)
+ * @param {boolean} [opts.materializeSymlinks]   - dereference Turbopack hashed-module symlinks in node_modules (default false)
  * @returns {void}
  */
 export function assembleStandalone({
@@ -483,6 +842,7 @@ export function assembleStandalone({
   sanitizePaths = false,
   patchTurbopackChunks: doPatchChunks = false,
   copyNatives = true,
+  materializeSymlinks = false,
 }) {
   if (!distDir) throw new Error("[assembleStandalone] distDir is required");
   if (!outDir) throw new Error("[assembleStandalone] outDir is required");
@@ -538,5 +898,54 @@ export function assembleStandalone({
   // 6. Optionally copy native assets + extra modules (synchronous)
   if (copyNatives) {
     copyNativeAssetsAndExtraModules(projectRoot, resolvedOutDir);
+    // Repair hollow externalized package dirs in BOTH locations Turbopack's standalone
+    // tracer can populate: the top-level bundle node_modules, and — for projects with a
+    // custom distDir (see next.config.mjs) — the nested <relDistDir>/node_modules mirrored
+    // alongside the traced server chunks. materializeBundledSymlinks (step 7 below) already
+    // treats these as two distinct targets; #9913 only covered the top-level one, which left
+    // the nested location's hollow dirs unrepaired (#7346).
+    for (const bundleNodeModules of [
+      path.join(resolvedOutDir, "node_modules"),
+      path.join(resolvedOutDir, relDistDir, "node_modules"),
+    ]) {
+      const emptyPkgRepair = repairEmptyExternalPackageDirs(projectRoot, bundleNodeModules);
+      if (emptyPkgRepair.repaired > 0) {
+        console.log(
+          `[assembleStandalone] Repaired ${emptyPkgRepair.repaired} hollow external package dir(s) in ` +
+            `${path.relative(resolvedOutDir, bundleNodeModules) || "."}: ${emptyPkgRepair.packages.join(", ")}`
+        );
+      }
+    }
+
+    // #9166: dynamically imported LLMLingua packages are not reliably traced
+    // into the standalone bundle. Copy their complete dependency closure from
+    // the installed root tree without overwriting packages already traced by
+    // Next.js. Include transformers here so its ONNX runtime closure is also
+    // guaranteed in Docker/standalone builds.
+    colocateLlmlinguaOptionals({
+      rootDir: projectRoot,
+      targetNodeModulesDir: path.join(resolvedOutDir, "node_modules"),
+      seeds: [...SEED_PACKAGES, "@huggingface/transformers"],
+      log: (message) => console.log(`[assembleStandalone] ${message.trim()}`),
+    });
+  }
+
+  // 7. Optionally dereference Turbopack hashed-module symlinks so the bundle is
+  //    self-contained (no absolute links into the build machine). Runs AFTER the
+  //    native/extra-module copy so the sibling-package relink fallback can find
+  //    real packages. See materializeBundledSymlinks + issues #6724, #6594.
+  if (materializeSymlinks) {
+    for (const nmDir of [
+      path.join(resolvedOutDir, "node_modules"),
+      path.join(resolvedOutDir, relDistDir, "node_modules"),
+    ]) {
+      const s = materializeBundledSymlinks(nmDir);
+      if (s.materialized || s.relinked || s.removed) {
+        console.log(
+          `[assembleStandalone] Materialized module symlinks in ${path.relative(resolvedOutDir, nmDir) || "."}: ` +
+            `${s.materialized} dereferenced, ${s.relinked} relinked, ${s.removed} dropped`
+        );
+      }
+    }
   }
 }

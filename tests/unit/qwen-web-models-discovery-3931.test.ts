@@ -2,16 +2,14 @@
  * TDD regression for #3931 (Problem #3, diagnosed by @thezukiru in discussion
  * #3895): the `qwen-web` cookie provider had no entry in PROVIDER_MODELS_CONFIG
  * (`src/app/api/providers/[id]/models/route.ts`), so the model-discovery page
- * returned nothing for it. The OAuth fallback at the top of the handler only
- * fires for `provider === "qwen" && authType === "oauth"`, so qwen-web fell
- * through to the no-config branch.
+ * returned nothing for it, so qwen-web fell through to the no-config branch.
  *
  * (Problem #1 — the validator bare-token false-positive — was already fixed in
  * the merged PR #3958; Problem #2 — empty stream from WAF bot-detection on the
  * streaming endpoint — is a separate upstream/stealth concern, still open.)
  *
  * Fix: add a `qwen-web` PROVIDER_MODELS_CONFIG entry pointing at the public
- * `https://chat.qwen.ai/api/v2/models` endpoint, parsing the
+ * `https://chat.qwen.ai/api/v2/models/` endpoint, parsing the
  * `{ data: { data: [{ id, name, owned_by }] } }` shape.
  */
 import test from "node:test";
@@ -29,13 +27,13 @@ const modelsRoute = await import("../../src/app/api/providers/[id]/models/route.
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
 test.after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 interface ModelsBody {
@@ -45,7 +43,7 @@ interface ModelsBody {
   source?: string;
 }
 
-const QWEN_WEB_MODELS_URL = "https://chat.qwen.ai/api/v2/models";
+const QWEN_WEB_MODELS_URL = "https://chat.qwen.ai/api/v2/models/";
 
 test("#3931 qwen-web model discovery fetches the public /api/v2/models catalog", async () => {
   await resetStorage();
@@ -83,7 +81,11 @@ test("#3931 qwen-web model discovery fetches the public /api/v2/models catalog",
     assert.equal(response.status, 200);
     const body = (await response.json()) as ModelsBody;
     assert.equal(body.provider, "qwen-web");
-    assert.equal(body.source, "api", "should serve the live qwen-web catalog, not local_catalog/empty");
+    assert.equal(
+      body.source,
+      "api",
+      "should serve the live qwen-web catalog, not local_catalog/empty"
+    );
     assert.ok(fetchedUrl, `should have probed ${QWEN_WEB_MODELS_URL}`);
     const ids = body.models.map((m) => m.id);
     assert.ok(ids.includes("qwen3-max"), `live ids missing: ${ids.join(",")}`);

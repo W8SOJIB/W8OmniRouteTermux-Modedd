@@ -10,10 +10,55 @@ import {
   decryptConnectionFields,
   migrateLegacyEncryptedString,
 } from "./encryption";
-import { invalidateDbCache } from "./readCache";
+import { createLazyRowProxy } from "./providers/lazyConnectionView";
+import { invalidateDbCache, getCachedRawProviderConnections } from "./readCache";
+import { reorderConnections } from "./providers/deletion";
+import {
+  removeConnectionHealth,
+  removeConnectionIndex,
+} from "@omniroute/open-sse/services/apiKeyRotator.ts";
+import { invalidateReasoningRoutingRuleCache } from "./reasoningRoutingRules";
 import { normalizeProviderSpecificData } from "@/lib/providers/requestDefaults";
-import { bumpProxyConfigGeneration } from "./settings";
-import { webSessionCredentialKey, parseProviderSpecificData } from "./webSessionDedup";
+import { ensureCodexFingerprintSeed } from "@omniroute/open-sse/config/codexIdentity.ts";
+import { bumpProxyConfigGeneration, getSettings } from "./settings";
+import {
+  getStoredManagementPassword,
+  isBcryptHash,
+  verifyManagementPassword,
+} from "@/lib/auth/managementPassword";
+import {
+  webSessionCredentialKey,
+  parseProviderSpecificData,
+  isMatchingOauthIdentity,
+} from "./webSessionDedup";
+import { pickCodexConnectionForUser } from "@/lib/oauth/utils/codexConnectionSelection";
+import { reconcileCodexUsageHistory } from "./providers/usageIdentityReconciliation";
+
+/**
+ * normalizeProviderSpecificData + the Codex fingerprint-seed invariant: Codex
+ * OAuth connections whose convergence mode derives account-scoped identities
+ * (device/session/full — the default session included) carry a persisted
+ * random seed (`codexFingerprintSeed`) as the derivation source. Created here
+ * at the persistence choke point so every write path (manual create, OAuth
+ * persist, edit, import) is covered; the seed is never regenerated once valid,
+ * so identities stay put across saves. Pre-seed connections rotate from the
+ * legacy connection-id derivation exactly once on their next write — the
+ * OmniRoute analog of sub2api's migration-225 backfill (v0.1.178, #5696).
+ */
+function normalizeConnectionProviderSpecificData(
+  provider: string | null,
+  providerSpecificData: unknown,
+  credentials: { accessToken?: unknown; refreshToken?: unknown },
+  existingProviderSpecificData?: unknown
+) {
+  const normalized = normalizeProviderSpecificData(provider, providerSpecificData);
+  if (provider !== "codex") return normalized;
+  return ensureCodexFingerprintSeed(
+    normalized,
+    credentials,
+    (existingProviderSpecificData as Record<string, unknown> | null) ?? null
+  );
+}
 import {
   withNullableMaxConcurrent,
   withNullableQuotaWindowThresholds,
@@ -29,6 +74,71 @@ import {
 
 type JsonRecord = Record<string, unknown>;
 
+const CONNECTION_CREDENTIAL_FIELDS = ["apiKey", "accessToken", "refreshToken", "idToken"] as const;
+
+/** Thrown when a write would store the dashboard login password as a provider credential. */
+export class ManagementPasswordAsCredentialError extends Error {
+  readonly code = "MANAGEMENT_PASSWORD_AS_CREDENTIAL" as const;
+
+  constructor() {
+    super(
+      "That value is the dashboard login password, not a provider API key. Storing it would " +
+        "send it upstream on every request routed through this connection."
+    );
+    this.name = "ManagementPasswordAsCredentialError";
+  }
+}
+
+/**
+ * Refuse to store the dashboard login password as a connection API key.
+ *
+ * A browser that autofills the management password into the API-key field
+ * produces a connection whose credential authenticates against nothing, and
+ * every request routed through it comes back 401. Rejecting it in the form
+ * would not be enough: the same autofill fires again while an operator is
+ * repairing the connection by hand, so the refusal has to sit on the write
+ * path that all of those forms funnel into.
+ *
+ * Only an actual match blocks the write. A settings row that cannot be read,
+ * or a bcrypt call that throws, logs and allows -- a guard against one specific
+ * operator mistake must not become a way to lock out every connection write.
+ *
+ * Deliberately narrower than CONNECTION_CREDENTIAL_FIELDS. The OAuth tokens
+ * arrive from a provider's token endpoint, and the refresh path writes them
+ * back through updateProviderConnection on every renewal, so checking them
+ * would put a bcrypt round on a renewal path to defend a field no autofill
+ * reaches. apiKey is the only credential an operator types into a form.
+ */
+async function assertApiKeyIsNotManagementPassword(apiKey: unknown): Promise<void> {
+  if (typeof apiKey !== "string") return;
+  const trimmed = apiKey.trim();
+  if (!trimmed) return;
+
+  try {
+    const settings = (await getSettings()) as JsonRecord;
+    const stored = getStoredManagementPassword(settings);
+    // Only a stored bcrypt hash is comparable. A fresh install that has never
+    // bootstrapped a password has nothing to collide with.
+    if (!isBcryptHash(stored)) return;
+    // Both forms of the value, because neither the login route nor the
+    // set-password route trims: a paste carries whitespace the password does
+    // not have, and a password is allowed to carry whitespace of its own. The
+    // second comparison only runs when the first fails on a different string.
+    const matches =
+      (await verifyManagementPassword(trimmed, stored)) ||
+      (trimmed !== apiKey && (await verifyManagementPassword(apiKey, stored)));
+    if (!matches) return;
+  } catch (err) {
+    console.warn(
+      "[Providers] could not check the credential against the dashboard password:",
+      err instanceof Error ? err.message : String(err)
+    );
+    return;
+  }
+
+  throw new ManagementPasswordAsCredentialError();
+}
+
 interface StatementLike<TRow = unknown> {
   all: (...params: unknown[]) => TRow[];
   get: (...params: unknown[]) => TRow | undefined;
@@ -37,13 +147,120 @@ interface StatementLike<TRow = unknown> {
 
 interface DbLike {
   prepare: <TRow = unknown>(sql: string) => StatementLike<TRow>;
+  transaction: <T>(fn: () => T) => () => T;
 }
+
+// Real column set for provider_connections (must match the CREATE TABLE in
+// core.ts's SCHEMA_SQL). getProviderConnections()'s optional `columns`
+// projection is interpolated directly into the SELECT clause, so every
+// requested name must be validated against this allowlist before use —
+// there is no current caller that passes untrusted input, but the
+// projection API itself must never accept an arbitrary string.
+export const PROVIDER_CONNECTIONS_COLUMNS = new Set([
+  "id",
+  "provider",
+  "auth_type",
+  "name",
+  "email",
+  "priority",
+  "is_active",
+  "access_token",
+  "refresh_token",
+  "expires_at",
+  "token_expires_at",
+  "scope",
+  "project_id",
+  "test_status",
+  "error_code",
+  "last_error",
+  "last_error_at",
+  "last_error_type",
+  "last_error_source",
+  "backoff_level",
+  "rate_limited_until",
+  "health_check_interval",
+  "last_health_check_at",
+  "last_tested",
+  "api_key",
+  "id_token",
+  "provider_specific_data",
+  "expires_in",
+  "display_name",
+  "global_priority",
+  "default_model",
+  "token_type",
+  "consecutive_use_count",
+  "rate_limit_protection",
+  "last_used_at",
+  "group",
+  "max_concurrent",
+  "proxy_enabled",
+  "per_key_proxy_enabled",
+  "quota_window_thresholds_json",
+  "rate_limit_overrides_json",
+  "created_at",
+  "updated_at",
+]);
 
 // ──────────────── Provider Connections ────────────────
 
-export async function getProviderConnections(filter: JsonRecord = {}) {
+/**
+ * Returns provider connections as lazy-decrypting proxies: encrypted
+ * credential fields (apiKey, accessToken, refreshToken, idToken) are only
+ * decrypted on first property access, not eagerly for every row. Column-
+ * projected reads (`columns` passed) bypass the raw-row cache — the cache
+ * key doesn't account for projection, so a projected read could otherwise
+ * poison the cache for a subsequent full-row read of the same filter.
+ *
+ * When `limit`/`offset` are provided, the cache is also bypassed since
+ * the cache key doesn't account for pagination.
+ */
+export async function getProviderConnections(
+  filter: JsonRecord = {},
+  limit?: number,
+  offset?: number,
+  columns?: string[]
+) {
+  const useCache = !columns?.length && limit === undefined && offset === undefined;
+  const raw = useCache
+    ? await getCachedRawProviderConnections(filter)
+    : await getRawProviderConnections(filter, limit, offset, columns);
+  return raw.map(createLazyRowProxy);
+}
+
+/**
+ * Same as getProviderConnections but WITHOUT decryptConnectionFields.
+ * Returns raw rows with encrypted credential fields intact — callers
+ * that only need metadata (id, priority, backoffLevel, etc.) avoid
+ * the O(n) AES-GCM decrypt cost on every cache fill.
+ *
+ * Used by the lazy-decryption path in auth selection (auth.ts) where
+ * 10k+ connections are filtered in JS but only 1 needs its apiKey
+ * decrypted.
+ *
+ * @param limit — Optional SQL LIMIT clause to cap rows returned
+ * @param offset — Optional SQL OFFSET for pagination
+ */
+export async function getRawProviderConnections(
+  filter: JsonRecord = {},
+  limit?: number,
+  offset?: number,
+  columns?: string[]
+) {
   const db = getDbInstance() as unknown as DbLike;
-  let sql = "SELECT * FROM provider_connections";
+  let selectCols = "*";
+  if (columns?.length) {
+    const invalidColumns = columns.filter((col) => !PROVIDER_CONNECTIONS_COLUMNS.has(col));
+    if (invalidColumns.length > 0) {
+      throw new Error(
+        `getProviderConnections: invalid column(s) requested: ${invalidColumns.join(", ")}`
+      );
+    }
+    // "group" is a reserved SQL keyword — the schema declares it quoted, so
+    // it must be re-quoted here too or the generated SELECT is a syntax error.
+    selectCols = columns.map((col) => (col === "group" ? `"group"` : col)).join(", ");
+  }
+  let sql = `SELECT ${selectCols} FROM provider_connections`;
   const conditions: string[] = [];
   const params: Record<string, unknown> = {};
 
@@ -55,25 +272,59 @@ export async function getProviderConnections(filter: JsonRecord = {}) {
     conditions.push("is_active = @isActive");
     params.isActive = filter.isActive ? 1 : 0;
   }
+  if (filter.authType) {
+    conditions.push("auth_type = @authType");
+    params.authType = filter.authType;
+  }
 
   if (conditions.length > 0) {
     sql += " WHERE " + conditions.join(" AND ");
   }
   sql += " ORDER BY priority ASC, updated_at DESC";
+  if (limit !== undefined) {
+    sql += " LIMIT @limit OFFSET @offset";
+    params.limit = limit;
+    params.offset = offset ?? 0;
+  }
 
   const rows = db.prepare(sql).all(params);
   return rows.map((r) => {
     const camelRow = rowToCamel(r);
-    return decryptConnectionFields(
-      withNullableRateLimitOverrides(
-        withNullableQuotaWindowThresholds(
-          withNullableMaxConcurrent(cleanNulls(camelRow), camelRow),
-          camelRow
-        ),
+    return withNullableRateLimitOverrides(
+      withNullableQuotaWindowThresholds(
+        withNullableMaxConcurrent(cleanNulls(camelRow), camelRow),
         camelRow
-      )
+      ),
+      camelRow
     );
   });
+}
+
+export function getProviderConnectionsCount(filter: JsonRecord = {}): number {
+  const db = getDbInstance() as unknown as DbLike;
+  let sql = "SELECT count(*) as cnt FROM provider_connections";
+  const conditions: string[] = [];
+  const params: Record<string, unknown> = {};
+
+  if (filter.provider) {
+    conditions.push("provider = @provider");
+    params.provider = filter.provider;
+  }
+  if (filter.isActive !== undefined) {
+    conditions.push("is_active = @isActive");
+    params.isActive = filter.isActive ? 1 : 0;
+  }
+  if (filter.authType) {
+    conditions.push("auth_type = @authType");
+    params.authType = filter.authType;
+  }
+
+  if (conditions.length > 0) {
+    sql += " WHERE " + conditions.join(" AND ");
+  }
+
+  const row = db.prepare(sql).get(params) as { cnt: number };
+  return row.cnt;
 }
 
 export async function getProviderConnectionById(id: string) {
@@ -130,71 +381,83 @@ function findExistingCookieConnection(
 }
 
 export async function createProviderConnection(data: JsonRecord) {
+  await assertApiKeyIsNotManagementPassword(data.apiKey);
   const db = getDbInstance() as unknown as DbLike;
   const now = new Date().toISOString();
-  const normalizedProviderSpecificData = normalizeProviderSpecificData(
+  const normalizedProviderSpecificData = normalizeConnectionProviderSpecificData(
     toStringOrNull(data.provider),
-    data.providerSpecificData
+    data.providerSpecificData,
+    data
   );
 
-  // Upsert check
-  // For Codex/OpenAI, a single email can have multiple workspaces (Team + Personal)
-  // We need to check for workspace uniqueness, not just email
   let existing: JsonRecord | null = null;
+  let promotedCodexIdentity = false;
 
-  if (data.authType === "oauth" && data.email) {
-    // For Codex, check for existing connection with same workspace
-    const providerSpecificData = toRecord(data.providerSpecificData);
-    const workspaceId = toStringOrNull(providerSpecificData.workspaceId);
-    if (data.provider === "codex" && workspaceId) {
-      // For Codex, check for existing connection with same workspace AND email
-      // A single workspace can have multiple users (Team/Business plans)
-      // We need both workspace + email uniqueness to allow multiple accounts
-      existing =
-        (db
-          .prepare(
-            "SELECT * FROM provider_connections WHERE provider = ? AND auth_type = 'oauth' AND json_extract(provider_specific_data, '$.workspaceId') = ? AND email = ?"
-          )
-          .get(data.provider, workspaceId, data.email) as JsonRecord | undefined) || null;
+  const providerSpecificData = toRecord(data.providerSpecificData);
+  const workspaceId = toStringOrNull(providerSpecificData.workspaceId);
+  const chatgptUserId = toStringOrNull(providerSpecificData.chatgptUserId);
 
-      // If no match with workspace+email, also check workspace-only for backward compat
-      // (old connections without email should still be updated, not duplicated)
-      if (!existing) {
+  if (data.authType === "oauth" && data.provider === "codex" && chatgptUserId) {
+    const strongSql = workspaceId
+      ? "SELECT * FROM provider_connections WHERE provider = ? AND auth_type = 'oauth' AND json_extract(provider_specific_data, '$.workspaceId') = ? AND json_extract(provider_specific_data, '$.chatgptUserId') = ?"
+      : "SELECT * FROM provider_connections WHERE provider = ? AND auth_type = 'oauth' AND (json_extract(provider_specific_data, '$.workspaceId') IS NULL OR json_extract(provider_specific_data, '$.workspaceId') = '') AND json_extract(provider_specific_data, '$.chatgptUserId') = ?";
+    existing =
+      ((workspaceId
+        ? db.prepare(strongSql).get(data.provider, workspaceId, chatgptUserId)
+        : db.prepare(strongSql).get(data.provider, chatgptUserId)) as JsonRecord | undefined) ||
+      null;
+
+    if (!existing && workspaceId) {
+      const workspaceMatches = db
+        .prepare(
+          `SELECT * FROM provider_connections
+           WHERE provider = ? AND auth_type = 'oauth'
+             AND json_extract(provider_specific_data, '$.workspaceId') = ?
+           ORDER BY created_at`
+        )
+        .all(data.provider, workspaceId) as JsonRecord[];
+      existing = pickCodexConnectionForUser(
+        workspaceMatches,
+        chatgptUserId,
+        toStringOrNull(data.email)
+      );
+      promotedCodexIdentity = existing !== null;
+    }
+  } else if (data.authType === "oauth" && data.email) {
+    if (data.provider === "codex") {
+      if (workspaceId) {
         existing =
           (db
             .prepare(
-              "SELECT * FROM provider_connections WHERE provider = ? AND auth_type = 'oauth' AND json_extract(provider_specific_data, '$.workspaceId') = ? AND (email IS NULL OR email = '')"
+              `SELECT * FROM provider_connections
+               WHERE provider = ? AND auth_type = 'oauth'
+                 AND json_extract(provider_specific_data, '$.workspaceId') = ?
+                 AND email = ?
+               LIMIT 1`
             )
-            .get(data.provider, workspaceId) as JsonRecord | undefined) || null;
+            .get(data.provider, workspaceId, data.email) as JsonRecord | undefined) || null;
       }
-      // For Codex with workspaceId, don't fall back to email-only check
-      // This allows creating new connections for different workspaces
     } else {
       // For other providers (or Codex without workspaceId), match on email —
-      // disambiguated by providerSpecificData.username when present on both
-      // sides. Two different IdPs can share the same email address (e.g. a
-      // Google account and a HuggingFace account); matching on email alone
-      // would silently overwrite the other account's connection on the
-      // second login. Only fall back to the bare email-only match when
-      // neither side carries a username (legacy rows created before this
-      // disambiguation existed).
+      // disambiguated by providerSpecificData.username and/or
+      // providerSpecificData.profileArn when present on both sides. Two
+      // different IdPs (or two distinct Kiro/AWS profiles authenticated via
+      // the same email-carrying IdP) can share the same email address;
+      // matching on email alone would silently overwrite the other
+      // account's connection on the second login. Only fall back to the
+      // bare email-only match when neither side carries a username/profileArn
+      // (legacy rows created before this disambiguation existed).
       const incomingUsername = toStringOrNull(providerSpecificData.username);
+      const incomingProfileArn = toStringOrNull(providerSpecificData.profileArn);
       const emailMatches = db
         .prepare(
           "SELECT * FROM provider_connections WHERE provider = ? AND auth_type = 'oauth' AND email = ?"
         )
         .all(data.provider, data.email) as JsonRecord[];
       existing =
-        emailMatches.find((row) => {
-          const existingUsername = toStringOrNull(
-            parseProviderSpecificData(row.provider_specific_data)?.username
-          );
-          if (incomingUsername && existingUsername) {
-            return incomingUsername === existingUsername;
-          }
-          if (incomingUsername || existingUsername) return false;
-          return true;
-        }) || null;
+        emailMatches.find((row) =>
+          isMatchingOauthIdentity(row, incomingUsername, incomingProfileArn)
+        ) || null;
     }
   } else if (data.authType === "apikey") {
     // Name-based upsert (existing behavior): same provider + same name → update.
@@ -244,12 +507,32 @@ export async function createProviderConnection(data: JsonRecord) {
   if (existing) {
     const existingId = toStringOrNull(existing.id);
     if (!existingId) return null;
-    const merged: JsonRecord = { ...toRecord(rowToCamel(existing)), ...data, updatedAt: now };
-    merged.providerSpecificData = normalizeProviderSpecificData(
+    const rawExisting = toRecord(rowToCamel(existing));
+    const decryptedExisting = decryptConnectionFields({ ...rawExisting });
+    const merged: JsonRecord = { ...decryptedExisting, ...data, updatedAt: now };
+    merged.providerSpecificData = normalizeConnectionProviderSpecificData(
       toStringOrNull(merged.provider),
-      merged.providerSpecificData
+      merged.providerSpecificData,
+      merged,
+      decryptedExisting.providerSpecificData
     );
-    _updateConnectionRow(db, existingId, merged);
+    const persistence: JsonRecord = { ...merged };
+    for (const field of CONNECTION_CREDENTIAL_FIELDS) {
+      if (!Object.hasOwn(data, field)) {
+        persistence[field] = rawExisting[field];
+      }
+    }
+    db.transaction(() => {
+      if (promotedCodexIdentity) {
+        reconcileCodexUsageHistory(db, {
+          connectionId: existingId,
+          existing,
+          merged,
+          matchedExistingCodexByWorkspace: true,
+        });
+      }
+      _updateConnectionRow(db, existingId, encryptConnectionFields(persistence));
+    })();
     backupDbFile("pre-write");
     return withNullableRateLimitOverrides(
       withNullableQuotaWindowThresholds(
@@ -293,6 +576,7 @@ export async function createProviderConnection(data: JsonRecord) {
     updatedAt: now,
     proxyEnabled: normalizeBooleanColumn(data.proxyEnabled, true),
     perKeyProxyEnabled: normalizeBooleanColumn(data.perKeyProxyEnabled, false),
+    quotaVisible: normalizeBooleanColumn(data.quotaVisible, true),
   };
 
   // Optional fields
@@ -324,6 +608,7 @@ export async function createProviderConnection(data: JsonRecord) {
     "maxConcurrent",
     "proxyEnabled",
     "perKeyProxyEnabled",
+    "quotaVisible",
     "quotaWindowThresholds",
     "rateLimitOverrides",
     "healthCheckInterval",
@@ -342,21 +627,32 @@ export async function createProviderConnection(data: JsonRecord) {
   // to no-overrides) keeps the field present on the returned object so the
   // UI can tell "field was read, no overrides" apart from "field absent."
   if ("quotaWindowThresholds" in connection) {
-    connection.quotaWindowThresholds = sanitizeQuotaWindowThresholds(
-      connection.quotaWindowThresholds
-    );
+    const result = sanitizeQuotaWindowThresholds(connection.quotaWindowThresholds);
+    if (result.rejected.length > 0) {
+      throw new Error(
+        `Refusing to persist quotaWindowThresholds with rejected keys: ${result.rejected.join(", ")}`
+      );
+    }
+    connection.quotaWindowThresholds = result.sanitized;
   }
 
   // Same sanitization for rateLimitOverrides — keep in-memory representation
-  // in sync with what gets persisted.
+  // in sync with what gets persisted. Reject (don't silently drop) invalid
+  // keys/values so a direct DB writer can't lose operator intent.
   if ("rateLimitOverrides" in connection) {
-    connection.rateLimitOverrides = sanitizeRateLimitOverrides(connection.rateLimitOverrides);
+    const result = sanitizeRateLimitOverrides(connection.rateLimitOverrides);
+    if (result.rejected.length > 0) {
+      throw new Error(
+        `Refusing to persist rateLimitOverrides with rejected keys: ${result.rejected.join(", ")}`
+      );
+    }
+    connection.rateLimitOverrides = result.sanitized;
   }
 
   _insertConnectionRow(db, encryptConnectionFields({ ...connection }));
   const providerId = toStringOrNull(data.provider);
   if (providerId) {
-    _reorderConnections(db, providerId);
+    reorderConnections(db, providerId);
   }
   backupDbFile("pre-write");
   invalidateDbCache("connections"); // Bust connections read cache
@@ -382,7 +678,7 @@ function _insertConnectionRow(db: DbLike, conn: JsonRecord) {
       last_tested, api_key, id_token, provider_specific_data,
       expires_in, display_name, global_priority, default_model,
       token_type, consecutive_use_count, rate_limit_protection, last_used_at, "group", max_concurrent,
-      proxy_enabled, per_key_proxy_enabled, quota_window_thresholds_json, rate_limit_overrides_json,
+      proxy_enabled, per_key_proxy_enabled, quota_visible, quota_window_thresholds_json, rate_limit_overrides_json,
       created_at, updated_at
     ) VALUES (
       @id, @provider, @authType, @name, @email, @priority, @isActive,
@@ -393,7 +689,7 @@ function _insertConnectionRow(db: DbLike, conn: JsonRecord) {
       @lastTested, @apiKey, @idToken, @providerSpecificData,
       @expiresIn, @displayName, @globalPriority, @defaultModel,
       @tokenType, @consecutiveUseCount, @rateLimitProtection, @lastUsedAt, @group, @maxConcurrent,
-      @proxyEnabled, @perKeyProxyEnabled, @quotaWindowThresholdsJson, @rateLimitOverridesJson,
+      @proxyEnabled, @perKeyProxyEnabled, @quotaVisible, @quotaWindowThresholdsJson, @rateLimitOverridesJson,
       @createdAt, @updatedAt
     )
   `
@@ -440,6 +736,7 @@ function _insertConnectionRow(db: DbLike, conn: JsonRecord) {
     maxConcurrent: conn.maxConcurrent ?? null,
     proxyEnabled: normalizeBooleanColumn(conn.proxyEnabled, true) ? 1 : 0,
     perKeyProxyEnabled: normalizeBooleanColumn(conn.perKeyProxyEnabled, false) ? 1 : 0,
+    quotaVisible: normalizeBooleanColumn(conn.quotaVisible, true) ? 1 : 0,
     quotaWindowThresholdsJson: serializeJsonField(conn.quotaWindowThresholds),
     rateLimitOverridesJson: serializeJsonField(conn.rateLimitOverrides),
     createdAt: conn.createdAt,
@@ -447,35 +744,11 @@ function _insertConnectionRow(db: DbLike, conn: JsonRecord) {
   });
 }
 
-function _updateConnectionRow(db: DbLike, id: string, data: JsonRecord) {
-  const now = data.updatedAt || new Date().toISOString();
-  db.prepare(
-    `
-    UPDATE provider_connections SET
-      provider = @provider, auth_type = @authType, name = @name, email = @email,
-      priority = @priority, is_active = @isActive, access_token = @accessToken,
-      refresh_token = @refreshToken, expires_at = @expiresAt, token_expires_at = @tokenExpiresAt,
-      scope = @scope, project_id = @projectId, test_status = @testStatus, error_code = @errorCode,
-      last_error = @lastError, last_error_at = @lastErrorAt, last_error_type = @lastErrorType,
-      last_error_source = @lastErrorSource, backoff_level = @backoffLevel,
-      rate_limited_until = @rateLimitedUntil, health_check_interval = @healthCheckInterval,
-      last_health_check_at = @lastHealthCheckAt, last_tested = @lastTested, api_key = @apiKey,
-      id_token = @idToken, provider_specific_data = @providerSpecificData,
-      expires_in = @expiresIn, display_name = @displayName, global_priority = @globalPriority,
-      default_model = @defaultModel, token_type = @tokenType,
-      consecutive_use_count = @consecutiveUseCount,
-      rate_limit_protection = @rateLimitProtection,
-      last_used_at = @lastUsedAt,
-      "group" = @group,
-      max_concurrent = @maxConcurrent,
-      quota_window_thresholds_json = @quotaWindowThresholdsJson,
-      proxy_enabled = @proxyEnabled,
-      per_key_proxy_enabled = @perKeyProxyEnabled,
-      rate_limit_overrides_json = @rateLimitOverridesJson,
-      updated_at = @updatedAt
-    WHERE id = @id
-  `
-  ).run({
+// Assembles the `.run()` params for _updateConnectionRow's UPDATE statement.
+// Split out purely to keep _updateConnectionRow under the max-lines-per-function
+// gate — same field mapping/normalization as before, just relocated.
+function _buildUpdateConnectionRowParams(id: string, data: JsonRecord, now: unknown) {
+  return {
     id,
     provider: data.provider,
     authType: data.authType || null,
@@ -519,9 +792,46 @@ function _updateConnectionRow(db: DbLike, id: string, data: JsonRecord) {
     quotaWindowThresholdsJson: serializeJsonField(data.quotaWindowThresholds),
     proxyEnabled: normalizeBooleanColumn(data.proxyEnabled, true) ? 1 : 0,
     perKeyProxyEnabled: normalizeBooleanColumn(data.perKeyProxyEnabled, false) ? 1 : 0,
+    quotaVisible: normalizeBooleanColumn(data.quotaVisible, true) ? 1 : 0,
     rateLimitOverridesJson: serializeJsonField(data.rateLimitOverrides),
+    lastPingAt: data.lastPingAt || null,
+    lastPingedResetKey: data.lastPingedResetKey || null,
     updatedAt: now,
-  });
+  };
+}
+
+function _updateConnectionRow(db: DbLike, id: string, data: JsonRecord) {
+  const now = data.updatedAt || new Date().toISOString();
+  db.prepare(
+    `
+    UPDATE provider_connections SET
+      provider = @provider, auth_type = @authType, name = @name, email = @email,
+      priority = @priority, is_active = @isActive, access_token = @accessToken,
+      refresh_token = @refreshToken, expires_at = @expiresAt, token_expires_at = @tokenExpiresAt,
+      scope = @scope, project_id = @projectId, test_status = @testStatus, error_code = @errorCode,
+      last_error = @lastError, last_error_at = @lastErrorAt, last_error_type = @lastErrorType,
+      last_error_source = @lastErrorSource, backoff_level = @backoffLevel,
+      rate_limited_until = @rateLimitedUntil, health_check_interval = @healthCheckInterval,
+      last_health_check_at = @lastHealthCheckAt, last_tested = @lastTested, api_key = @apiKey,
+      id_token = @idToken, provider_specific_data = @providerSpecificData,
+      expires_in = @expiresIn, display_name = @displayName, global_priority = @globalPriority,
+      default_model = @defaultModel, token_type = @tokenType,
+      consecutive_use_count = @consecutiveUseCount,
+      rate_limit_protection = @rateLimitProtection,
+      last_used_at = @lastUsedAt,
+      "group" = @group,
+      max_concurrent = @maxConcurrent,
+      quota_window_thresholds_json = @quotaWindowThresholdsJson,
+      proxy_enabled = @proxyEnabled,
+      per_key_proxy_enabled = @perKeyProxyEnabled,
+      quota_visible = @quotaVisible,
+      rate_limit_overrides_json = @rateLimitOverridesJson,
+      last_ping_at = @lastPingAt,
+      last_pinged_reset_key = @lastPingedResetKey,
+      updated_at = @updatedAt
+    WHERE id = @id
+  `
+  ).run(_buildUpdateConnectionRowParams(id, data, now));
 }
 
 export async function updateProviderConnection(id: string, data: JsonRecord) {
@@ -529,27 +839,56 @@ export async function updateProviderConnection(id: string, data: JsonRecord) {
   const existing = db.prepare("SELECT * FROM provider_connections WHERE id = ?").get(id);
   if (!existing) return null;
 
+  // The incoming value only. A connection that already holds the password has
+  // to stay editable, or an operator cannot repair the one this guard exists
+  // to prevent -- and re-checking the merged value would spend a bcrypt round
+  // on every unrelated field edit.
+  await assertApiKeyIsNotManagementPassword(data.apiKey);
+
+  const existingCamel = toRecord(rowToCamel(existing));
   const merged: JsonRecord = {
-    ...toRecord(rowToCamel(existing)),
+    ...existingCamel,
     ...data,
     updatedAt: new Date().toISOString(),
   };
-  merged.providerSpecificData = normalizeProviderSpecificData(
+  merged.providerSpecificData = normalizeConnectionProviderSpecificData(
     toStringOrNull(merged.provider),
-    merged.providerSpecificData
+    merged.providerSpecificData,
+    merged,
+    existingCamel.providerSpecificData
   );
   // Mirror the sanitization the create path applies — keep the returned
   // object in lockstep with what we persist.
   if ("quotaWindowThresholds" in merged) {
-    const sanitized = sanitizeQuotaWindowThresholds(merged.quotaWindowThresholds);
+    const result = sanitizeQuotaWindowThresholds(merged.quotaWindowThresholds);
+    if (result.rejected.length > 0) {
+      throw new Error(
+        `Refusing to persist quotaWindowThresholds with rejected keys: ${result.rejected.join(", ")}`
+      );
+    }
     // For updates we always carry the key forward (even as null) so the read
-    // path surfaces the cleared state to callers that just patched it.
-    merged.quotaWindowThresholds = sanitized;
+    // path surfaces the cleared state to callers that merged it.
+    merged.quotaWindowThresholds = result.sanitized;
   }
   if ("rateLimitOverrides" in merged) {
-    merged.rateLimitOverrides = sanitizeRateLimitOverrides(merged.rateLimitOverrides);
+    const result = sanitizeRateLimitOverrides(merged.rateLimitOverrides);
+    if (result.rejected.length > 0) {
+      throw new Error(
+        `Refusing to persist rateLimitOverrides with rejected keys: ${result.rejected.join(", ")}`
+      );
+    }
+    merged.rateLimitOverrides = result.sanitized;
   }
-  _updateConnectionRow(db, id, encryptConnectionFields({ ...merged }));
+  const existingRecord = toRecord(existing);
+
+  db.transaction(() => {
+    reconcileCodexUsageHistory(db, {
+      connectionId: id,
+      existing: existingRecord,
+      merged,
+    });
+    _updateConnectionRow(db, id, encryptConnectionFields({ ...merged }));
+  })();
   backupDbFile("pre-write");
   invalidateDbCache("connections"); // Bust connections read cache
   bumpProxyConfigGeneration();
@@ -560,7 +899,7 @@ export async function updateProviderConnection(id: string, data: JsonRecord) {
       typeof existingRecord.provider === "string"
         ? existingRecord.provider
         : String(existingRecord.provider || "");
-    _reorderConnections(db, providerId);
+    reorderConnections(db, providerId);
   }
 
   return withNullableRateLimitOverrides(
@@ -571,6 +910,11 @@ export async function updateProviderConnection(id: string, data: JsonRecord) {
     merged
   );
 }
+
+export {
+  updateCodexScopedQuotaState,
+  updateCodexScopeCooldown,
+} from "./providers/codexAccountState";
 
 /**
  * Atomic conditional clear of recoverable error state on a connection row.
@@ -594,8 +938,9 @@ export async function clearConnectionErrorIfUnchanged(
   }
 ): Promise<boolean> {
   const db = getDbInstance() as unknown as DbLike;
-  const result = db.prepare(
-    `
+  const result = db
+    .prepare(
+      `
     UPDATE provider_connections SET
       test_status = 'active',
       last_error = NULL,
@@ -611,13 +956,14 @@ export async function clearConnectionErrorIfUnchanged(
       AND IFNULL(last_error_at, '') = ?
       AND IFNULL(rate_limited_until, '') = ?
     `
-  ).run(
-    new Date().toISOString(),
-    id,
-    expected.testStatus ?? "",
-    expected.lastErrorAt ?? "",
-    expected.rateLimitedUntil ?? ""
-  );
+    )
+    .run(
+      new Date().toISOString(),
+      id,
+      expected.testStatus ?? "",
+      expected.lastErrorAt ?? "",
+      expected.rateLimitedUntil ?? ""
+    );
   const applied = (result.changes ?? 0) > 0;
   if (applied) {
     backupDbFile("pre-write");
@@ -627,83 +973,62 @@ export async function clearConnectionErrorIfUnchanged(
   return applied;
 }
 
-export async function deleteProviderConnection(id: string) {
+/**
+ * Lightweight stat bump — updates lastUsedAt and consecutiveUseCount without
+ * SELECT, re-encrypt, cache invalidation, or file backup.
+ * Safe for the hot getProviderCredentials path where only usage stats change.
+ * Fixes the cache-thrashing bug where every credential selection invalidated
+ * the 5s TTL cache and paid 3000-row decryption cost on the next request.
+ */
+export async function touchConnectionLastUsed(
+  id: string,
+  consecutiveUseCount: number
+): Promise<void> {
+  if (!id) return;
   const db = getDbInstance() as unknown as DbLike;
-  const existing = db.prepare("SELECT provider FROM provider_connections WHERE id = ?").get(id);
-  if (!existing) return false;
-
-  db.prepare("DELETE FROM quota_snapshots WHERE connection_id = ?").run(id);
-  db.prepare("DELETE FROM provider_connections WHERE id = ?").run(id);
-  bumpProxyConfigGeneration();
-  const existingRecord = toRecord(existing);
-  const providerId =
-    typeof existingRecord.provider === "string"
-      ? existingRecord.provider
-      : String(existingRecord.provider || "");
-  _reorderConnections(db, providerId);
-  backupDbFile("pre-write");
-  invalidateDbCache("connections"); // Bust connections read cache
-  return true;
-}
-
-export async function deleteProviderConnections(ids: string[]): Promise<number> {
-  if (ids.length === 0) return 0;
-  const db = getDbInstance();
-
-  const deletedCount = db.transaction(() => {
-    const placeholders = ids.map(() => "?").join(",");
-    db.prepare(`DELETE FROM quota_snapshots WHERE connection_id IN (${placeholders})`).run(...ids);
-    const result = db
-      .prepare(`DELETE FROM provider_connections WHERE id IN (${placeholders})`)
-      .run(...ids);
-    return result.changes ?? 0;
-  })();
-
-  backupDbFile("pre-write");
-  invalidateDbCache("connections");
-  return deletedCount;
-}
-
-export async function deleteProviderConnectionsByProvider(providerId: string) {
-  const db = getDbInstance() as unknown as DbLike;
-  const connectionIds = db
-    .prepare("SELECT id FROM provider_connections WHERE provider = ?")
-    .all(providerId)
-    .map((row) => {
-      const record = toRecord(row);
-      return typeof record.id === "string" ? record.id : null;
-    })
-    .filter((id): id is string => id !== null);
-
-  if (connectionIds.length > 0) {
-    const deleteSnapshots = db.prepare("DELETE FROM quota_snapshots WHERE connection_id = ?");
-    for (const connectionId of connectionIds) {
-      deleteSnapshots.run(connectionId);
-    }
-  }
-
-  const result = db.prepare("DELETE FROM provider_connections WHERE provider = ?").run(providerId);
-  backupDbFile("pre-write");
-  return result.changes;
-}
-
-export async function reorderProviderConnections(providerId: string) {
-  const db = getDbInstance() as unknown as DbLike;
-  _reorderConnections(db, providerId);
-}
-
-function _reorderConnections(db: DbLike, providerId: string) {
-  const rows = db
-    .prepare(
-      "SELECT id, priority, updated_at FROM provider_connections WHERE provider = ? ORDER BY priority ASC, updated_at DESC"
-    )
-    .all(providerId);
-
-  const update = db.prepare("UPDATE provider_connections SET priority = ? WHERE id = ?");
-  rows.forEach((row, index) => {
-    const current = toRecord(row);
-    update.run(index + 1, current.id);
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE provider_connections SET
+      last_used_at = @lastUsedAt,
+      consecutive_use_count = @consecutiveUseCount,
+      updated_at = @updatedAt
+    WHERE id = @id`
+  ).run({
+    lastUsedAt: now,
+    consecutiveUseCount,
+    updatedAt: now,
+    id,
   });
+}
+
+/**
+ * Lightweight backoff reset — runs a targeted UPDATE without SELECT or re-encrypt.
+ * Follows the `clearConnectionErrorIfUnchanged` pattern but without the CAS check,
+ * since the caller already verified the connection is eligible for reset.
+ * Resets all backoff/error columns so the connection re-enters the selection pool.
+ * Does invalidateDbCache + bumpProxyConfigGeneration since backoff affects priority.
+ */
+export async function resetConnectionBackoff(id: string): Promise<void> {
+  if (!id) return;
+  const db = getDbInstance() as unknown as DbLike;
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE provider_connections SET
+      backoff_level = 0,
+      test_status = 'active',
+      last_error = NULL,
+      last_error_at = NULL,
+      last_error_type = NULL,
+      last_error_source = NULL,
+      error_code = NULL,
+      updated_at = @updatedAt
+    WHERE id = @id`
+  ).run({
+    updatedAt: now,
+    id,
+  });
+  invalidateDbCache("connections");
+  bumpProxyConfigGeneration();
 }
 
 export async function cleanupProviderConnections() {
@@ -720,71 +1045,19 @@ export async function getDistinctGroups(): Promise<string[]> {
   return rows.map((r) => String(r.group ?? "")).filter(Boolean);
 }
 
-// ──────────────── Auto Migration ────────────────
-
-/**
- * Scans all connections and re-encrypts any fields using the old dynamic salt
- * so they use the new canonical static salt.
- */
-export function autoMigrateLegacyEncryptedConnections(): number {
-  const db = getDbInstance() as unknown as DbLike;
-  const rows = db.prepare("SELECT * FROM provider_connections").all();
-  let migratedCount = 0;
-
-  for (const row of rows) {
-    const camelRow = rowToCamel(row);
-    if (!camelRow) continue;
-
-    let updatedRow = false;
-
-    const encryptedFields = ["apiKey", "idToken", "accessToken", "refreshToken"];
-    for (const field of encryptedFields) {
-      if (typeof camelRow[field] === "string") {
-        const { updated, value } = migrateLegacyEncryptedString(camelRow[field] as string);
-        if (updated) {
-          camelRow[field] = value;
-          updatedRow = true;
-        }
-      }
-    }
-
-    if (updatedRow) {
-      // camelRow[field] is already re-encrypted!
-      // But _updateConnectionRow does not re-encrypt automatically, so we pass it safely.
-      // Wait, _updateConnectionRow runs the full data through `encryptConnectionFields`,
-      // but `encryptConnectionFields` will re-encrypt plain text.
-      // BUT `migrateLegacyEncryptedString` returns ALREADY ENCRYPTED ciphertext!
-      // Wait... if we pass ALREADY ENCRYPTED text to `_updateConnectionRow`,
-      // `encryptConnectionFields` in `_updateConnectionRow` will encrypt it AGAIN!
-      // Let's modify the DB directly so we don't double encrypt.
-
-      db.prepare(
-        "UPDATE provider_connections SET api_key = @apiKey, id_token = @idToken, access_token = @accessToken, refresh_token = @refreshToken, updated_at = @updatedAt WHERE id = @id"
-      ).run({
-        id: camelRow.id,
-        apiKey: camelRow.apiKey ?? null,
-        idToken: camelRow.idToken ?? null,
-        accessToken: camelRow.accessToken ?? null,
-        refreshToken: camelRow.refreshToken ?? null,
-        updatedAt: new Date().toISOString(),
-      });
-      migratedCount++;
-    }
-  }
-
-  if (migratedCount > 0) {
-    backupDbFile("pre-write");
-    invalidateDbCache("connections");
-    console.log(`[DB] Auto-migrated ${migratedCount} connection(s) to new static-salt encryption.`);
-  }
-
-  return migratedCount;
-}
+export { autoMigrateLegacyEncryptedConnections, getGheCopilotHosts } from "./providers/migrations";
+export {
+  deleteProviderConnection,
+  deleteProviderConnections,
+  deleteProviderConnectionsByProvider,
+  reorderProviderConnections,
+} from "./providers/deletion";
 
 // ──────────────── Re-exports from leaf modules ────────────────
 
 export {
   getProviderNodes,
+  getProviderNodesCount,
   getProviderNodeById,
   resolveProviderNodeForConnection,
   createProviderNode,
@@ -795,9 +1068,9 @@ export {
   setConnectionRateLimitUntil,
   markConnectionRateLimitedUntil,
   clearConnectionRateLimit,
-  isConnectionRateLimited,
-  getRateLimitedConnections,
   getEffectiveQuotaUsage,
   clearStaleCrashCooldowns,
   formatResetCountdown,
+  isConnectionRateLimited,
+  getRateLimitedConnections,
 } from "./providers/rateLimit";

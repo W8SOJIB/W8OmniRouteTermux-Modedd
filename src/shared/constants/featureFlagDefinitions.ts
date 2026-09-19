@@ -12,7 +12,7 @@ export interface FeatureFlagDefinition {
 }
 
 export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
-  // ──────────────── Security (9) ────────────────
+  // ──────────────── Security (10) ────────────────
   {
     key: "REQUIRE_API_KEY",
     label: "Require API Key",
@@ -105,6 +105,32 @@ export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
     requiresRestart: false,
     warningLevel: "danger",
   },
+  {
+    key: "AUTH_LOG_INCLUDE_ACCOUNT_ID",
+    label: "Log Account IDs",
+    description:
+      'Include account prefix in AUTH log lines (e.g. "Using <provider> account: abc12345..."). ' +
+      "Disabled by default so account identifiers are redacted from shared/multi-tenant process logs. " +
+      "Independent from Debug Mode; flipping Debug Mode does not reveal this.",
+    descriptionI18nKey: "featureFlagAuthLogIncludeAccountIdDescription",
+    category: "security",
+    defaultValue: "false",
+    type: "boolean",
+    requiresRestart: false,
+    warningLevel: "info",
+  },
+  {
+    key: "OMNIROUTE_OIDC_DISABLE_PASSWORD_LOGIN",
+    label: "Disable Password Login With OIDC",
+    description:
+      "When OIDC is enabled, disable password login so users can only authenticate via OIDC Single Sign-On. When disabled (default), both password login and OIDC are available.",
+    descriptionI18nKey: "featureFlagOidcDisablePasswordLoginDescription",
+    category: "security",
+    defaultValue: "false",
+    type: "boolean",
+    requiresRestart: false,
+    warningLevel: "info",
+  },
   // ──────────────── Network (7) ────────────────
   {
     key: "ENABLE_TLS_FINGERPRINT",
@@ -116,6 +142,18 @@ export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
     type: "boolean",
     requiresRestart: true,
     warningLevel: "info",
+  },
+  {
+    key: "AUDIO_REMOTE_PROVIDER_NODES",
+    label: "Remote Audio Provider Nodes",
+    description:
+      "Allow the /v1/audio/* routes to use OpenAI-compatible provider nodes hosted outside localhost. Off by default — routing audio to a remote host changes egress identity and must be an explicit operator decision. Loopback nodes are always allowed and unaffected.",
+    descriptionI18nKey: "settings.featureFlags.audioRemoteProviderNodes",
+    category: "network",
+    defaultValue: "false",
+    type: "boolean",
+    requiresRestart: false,
+    warningLevel: "danger",
   },
   {
     key: "ONEPROXY_ENABLED",
@@ -151,6 +189,18 @@ export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
     type: "boolean",
     requiresRestart: false,
     warningLevel: "danger",
+  },
+  {
+    key: "NETWORK_ROTATION_SHARED_EGRESS_GUARD",
+    label: "Network Rotation Shared-Egress Guard",
+    description:
+      "On a network exception (timeout, connection refused/reset) for a multi-account rotation executor, when the failing account has no dedicated proxy, apply a short cooldown and skip other proxy-less accounts for the rest of the request instead of retrying each one. On by default (safe: no egress IP change, only reduces latency/cooldown risk on shared-egress accounts). Disable to restore immediate propagation on the first proxy-less throw.",
+    descriptionI18nKey: "featureFlagNetworkRotationSharedEgressGuardDescription",
+    category: "network",
+    defaultValue: "true",
+    type: "boolean",
+    requiresRestart: false,
+    warningLevel: "info",
   },
   {
     key: "MITM_DISABLE_TLS_VERIFY",
@@ -198,7 +248,7 @@ export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
     warningLevel: "info",
   },
 
-  // ──────────────── Policies (3) ────────────────
+  // ──────────────── Policies (5) ────────────────
   {
     key: "TOOL_POLICY_MODE",
     label: "Tool Policy Mode",
@@ -223,18 +273,43 @@ export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
     warningLevel: "info",
   },
   {
-    key: "ALLOW_MULTI_CONNECTIONS_PER_COMPAT_NODE",
-    label: "Multi Connections per Compat Node",
-    description: "Allow multiple connections per compatibility node",
-    descriptionI18nKey: "featureFlagAllowMultiConnectionsPerCompatNodeDescription",
+    key: "DISABLE_CONTEXT_WINDOW_CHECKS",
+    label: "Disable Context Window Checks",
+    description:
+      "Skip OmniRoute's local context-window and max-input-token check for direct single-model requests. Upstream providers remain responsible for enforcing their actual limits. Off by default.",
+    descriptionI18nKey: "featureFlagDisableContextWindowChecksDescription",
     category: "policies",
     defaultValue: "false",
     type: "boolean",
-    requiresRestart: true,
+    requiresRestart: false,
+    warningLevel: "danger",
+  },
+  {
+    key: "CAPABILITY_FILTER_ENABLED",
+    label: "Capability Filter",
+    description:
+      "Reject requests before dispatch when the target model lacks required capabilities (vision, tools, structured output, context window). Protects direct single-provider requests that bypass the combo-layer compatibility filter.",
+    descriptionI18nKey: "featureFlagCapabilityFilterEnabledDescription",
+    category: "policies",
+    defaultValue: "false",
+    type: "boolean",
+    requiresRestart: false,
+    warningLevel: "caution",
+  },
+  {
+    key: "RADAR_ENABLED",
+    label: "Radar",
+    description:
+      "Enable the OmniRoute Radar module (catalog feed screens and sync). Off by default; enabling only unlocks the UI — data sync remains a separate opt-in.",
+    descriptionI18nKey: "featureFlagRadarEnabledDescription",
+    category: "policies",
+    defaultValue: "false",
+    type: "boolean",
+    requiresRestart: false,
     warningLevel: "info",
   },
 
-  // ──────────────── Runtime (13) ────────────────
+  // ──────────────── Runtime (16) ────────────────
   {
     key: "RESPONSES_PASSTHROUGH_DROP_COMMENTARY",
     label: "Drop Responses Commentary",
@@ -306,7 +381,7 @@ export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
     key: "OMNIROUTE_ENABLE_LIVE_WS",
     label: "Live Dashboard WebSocket",
     description:
-      "Start the real-time dashboard WebSocket server on import (port 20129, loopback-bound by default). Default: enabled. Set to '0' or 'false' to disable. LAN exposure requires LIVE_WS_HOST=0.0.0.0 + LIVE_WS_ALLOWED_ORIGINS.",
+      "Start the real-time dashboard WebSocket server on import (port 20132, loopback-bound by default). Default: enabled. Set to '0' or 'false' to disable. LAN exposure requires LIVE_WS_HOST=0.0.0.0 + LIVE_WS_ALLOWED_ORIGINS.",
     descriptionI18nKey: "featureFlagOmnirouteEnableLiveWsDescription",
     category: "runtime",
     defaultValue: "true",
@@ -320,6 +395,18 @@ export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
     description:
       "Allow Codex to use the Responses-over-WebSocket transport (the codex CLI WS endpoint and codexTransport=websocket). When off, Codex falls back to HTTP Responses.",
     descriptionI18nKey: "featureFlagOmnirouteCodexWsEnabledDescription",
+    category: "runtime",
+    defaultValue: "true",
+    type: "boolean",
+    requiresRestart: false,
+    warningLevel: "info",
+  },
+  {
+    key: "OMNIROUTE_CODEX_APP_SERVER_ENABLED",
+    label: "Codex App-Server Transport",
+    description:
+      "Allow Codex to use the local app-server WebSocket JSON-RPC transport (codexTransport=app-server). When off, connections opted into app-server fall back to Codex's other transports.",
+    descriptionI18nKey: "featureFlagOmnirouteCodexAppServerEnabledDescription",
     category: "runtime",
     defaultValue: "true",
     type: "boolean",
@@ -393,6 +480,55 @@ export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
     descriptionI18nKey: "featureFlagArenaEloSyncEnabledDescription",
     category: "runtime",
     defaultValue: "true",
+    type: "boolean",
+    requiresRestart: false,
+    warningLevel: "info",
+  },
+  {
+    key: "EXPOSE_CC_DISCOVERY_ALIASES",
+    label: "Claude Code Discovery Aliases",
+    description:
+      "Advertise claude/<provider>/<model> mirror ids on /v1/models so Claude Code gateway model discovery lists non-Claude models. Warning: doubles catalog entries for all clients when enabled globally.",
+    descriptionI18nKey: "featureFlagExposeCcDiscoveryAliasesDescription",
+    category: "runtime",
+    defaultValue: "false",
+    type: "boolean",
+    requiresRestart: false,
+    warningLevel: "info",
+  },
+  {
+    key: "OMNIROUTE_CHAT_VIRTUAL_LANES",
+    label: "Adaptive Virtual Admission Lanes",
+    description:
+      "Enable per-tenant adaptive virtual admission lanes for provider dispatch (#9654): one tenant's burst no longer 503s another. The OMNIROUTE_CHAT_VIRTUAL_LANES env var wins over this dashboard override; changes take effect at server restart.",
+    descriptionI18nKey: "featureFlagChatVirtualLanesEnabledDescription",
+    category: "runtime",
+    defaultValue: "false",
+    type: "boolean",
+    requiresRestart: true,
+    warningLevel: "info",
+  },
+  {
+    key: "EXPOSE_FUNCTIONAL_GATEWAY_MIRRORS",
+    label: "Functional Gateway Mirrors",
+    description:
+      "Advertise <gateway-alias>/<model> mirror ids on /v1/models for models whose canonical owner has no active credential but a passthrough gateway with an active credential routes them. Warning: adds catalog entries for all clients when enabled globally.",
+    descriptionI18nKey: "featureFlagExposeFunctionalGatewayMirrorsDescription",
+    category: "runtime",
+    defaultValue: "false",
+    type: "boolean",
+    requiresRestart: false,
+    warningLevel: "info",
+  },
+
+  {
+    key: "NEWAPI_AGGREGATOR_BALANCE",
+    label: "New-API Aggregator Balance",
+    description:
+      "Enable balance detection for New-API / One-API / Sub2API aggregator compatible nodes. When enabled, compatible nodes with the aggregator flag set will report their balance in the dashboard and quota-preflight routing.",
+    descriptionI18nKey: "featureFlagNewApiAggregatorBalanceDescription",
+    category: "runtime",
+    defaultValue: "false",
     type: "boolean",
     requiresRestart: false,
     warningLevel: "info",

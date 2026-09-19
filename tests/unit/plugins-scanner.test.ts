@@ -36,7 +36,7 @@ describe("plugin scanner", () => {
         assert.ok(result.plugins[0].manifest);
         assert.ok(result.plugins[0].pluginDir);
       } finally {
-        rmSync(tmp, { recursive: true, force: true });
+        rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
     });
 
@@ -48,7 +48,7 @@ describe("plugin scanner", () => {
         const result = await mod.scanPluginDir(tmp);
         assert.equal(result.plugins.length, 0);
       } finally {
-        rmSync(tmp, { recursive: true, force: true });
+        rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
     });
 
@@ -59,7 +59,7 @@ describe("plugin scanner", () => {
         const result = await mod.scanPluginDir(tmp);
         assert.equal(result.plugins.length, 0);
       } finally {
-        rmSync(tmp, { recursive: true, force: true });
+        rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
     });
 
@@ -76,7 +76,7 @@ describe("plugin scanner", () => {
         const result = await mod.scanPluginDir(tmp);
         assert.equal(result.plugins.length, 2);
       } finally {
-        rmSync(tmp, { recursive: true, force: true });
+        rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
     });
   });

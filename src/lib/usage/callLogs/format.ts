@@ -1,21 +1,16 @@
 import type { RequestPipelinePayloads } from "@omniroute/open-sse/utils/requestLogger.ts";
+import { classifyProviderError } from "@omniroute/open-sse/services/errorClassifier.ts";
 import { sanitizePII } from "../../piiSanitizer";
-import { protectPayloadForLog } from "../../logPayloads";
+import { omitEncryptedReasoningFromLogChunks, protectPayloadForLog } from "../../logPayloads";
 import type { CallLogDetailState } from "../callLogArtifacts";
+// #7879: re-export the canonical helper so existing consumers of this module
+// keep importing `toNumber` from here unchanged.
+export { toNumber } from "@/shared/utils/numeric";
 
 type JsonRecord = Record<string, unknown>;
 
 export function asRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
-}
-
-export function toNumber(value: unknown): number {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim().length > 0) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-  return 0;
 }
 
 export function toStringOrNull(value: unknown): string | null {
@@ -85,9 +80,12 @@ export function protectPipelinePayloads(payloads: unknown): RequestPipelinePaylo
     if (key === "streamChunks" && value && typeof value === "object") {
       const chunks = value as Record<string, unknown>;
       const compacted = Object.fromEntries(
-        Object.entries(chunks).filter(
-          ([, chunkValue]) => Array.isArray(chunkValue) && chunkValue.length > 0
-        )
+        Object.entries(chunks)
+          .filter(([, chunkValue]) => Array.isArray(chunkValue) && chunkValue.length > 0)
+          .map(([stage, chunkValue]) => [
+            stage,
+            omitEncryptedReasoningFromLogChunks(chunkValue as string[]),
+          ])
       );
       if (Object.keys(compacted).length > 0) {
         protectedPayloads.streamChunks = protectPayloadForLog(
@@ -126,4 +124,23 @@ export function buildRequestSummary(
 
   if (Object.keys(summary).length === 0) return null;
   return JSON.stringify(summary);
+}
+
+// #10670: per-call error family at the single write point. Reuses the
+// production classifier (chatCore.ts:3974, auth.ts:2598) so the persisted
+// vocabulary is exactly PROVIDER_ERROR_TYPES. Successes (status < 400 with no
+// error text) short-circuit to null — the classifier never returns a family
+// for them anyway, this only skips the call.
+// Normalization: strings pass through, Error objects yield .message, any other
+// object yields "" (no caller passes plain objects — verified: 35 callers use
+// strings and Error only). Deliberate deviation from design §4 ("objet →
+// JSON.stringify"): a stringified object carries no classifier signal.
+export function classifyCallLogError(
+  status: number,
+  error: unknown,
+  provider?: string | null
+): string | null {
+  const errorText = typeof error === "string" ? error : error instanceof Error ? error.message : "";
+  if (status < 400 && errorText.length === 0) return null;
+  return classifyProviderError(status, errorText, provider);
 }

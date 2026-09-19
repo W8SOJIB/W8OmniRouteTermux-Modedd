@@ -13,7 +13,6 @@ import { isClaudeCodeCompatible } from "../services/provider.ts";
 import {
   getAntigravityUserAgent,
   GITHUB_COPILOT_CHAT_USER_AGENT,
-  getQwenOauthHeaders,
 } from "./providerHeaderProfiles.ts";
 import { normalizeCliCompatProviderId } from "@/shared/utils/cliCompat";
 
@@ -198,44 +197,6 @@ export const CLI_FINGERPRINTS: Record<string, CliFingerprint> = {
     ],
     userAgent: getAntigravityUserAgent,
   },
-  qwen: {
-    headerOrder: [
-      "Host",
-      "Content-Type",
-      "Authorization",
-      "User-Agent",
-      "X-Dashscope-AuthType",
-      "X-Dashscope-CacheControl",
-      "X-Dashscope-UserAgent",
-      "X-Stainless-Arch",
-      "X-Stainless-Lang",
-      "X-Stainless-Os",
-      "X-Stainless-Package-Version",
-      "X-Stainless-Retry-Count",
-      "X-Stainless-Runtime",
-      "X-Stainless-Runtime-Version",
-      "Connection",
-      "Accept",
-      "Accept-Language",
-      "Sec-Fetch-Mode",
-      "Accept-Encoding",
-    ],
-    bodyFieldOrder: [
-      "model",
-      "messages",
-      "temperature",
-      "top_p",
-      "max_tokens",
-      "stream",
-      "tools",
-      "tool_choice",
-      "response_format",
-      "n",
-      "stop",
-    ],
-    userAgent: getQwenOauthHeaders()["User-Agent"],
-    extraHeaders: getQwenOauthHeaders(),
-  },
 };
 
 /**
@@ -310,6 +271,8 @@ function stripInternalBodyFields(body: unknown): unknown {
   const record = body as Record<string, unknown>;
   delete record._claudeCodeRequiresLowercaseToolNames;
   delete record._nativeCodexPassthrough;
+  delete record._nativeXaiResponsesPassthrough;
+  delete record._nativeOpenAICompatibleResponsesPassthrough;
   delete record._omnirouteResponsesStore;
   return body;
 }

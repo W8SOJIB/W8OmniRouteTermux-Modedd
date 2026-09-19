@@ -19,9 +19,7 @@ export const FREE_TIER_BUDGETS: Record<string, number> = {
   cerebras: 30_000_000,
   "api-airforce": 24_000_000,
   "ollama-cloud": 20_000_000,
-  "github-models": 18_000_000,
   groq: 15_000_000,
-  inclusionai: 15_000_000,
   bluesminds: 7_200_000,
   sambanova: 6_000_000,
   "arcee-ai": 4_800_000,
@@ -42,6 +40,7 @@ export const FREE_TIER_BUDGETS: Record<string, number> = {
 export const FREE_TIER_TOS: Record<string, TosVerdict> = {
   opencode: "avoid",
   "duckduckgo-web": "avoid",
+  "felo-web": "avoid",
   agy: "avoid",
   kiro: "avoid",
   "amazon-q": "avoid",

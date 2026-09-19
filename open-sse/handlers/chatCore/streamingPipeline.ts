@@ -23,6 +23,17 @@ import { createPiiSseTransform as defaultPiiSse } from "@/lib/streamingPiiTransf
 import { isFeatureFlagEnabled as defaultFeatureFlag } from "@/shared/utils/featureFlags";
 import { OMNIROUTE_RESPONSE_HEADERS } from "@/shared/constants/headers";
 import { SSE_HEARTBEAT_INTERVAL_MS } from "../../config/constants.ts";
+/**
+ * Pipeline assembly instrumentation — performance.mark() along the SSE hot path.
+ * Marks are visible to Node.js perf_hooks consumers and DevTools' Performance
+ * panel when NODE_OPTIONS=--enable-node-performance-clinician or similar.
+ *
+ * Each call to assembleStreamingPipeline creates one measure record:
+ *   "omni-pipeline" — wall-clock duration of the full transform chain assembly.
+ */
+const PIPELINE_START = "omni-pipeline-start";
+const PIPELINE_END = "omni-pipeline-end";
+const PIPELINE_MEASURE = "omni-pipeline";
 
 type HeadersLike = Headers | Record<string, unknown> | null | undefined;
 
@@ -50,17 +61,21 @@ const DEFAULT_DEPS: StreamingPipelineDeps = {
 
 export function assembleStreamingPipeline(
   args: {
-    providerResponse: unknown;
-    transformStream: unknown;
-    streamController: { signal: AbortSignal };
+    providerResponse: Parameters<typeof defaultPipeWithDisconnect>[0];
+    transformStream: Parameters<typeof defaultPipeWithDisconnect>[1];
+    streamController: Parameters<typeof defaultPipeWithDisconnect>[2];
     createPiiTransform: unknown;
     clientRawRequestHeaders: HeadersLike;
-    clientResponseFormat: unknown;
+    clientResponseFormat: Parameters<typeof defaultShape>[0];
     echoModel: string | null | undefined;
     responseHeaders: Record<string, string>;
   },
   deps: StreamingPipelineDeps = DEFAULT_DEPS
 ) {
+  performance.clearMarks(PIPELINE_START);
+  performance.clearMarks(PIPELINE_END);
+  performance.clearMeasures(PIPELINE_MEASURE);
+  performance.mark(PIPELINE_START);
   // ── Phase 9.3: Progress tracking (opt-in) ──
   const progressEnabled = deps.wantsProgress(args.clientRawRequestHeaders);
   let finalStream;
@@ -77,7 +92,9 @@ export function assembleStreamingPipeline(
   }
 
   if (progressEnabled) {
-    const progressTransform = deps.createProgressTransform({ signal: args.streamController.signal });
+    const progressTransform = deps.createProgressTransform({
+      signal: args.streamController.signal,
+    });
     // Chain: provider → transform → progress → client
     finalStream = piiStream.pipeThrough(progressTransform);
     args.responseHeaders[OMNIROUTE_RESPONSE_HEADERS.progress] = "enabled";
@@ -95,5 +112,7 @@ export function assembleStreamingPipeline(
   if (args.echoModel) {
     finalStream = finalStream.pipeThrough(deps.createModelEchoTransform(args.echoModel));
   }
+  performance.mark(PIPELINE_END);
+  performance.measure(PIPELINE_MEASURE, PIPELINE_START, PIPELINE_END);
   return finalStream;
 }

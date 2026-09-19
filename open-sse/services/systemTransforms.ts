@@ -96,6 +96,10 @@ export const DEFAULT_OBFUSCATE_WORDS = [
   // Open WebUI additions
   "openwebui",
   "open-webui",
+  // Do not add "hermes" / "hermes-agent" here. #8350 is handled by
+  // HERMES_PARAGRAPH_ANCHORS + HERMES_IDENTITY_PREFIXES (system-prompt
+  // drops only). ZWJ on the short substring "hermes" rewrites user
+  // messages and hostnames (#10484).
 ];
 
 /**
@@ -117,6 +121,19 @@ export const PI_PARAGRAPH_ANCHORS = [
   "/.pi/",
   "Pi documentation (read only when the user asks about pi itself",
 ];
+
+/**
+ * Hermes (NousResearch/hermes-agent) paragraph anchors — the doc-link
+ * paragraph injected by `agent/prompt_builder.py` on the upstream CLI.
+ * Added on top of the other anchor lists for #8350.
+ */
+export const HERMES_PARAGRAPH_ANCHORS = [
+  "hermes-agent.nousresearch.com",
+  "github.com/NousResearch/hermes-agent",
+];
+
+/** Hermes identity paragraph prefixes ("You are Hermes Agent, ..."). */
+export const HERMES_IDENTITY_PREFIXES = ["You are Hermes Agent"];
 
 // ────────────────────────────────────────────────────────────────────────────
 // Per-provider defaults.
@@ -164,12 +181,18 @@ export const DEFAULT_CLAUDE_PIPELINE: TransformOp[] = [
       ...DEFAULT_PARAGRAPH_REMOVAL_ANCHORS,
       ...OPENWEBUI_PARAGRAPH_ANCHORS,
       ...PI_PARAGRAPH_ANCHORS,
+      ...HERMES_PARAGRAPH_ANCHORS,
     ],
   },
-  // Drop "You are OpenCode" + "You are Open WebUI" identity paragraphs.
+  // Drop "You are OpenCode" + "You are Open WebUI" + "You are Hermes Agent"
+  // identity paragraphs.
   {
     kind: "drop_paragraph_if_starts_with",
-    prefixes: [...DEFAULT_IDENTITY_PREFIXES, ...OPENWEBUI_IDENTITY_PREFIXES],
+    prefixes: [
+      ...DEFAULT_IDENTITY_PREFIXES,
+      ...OPENWEBUI_IDENTITY_PREFIXES,
+      ...HERMES_IDENTITY_PREFIXES,
+    ],
   },
   // Replace the "Here is some useful information about the environment you are
   // running in:" billing-gate trigger phrase + the "if OpenCode honestly"
@@ -319,9 +342,17 @@ function applyObfuscateWords(body: RequestBody, op: ObfuscateWordsOp): void {
       if (typeof content === "string") {
         msg.content = obfuscateWithList(content, words);
       } else if (Array.isArray(content)) {
-        for (const block of content as Array<Record<string, unknown>>) {
-          if (typeof block.text === "string") {
-            block.text = obfuscateWithList(block.text, words);
+        // A signed Anthropic thinking turn covers its text siblings too. Leave
+        // the entire turn byte-for-byte intact so its signature remains valid.
+        const blocks = content as Array<Record<string, unknown>>;
+        const hasSignedThinking = blocks.some(
+          (block) => block?.type === "thinking" || block?.type === "redacted_thinking"
+        );
+        if (!hasSignedThinking) {
+          for (const block of blocks) {
+            if (typeof block.text === "string") {
+              block.text = obfuscateWithList(block.text, words);
+            }
           }
         }
       }

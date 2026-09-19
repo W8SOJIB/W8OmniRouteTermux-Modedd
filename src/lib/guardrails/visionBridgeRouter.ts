@@ -5,6 +5,8 @@
 
 import { getResolvedModelCapabilities } from "@/lib/modelCapabilities";
 import { PROVIDER_MODELS, PROVIDER_ID_TO_ALIAS } from "@omniroute/open-sse/config/providerModels";
+import { hasUsableCredentialsForModel } from "./visionBridgeCredentials";
+import { isVisionBridgeForcedModel } from "@/shared/constants/visionBridgeDefaults";
 
 export interface VisionModelCandidate {
   modelId: string;
@@ -95,10 +97,33 @@ function calculateSuccessRate(modelId: string): number {
 }
 
 /**
- * Get all vision-capable models from the registry.
+ * Injectable dependencies for the router's credential-usability check.
+ * Defaults to the real `hasUsableCredentialsForModel` (DB-backed). Tests can
+ * inject a pure stub here instead of mocking the `@/lib/db/providers` module
+ * boundary — this project's Node native test runner (`node:test`) has no
+ * supported ESM module-mocking mechanism, so DI is the only way to exercise
+ * the credential-exclusion branch under `npm run test:unit`.
  */
-function getVisionCapableModels(): VisionModelCandidate[] {
+export interface VisionBridgeRouterDeps {
+  hasUsableCredentials?: (model: string) => Promise<boolean | null>;
+}
+
+/**
+ * Get all vision-capable models from the registry that also have a usable
+ * active connection on this instance.
+ *
+ * Without this credential check, a model with no working connection (e.g. the
+ * hardcoded default `openai/gpt-4o-mini` on an instance with no `openai`
+ * provider connected) could win selection, fail the describe call, and leave
+ * the guardrail's describe-failure fallback to forward the raw image to a
+ * non-vision backend, which rejects it with an opaque upstream error.
+ */
+async function getVisionCapableModels(
+  deps: VisionBridgeRouterDeps = {}
+): Promise<VisionModelCandidate[]> {
+  const checkCreds = deps.hasUsableCredentials ?? hasUsableCredentialsForModel;
   const candidates: VisionModelCandidate[] = [];
+  const checks: Array<Promise<void>> = [];
 
   for (const [providerAlias, models] of Object.entries(PROVIDER_MODELS)) {
     if (!Array.isArray(models)) continue;
@@ -109,29 +134,44 @@ function getVisionCapableModels(): VisionModelCandidate[] {
       const fullModelId = `${providerAlias}/${model.id}`;
       const caps = getResolvedModelCapabilities(fullModelId);
 
-      if (caps.supportsVision === true) {
-        // Determine priority based on provider type
-        let priority = 100;
-        if (providerAlias.startsWith("opencode-")) {
-          priority = 0; // Local/free models first
-        } else if (providerAlias === "openai" || providerAlias === "anthropic") {
-          priority = 50; // Major providers
-        } else {
-          priority = 75; // Other providers
-        }
+      if (caps.supportsVision === true && !isVisionBridgeForcedModel(fullModelId)) {
+        checks.push(
+          checkCreds(fullModelId).then((usable) => {
+            // Only a confirmed `false` excludes a candidate — `null` (indeterminate,
+            // e.g. unit tests / early boot) fails open so existing behavior is preserved
+            // when the credential store can't be checked.
+            if (usable === false) return;
 
-        candidates.push({
-          modelId: model.id,
-          fullName: fullModelId,
-          priority,
-          averageLatencyMs: calculateAverageLatency(fullModelId),
-          lastUsedAt: 0,
-          successRate: calculateSuccessRate(fullModelId),
-        });
+            // Determine priority based on provider type (lower = better).
+            // Do NOT prefer opencode-* first: those catalog entries often resolve to a
+            // noauth connection and 401 "Missing API key", hijacking working providers
+            // (e.g. zai/glm-5.2 combo targets) when Vision Bridge auto-reroutes.
+            let priority = 100;
+            if (providerAlias === "openai" || providerAlias === "anthropic") {
+              priority = 50; // Major providers with real API keys
+            } else if (providerAlias === "vertex" || providerAlias === "gemini") {
+              priority = 55;
+            } else if (providerAlias.startsWith("opencode-")) {
+              priority = 95; // Free/catalog — only if nothing credentialed is available
+            } else {
+              priority = 75; // Other providers
+            }
+
+            candidates.push({
+              modelId: model.id,
+              fullName: fullModelId,
+              priority,
+              averageLatencyMs: calculateAverageLatency(fullModelId),
+              lastUsedAt: 0,
+              successRate: calculateSuccessRate(fullModelId),
+            });
+          })
+        );
       }
     }
   }
 
+  await Promise.all(checks);
   return candidates;
 }
 
@@ -170,37 +210,51 @@ function selectBestModel(
 
 /**
  * Get the best vision model for image description.
- * Respects fixed model override if configured.
+ * Respects fixed model override if configured, but validates it has usable
+ * credentials before short-circuiting — a fixedModel that is confirmed
+ * unreachable on this instance falls through to auto-selection.
+ * Returns `null` when no vision-capable candidate has usable credentials.
  */
-export function getBestVisionModel(
-  config: Partial<VisionBridgeRouterConfig> = {}
-): string {
+export async function getBestVisionModel(
+  config: Partial<VisionBridgeRouterConfig> = {},
+  deps: VisionBridgeRouterDeps = {}
+): Promise<string | null> {
   const fullConfig = { ...DEFAULT_ROUTER_CONFIG, ...config };
 
-  // If fixed model is configured, use it
+  // If fixed model is configured, validate it has usable credentials first.
+  // (#8430) An unreachable fixedModel (e.g. the default "openai/gpt-4o-mini"
+  // on an instance with no OpenAI connection/key) must not short-circuit the
+  // credential check — fall through to auto-selection instead.
   if (fullConfig.fixedModel) {
-    return fullConfig.fixedModel;
+    const checkCreds = deps.hasUsableCredentials ?? hasUsableCredentialsForModel;
+    const usable = await checkCreds(fullConfig.fixedModel);
+    // Only skip credential validation when the check is indeterminate (null).
+    // A confirmed `false` means fall through to auto-selection.
+    if (usable !== false) {
+      return fullConfig.fixedModel;
+    }
   }
 
   // Check selection cache — key includes excluded models to prevent cache pollution
   // across different configurations
-  const cacheKey = fullConfig.excludedModels.length > 0
-    ? `excl:${[...fullConfig.excludedModels].sort().join(",")}`
-    : "default";
+  const cacheKey =
+    fullConfig.excludedModels.length > 0
+      ? `excl:${[...fullConfig.excludedModels].sort().join(",")}`
+      : "default";
   const cached = selectionCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
     return cached.modelId;
   }
 
   // Get all vision-capable candidates
-  const candidates = getVisionCapableModels();
+  const candidates = await getVisionCapableModels(deps);
 
   // Select best model
   const best = selectBestModel(candidates, fullConfig);
 
   if (!best) {
-    // Fallback to default
-    return "openai/gpt-4o-mini";
+    // No vision-capable candidate has usable credentials on this instance
+    return null;
   }
 
   // Cache the selection
@@ -215,12 +269,13 @@ export function getBestVisionModel(
 /**
  * Get fallback models for retry logic.
  */
-export function getFallbackModels(
+export async function getFallbackModels(
   excludeModel: string,
-  config: Partial<VisionBridgeRouterConfig> = {}
-): string[] {
+  config: Partial<VisionBridgeRouterConfig> = {},
+  deps: VisionBridgeRouterDeps = {}
+): Promise<string[]> {
   const fullConfig = { ...DEFAULT_ROUTER_CONFIG, ...config };
-  const candidates = getVisionCapableModels();
+  const candidates = await getVisionCapableModels(deps);
 
   const filtered = candidates.filter(
     (c) =>
@@ -250,7 +305,10 @@ export function clearSelectionCache(): void {
 /**
  * Get latency statistics for debugging.
  */
-export function getLatencyStats(): Record<string, { avg: number; samples: number; successRate: number }> {
+export function getLatencyStats(): Record<
+  string,
+  { avg: number; samples: number; successRate: number }
+> {
   const stats: Record<string, { avg: number; samples: number; successRate: number }> = {};
 
   for (const [modelId, records] of latencyStore.entries()) {

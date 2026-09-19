@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 const qoderCli = await import("../../open-sse/services/qoderCli.ts");
+const { qoderProvider } = await import("../../open-sse/config/providers/registry/qoder/index.ts");
 
 /**
  * Write a fake `qodercli` binary and point CLI_QODER_BIN at it (see the twin
@@ -37,7 +38,7 @@ function withStubQoderCli(fn: () => void | Promise<void>) {
   const restore = () => {
     if (prevBin === undefined) delete process.env.CLI_QODER_BIN;
     else process.env.CLI_QODER_BIN = prevBin;
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   };
   return Promise.resolve().then(fn).finally(restore);
 }
@@ -115,13 +116,105 @@ test("qoder cli static models are copied and model-to-level mapping covers major
   models[0].name = "mutated";
 
   assert.notEqual(snapshot[0].name, "mutated");
-  assert.equal(qoderCli.mapQoderModelToLevel("deepseek-r1"), "ultimate");
-  assert.equal(qoderCli.mapQoderModelToLevel("qwen3-max-preview"), "performance");
+  assert.deepEqual(
+    snapshot.map((model) => model.id),
+    [
+      "qwen3.8-max-preview",
+      "qwen3.7-max",
+      "qwen3.7-plus",
+      "kimi-k3",
+      "kimi-k2.7-code",
+      "glm-5.2",
+      "deepseek-v4-pro",
+      "deepseek-v4-flash",
+      "minimax-m3",
+    ]
+  );
+  assert.deepEqual(
+    snapshot,
+    qoderProvider.models.map(({ id, name }) => ({ id, name }))
+  );
+  assert.deepEqual(qoderProvider.models, [
+    {
+      id: "qwen3.8-max-preview",
+      name: "Qwen3.8-Max-Preview",
+      supportsVision: true,
+      supportsReasoning: true,
+      contextLength: 1_000_000,
+      maxInputTokens: 180_000,
+    },
+    {
+      id: "qwen3.7-max",
+      name: "Qwen3.7-Max",
+      supportsVision: true,
+      contextLength: 1_000_000,
+    },
+    {
+      id: "qwen3.7-plus",
+      name: "Qwen3.7-Plus",
+      supportsVision: true,
+      contextLength: 1_000_000,
+    },
+    {
+      id: "kimi-k3",
+      name: "Kimi-K3",
+      supportsVision: true,
+      contextLength: 1_000_000,
+      maxInputTokens: 180_000,
+    },
+    {
+      id: "kimi-k2.7-code",
+      name: "Kimi-K2.7-Code",
+      supportsVision: true,
+      contextLength: 256_000,
+    },
+    {
+      id: "glm-5.2",
+      name: "GLM-5.2",
+      supportsVision: true,
+      supportsReasoning: true,
+      contextLength: 1_000_000,
+    },
+    {
+      id: "deepseek-v4-pro",
+      name: "DeepSeek-V4-Pro",
+      supportsVision: true,
+      supportsReasoning: true,
+      contextLength: 1_000_000,
+    },
+    {
+      id: "deepseek-v4-flash",
+      name: "DeepSeek-V4-Flash",
+      supportsVision: true,
+      supportsReasoning: true,
+      contextLength: 1_000_000,
+    },
+    {
+      id: "minimax-m3",
+      name: "MiniMax-M3",
+      supportsVision: true,
+      contextLength: 1_000_000,
+    },
+  ]);
+  assert.equal(qoderCli.mapQoderModelToLevel("qwen3.8-max-preview"), "qmodel_preview");
+  assert.equal(qoderCli.mapQoderModelToLevel("qoder/qwen3.8-max-preview"), "qmodel_preview");
+  assert.equal(qoderCli.mapQoderModelToLevel("qwen3.7-max"), "qmodel_latest");
+  assert.equal(qoderCli.mapQoderModelToLevel("qwen3.7-plus"), "qmodel");
+  assert.equal(qoderCli.mapQoderModelToLevel("kimi-k3"), "kmodel_latest");
+  assert.equal(qoderCli.mapQoderModelToLevel("kimi-k2.7-code"), "kmodel");
+  assert.equal(qoderCli.mapQoderModelToLevel("deepseek-v4-pro"), "dmodel");
+  assert.equal(qoderCli.mapQoderModelToLevel("deepseek-v4-flash"), "dfmodel");
+  assert.equal(qoderCli.mapQoderModelToLevel("deepseek-r1"), "dmodel");
+  assert.equal(qoderCli.mapQoderModelToLevel("qwen3-max-preview"), "qmodel_preview");
+  assert.equal(qoderCli.mapQoderModelToLevel("qwen3-max"), "qmodel_latest");
   assert.equal(qoderCli.mapQoderModelToLevel("kimi-k2-0905"), "kmodel");
   assert.equal(qoderCli.mapQoderModelToLevel("qwen3-coder-plus"), "qmodel");
   assert.equal(qoderCli.mapQoderModelToLevel("qoder-rome-30ba3b"), "qmodel");
   assert.equal(qoderCli.mapQoderModelToLevel("glm-5.2"), "gm51model");
   assert.equal(qoderCli.mapQoderModelToLevel("minimax-m3"), "mmodel");
+  assert.equal(qoderCli.mapQoderModelToLevel("q35model_preview"), "qmodel_preview");
+  assert.equal(qoderCli.mapQoderModelToLevel("qmodel_preview"), "qmodel_preview");
+  assert.equal(qoderCli.mapQoderModelToLevel("kmodel_latest"), "kmodel_latest");
   assert.equal(qoderCli.mapQoderModelToLevel("gm51model"), "gm51model");
   assert.equal(qoderCli.mapQoderModelToLevel("totally-unknown"), "auto");
   assert.equal(qoderCli.mapQoderModelToLevel(""), null);
@@ -396,7 +489,7 @@ test("runQoderCli survives qodercli exiting before it reads a large stdin (async
   } finally {
     if (prevBin === undefined) delete process.env.CLI_QODER_BIN;
     else process.env.CLI_QODER_BIN = prevBin;
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -423,7 +516,7 @@ test("runQoderCli preserves multi-byte UTF-8 output (Chinese) via stream setEnco
   } finally {
     if (prevBin === undefined) delete process.env.CLI_QODER_BIN;
     else process.env.CLI_QODER_BIN = prevBin;
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -437,8 +530,9 @@ test("parseQoderCliModelNames extracts display names, dropping header/noise", ()
 });
 
 test("resolveQoderModelName prefers a live display name, then static, then Auto", () => {
-  const live = ["Auto", "GLM-5.2", "Kimi-K2.7-Code"];
+  const live = ["Auto", "Qwen3.8-Max-Preview", "GLM-5.2", "Kimi-K2.7-Code"];
   // punctuation/case-insensitive match against the live list
+  assert.equal(qoderCli.resolveQoderModelName("qwen3.8-max-preview", live), "Qwen3.8-Max-Preview");
   assert.equal(qoderCli.resolveQoderModelName("glm-5.2", live), "GLM-5.2");
   assert.equal(qoderCli.resolveQoderModelName("GLM-5.2", live), "GLM-5.2");
   assert.equal(qoderCli.resolveQoderModelName("kimi-k2.7-code", live), "Kimi-K2.7-Code");
@@ -487,6 +581,6 @@ test("runQoderCli resolves the request against live --list-models and passes the
     qoderCli.__clearQoderModelNamesCache();
     if (prevBin === undefined) delete process.env.CLI_QODER_BIN;
     else process.env.CLI_QODER_BIN = prevBin;
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });

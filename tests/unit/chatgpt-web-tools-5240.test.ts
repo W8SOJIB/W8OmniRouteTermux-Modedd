@@ -8,15 +8,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const { ChatGptWebExecutor, __resetChatGptWebCachesForTesting } = await import(
-  "../../open-sse/executors/chatgpt-web.ts"
-);
-const { __setTlsFetchOverrideForTesting } = await import(
-  "../../open-sse/services/chatgptTlsClient.ts"
-);
+const { ChatGptWebExecutor, __resetChatGptWebCachesForTesting } =
+  await import("../../open-sse/executors/chatgpt-web.ts");
+const { __setTlsFetchOverrideForTesting } =
+  await import("../../open-sse/services/chatgptTlsClient.ts");
 
 // ─── Minimal TLS-fetch mock ──────────────────────────────────────────────────
-// Tailored to the tool-call flow (gpt-5.3-instant, non-thinking): root/DPL,
+// Tailored to the tool-call flow (gpt-5.5, non-thinking): root/DPL,
 // session→accessToken, sentinel→token (no PoW), conv→SSE. Warmup GETs fall
 // through to 404, which the executor tolerates.
 
@@ -68,7 +66,10 @@ function installMockFetch(convEvents: unknown[]) {
       body: null,
     });
 
-    if ((u === "https://chatgpt.com/" || u === "https://chatgpt.com") && (opts.method || "GET") === "GET") {
+    if (
+      (u === "https://chatgpt.com/" || u === "https://chatgpt.com") &&
+      (opts.method || "GET") === "GET"
+    ) {
       return {
         status: 200,
         headers: makeHeaders({ "Content-Type": "text/html" }),
@@ -127,7 +128,7 @@ const TOOL_CALL_TEXT = '<tool>{"name":"get_weather","arguments":{"location":"Tok
 
 function baseOpts(extra: Record<string, unknown>) {
   return {
-    model: "gpt-5.3-instant",
+    model: "gpt-5.5",
     credentials: { apiKey: "test" },
     signal: AbortSignal.timeout(10_000),
     log: null,

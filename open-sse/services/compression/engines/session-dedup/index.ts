@@ -46,6 +46,20 @@ const ENGINE_ID = "session-dedup";
 const DEFAULT_MIN_BLOCK_CHARS = 80;
 /** Minimum number of lines a block must span to be a dedup candidate. */
 const MIN_BLOCK_LINES = 3;
+/**
+ * O(n²) guard for {@link findSuffixBlocks} (OOM incident): a single message with
+ * thousands of lines otherwise generates one full-length suffix string PER line,
+ * all retained at once. A real agent conversation embedding a large
+ * line-numbered file view (e.g. a tool result pasting a multi-thousand-line
+ * file back into the chat) drove ~1.7GB of live suffix strings and OOM-killed
+ * the 2GB heap (heap snapshot confirmed 6801 `{ block }` objects). These bound
+ * both the number of suffix starts scanned
+ * and the total bytes of retained blocks, so memory is O(budget) instead of O(n²).
+ * Dedup is best-effort — skipping the tail only forgoes some compression, never
+ * changes output correctness.
+ */
+const MAX_SUFFIX_STARTS = 2000;
+const MAX_TOTAL_BLOCK_BYTES = 8 * 1024 * 1024;
 
 // ─── hash helper (SHA-256 prefix, collision-resistant) ───────────────────────
 
@@ -75,12 +89,19 @@ function findSuffixBlocks(
   const seen = new Set<string>();
   const results: Array<{ block: string; startLine: number }> = [];
 
-  for (let start = 0; start < n; start++) {
+  // O(n²) guard (#OOM): cap the number of suffix starts and the total retained
+  // block bytes so a huge message can't materialize thousands of full-length
+  // suffix strings at once. See MAX_SUFFIX_STARTS / MAX_TOTAL_BLOCK_BYTES.
+  const maxStarts = Math.min(n, MAX_SUFFIX_STARTS);
+  let totalBlockBytes = 0;
+  for (let start = 0; start < maxStarts; start++) {
     const block = lines.slice(start).join("\n");
     const blockLines = n - start;
     if (blockLines >= MIN_BLOCK_LINES && block.length >= minBlockChars && !seen.has(block)) {
       seen.add(block);
       results.push({ block, startLine: start });
+      totalBlockBytes += block.length;
+      if (totalBlockBytes >= MAX_TOTAL_BLOCK_BYTES) break;
     }
   }
   return results;

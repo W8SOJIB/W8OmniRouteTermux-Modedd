@@ -6,6 +6,7 @@ import { useNotificationStore } from "@/store/notificationStore";
 import { useTranslations } from "next-intl";
 import AutoDisableCard from "./AutoDisableCard";
 import ModelLockoutCard from "./ModelLockoutCard";
+import { NumberField, BooleanField } from "./ResilienceFields";
 
 type RequestQueueSettings = {
   autoEnableApiKeyProviders: boolean;
@@ -47,7 +48,7 @@ type QuotaShareConcurrencyLimitSettings = {
   enabled: boolean;
 };
 
-type ProviderCooldownSettings = {
+export type ProviderCooldownSettings = {
   enabled: boolean;
   minRetryCooldownMs: number;
   maxRetryCooldownMs: number;
@@ -108,69 +109,6 @@ function SectionDescription({
         <span className="font-semibold text-text-main">{t("effectLabel")}:</span> {effect}
       </div>
     </div>
-  );
-}
-
-function NumberField({
-  label,
-  value,
-  suffix,
-  min = 0,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  suffix?: string;
-  min?: number;
-  onChange: (value: number) => void;
-}) {
-  return (
-    <label className="flex flex-col gap-1">
-      <span className="text-xs text-text-muted">{label}</span>
-      <div className="flex items-center gap-2">
-        <input
-          type="number"
-          min={min}
-          value={value}
-          onChange={(event) => {
-            if (event.target.value === "") return;
-            const nextValue = Number(event.target.value);
-            if (Number.isFinite(nextValue)) {
-              onChange(nextValue);
-            }
-          }}
-          className="w-full rounded-lg border border-border bg-bg-subtle px-3 py-2 text-sm"
-        />
-        {suffix ? <span className="text-xs text-text-muted">{suffix}</span> : null}
-      </div>
-    </label>
-  );
-}
-
-function BooleanField({
-  label,
-  description,
-  checked,
-  onChange,
-}: {
-  label: string;
-  description: string;
-  checked: boolean;
-  onChange: (value: boolean) => void;
-}) {
-  return (
-    <label className="flex items-start justify-between gap-3 rounded-lg border border-border bg-bg-subtle px-3 py-3">
-      <div>
-        <div className="text-sm font-medium text-text-main">{label}</div>
-        <div className="text-xs text-text-muted">{description}</div>
-      </div>
-      <input
-        type="checkbox"
-        checked={checked}
-        onChange={(event) => onChange(event.target.checked)}
-        className="mt-1 size-4 rounded border-border"
-      />
-    </label>
   );
 }
 
@@ -764,10 +702,10 @@ function ComboCooldownWaitCard({
     setDraft(value);
   }, [value]);
 
-  const title = t("resilienceComboCooldownWaitTitle") || "Quota-share combo cooldown wait";
+  const title = t("resilienceComboCooldownWaitTitle");
   const desc =
     t("resilienceComboCooldownWaitDesc") ||
-    "For quota-share combos only: wait out a short transient cooldown and re-dispatch instead of returning a 429 immediately. Never waits on quota_exhausted.";
+    "For all combo strategies: wait out a short transient cooldown and re-dispatch instead of returning a 429 immediately. Never waits on quota_exhausted.";
 
   return (
     <Card className="p-6">
@@ -797,29 +735,29 @@ function ComboCooldownWaitCard({
         {editing ? (
           <>
             <BooleanField
-              label={t("resilienceEnableServerWait") || "Enabled"}
+              label={t("resilienceEnableServerWait")}
               description={
                 t("resilienceComboCooldownWaitToggleDesc") ||
-                "Quota-share combos only; never waits on quota_exhausted."
+                "All combo strategies; never waits on quota_exhausted."
               }
               checked={draft.enabled}
               onChange={(enabled) => setDraft((prev) => ({ ...prev, enabled }))}
             />
             <NumberField
-              label={t("resilienceComboCooldownMaxWaitMs") || "Max wait per attempt"}
+              label={t("resilienceComboCooldownMaxWaitMs")}
               value={draft.maxWaitMs}
               min={0}
               suffix="ms"
               onChange={(maxWaitMs) => setDraft((prev) => ({ ...prev, maxWaitMs }))}
             />
             <NumberField
-              label={t("resilienceMaxAttempts") || "Max attempts"}
+              label={t("resilienceMaxAttempts")}
               value={draft.maxAttempts}
               min={0}
               onChange={(maxAttempts) => setDraft((prev) => ({ ...prev, maxAttempts }))}
             />
             <NumberField
-              label={t("resilienceComboCooldownBudgetMs") || "Total wait budget"}
+              label={t("resilienceComboCooldownBudgetMs")}
               value={draft.budgetMs}
               min={0}
               suffix="ms"
@@ -829,31 +767,23 @@ function ComboCooldownWaitCard({
         ) : (
           <>
             <div className="rounded-xl border border-border bg-bg-subtle p-4">
-              <div className="text-xs text-text-muted">
-                {t("resilienceEnableServerWait") || "Enabled"}
-              </div>
+              <div className="text-xs text-text-muted">{t("resilienceEnableServerWait")}</div>
               <div className="mt-1 text-sm font-semibold text-text-main">
                 {value.enabled ? t("statusEnabled") : t("statusDisabled")}
               </div>
             </div>
             <div className="rounded-xl border border-border bg-bg-subtle p-4">
-              <div className="text-xs text-text-muted">
-                {t("resilienceComboCooldownMaxWaitMs") || "Max wait per attempt"}
-              </div>
+              <div className="text-xs text-text-muted">{t("resilienceComboCooldownMaxWaitMs")}</div>
               <div className="mt-1 text-sm font-semibold text-text-main">
                 {formatMs(value.maxWaitMs)}
               </div>
             </div>
             <div className="rounded-xl border border-border bg-bg-subtle p-4">
-              <div className="text-xs text-text-muted">
-                {t("resilienceMaxAttempts") || "Max attempts"}
-              </div>
+              <div className="text-xs text-text-muted">{t("resilienceMaxAttempts")}</div>
               <div className="mt-1 text-sm font-semibold text-text-main">{value.maxAttempts}</div>
             </div>
             <div className="rounded-xl border border-border bg-bg-subtle p-4">
-              <div className="text-xs text-text-muted">
-                {t("resilienceComboCooldownBudgetMs") || "Total wait budget"}
-              </div>
+              <div className="text-xs text-text-muted">{t("resilienceComboCooldownBudgetMs")}</div>
               <div className="mt-1 text-sm font-semibold text-text-main">
                 {formatMs(value.budgetMs)}
               </div>
@@ -882,8 +812,7 @@ function QuotaShareConcurrencyLimitCard({
     setDraft(value);
   }, [value]);
 
-  const title =
-    t("resilienceQuotaShareConcurrencyTitle") || "Quota-share per-connection concurrency";
+  const title = t("resilienceQuotaShareConcurrencyTitle");
   const desc =
     t("resilienceQuotaShareConcurrencyDesc") ||
     "For quota-share combos only: when a connection sets a Max Concurrent cap, serialize concurrent requests to that subscription account so it is never flooded past its ceiling — excess requests wait in the queue instead of getting a 429. The cap comes from each connection's Max Concurrent field; this switch only enables/disables honoring it.";
@@ -915,7 +844,7 @@ function QuotaShareConcurrencyLimitCard({
       <div className="grid grid-cols-1 gap-3">
         {editing ? (
           <BooleanField
-            label={t("resilienceEnableServerWait") || "Enabled"}
+            label={t("resilienceEnableServerWait")}
             description={
               t("resilienceQuotaShareConcurrencyToggleDesc") ||
               "Quota-share combos only; honors each connection's Max Concurrent cap."
@@ -925,9 +854,7 @@ function QuotaShareConcurrencyLimitCard({
           />
         ) : (
           <div className="rounded-xl border border-border bg-bg-subtle p-4">
-            <div className="text-xs text-text-muted">
-              {t("resilienceEnableServerWait") || "Enabled"}
-            </div>
+            <div className="text-xs text-text-muted">{t("resilienceEnableServerWait")}</div>
             <div className="mt-1 text-sm font-semibold text-text-main">
               {value.enabled ? t("statusEnabled") : t("statusDisabled")}
             </div>
@@ -938,7 +865,7 @@ function QuotaShareConcurrencyLimitCard({
   );
 }
 
-function ProviderCooldownCard({
+export function ProviderCooldownCard({
   value,
   onSave,
   saving,
@@ -999,6 +926,7 @@ function ProviderCooldownCard({
               label={t("resilienceProviderCooldownMin")}
               value={editing.minRetryCooldownMs}
               min={0}
+              max={300000}
               suffix="ms"
               onChange={(minRetryCooldownMs) =>
                 setEditing((prev) => ({ ...prev, minRetryCooldownMs }))
@@ -1008,6 +936,7 @@ function ProviderCooldownCard({
               label={t("resilienceProviderCooldownMax")}
               value={editing.maxRetryCooldownMs}
               min={0}
+              max={3600000}
               suffix="ms"
               onChange={(maxRetryCooldownMs) =>
                 setEditing((prev) => ({ ...prev, maxRetryCooldownMs }))

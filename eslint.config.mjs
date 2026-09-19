@@ -1,6 +1,40 @@
 import nextVitals from "eslint-config-next/core-web-vitals";
 import tseslint from "typescript-eslint";
 
+// #7879: bar NEW local `toNumber` definitions outside the canonical helper.
+// Pre-existing definitions (~51 across the codebase) are frozen via
+// config/quality/eslint-suppressions.json and migrated tier-by-tier; only a
+// genuinely NEW `function toNumber`/`const toNumber = ...` should fail.
+const TO_NUMBER_RESTRICTION = {
+  selector: "FunctionDeclaration[id.name='toNumber'], VariableDeclarator[id.name='toNumber']",
+  message:
+    "New local `toNumber` definitions are barred — import `toNumber` from " +
+    "`@/shared/utils/numeric` instead (#7879). See that module's JSDoc for the " +
+    "canonical coercion shape and the `toNumberOrNull`/`toNumberArray` variants.",
+};
+
+const LOCAL_DB_IMPORT_RESTRICTION = {
+  regex: "^(?:@/lib/localDb(?:\\.ts)?|(?:\\.\\.?/)+(?:lib/)?localDb(?:\\.ts)?)$",
+  message:
+    "The localDb compatibility barrel is restricted — import the owning domain module " +
+    "from `@/lib/db/` instead.",
+};
+
+const EXECUTOR_IMPORT_RESTRICTION = {
+  regex: "^(?:@omniroute/)?open-sse/executors(?:/|$)",
+  message: "Executor implementations must stay behind an open-sse handler or service boundary.",
+};
+
+const PROP_TYPES_RESTRICTION = {
+  name: "prop-types",
+  message: "PropTypes are deprecated. Use TypeScript types/interfaces instead.",
+};
+
+const IMPORT_BOUNDARY_RESTRICTIONS = {
+  paths: [PROP_TYPES_RESTRICTION],
+  patterns: [LOCAL_DB_IMPORT_RESTRICTION],
+};
+
 /** @type {import("eslint").Linter.Config[]} */
 const eslintConfig = [
   ...nextVitals,
@@ -27,15 +61,36 @@ const eslintConfig = [
       "no-eval": "error",
       "no-implied-eval": "error",
       "no-new-func": "error",
+      "no-restricted-imports": ["error", IMPORT_BOUNDARY_RESTRICTIONS],
+      // New rule shipped by the eslint-config-next bump (#10043); flags 6 pre-existing
+      // window.location.href navigations, several of which are deliberate full-page
+      // reloads (login/logout state reset). Off pending per-case review — issue #10292.
+      "@next/next/no-location-assign-relative-destination": "off",
+    },
+  },
+  // G14: DB internals may use the compatibility barrel while it is decomposed; all
+  // other source files must import the owning src/lib/db domain module directly.
+  {
+    files: ["src/lib/db/**/*.{ts,tsx,js,jsx}"],
+    rules: {
       "no-restricted-imports": [
         "error",
         {
-          paths: [
-            {
-              name: "prop-types",
-              message: "PropTypes are deprecated. Use TypeScript types/interfaces instead.",
-            },
-          ],
+          paths: [PROP_TYPES_RESTRICTION],
+        },
+      ],
+    },
+  },
+  // G14: App routes/components must delegate provider execution through handlers or
+  // services instead of reaching into executor implementations.
+  {
+    files: ["src/app/**/*.{ts,tsx,js,jsx}"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          ...IMPORT_BOUNDARY_RESTRICTIONS,
+          patterns: [LOCAL_DB_IMPORT_RESTRICTION, EXECUTOR_IMPORT_RESTRICTION],
         },
       ],
     },
@@ -56,7 +111,26 @@ const eslintConfig = [
           message:
             "Türkçe-güvenli arama için matchesSearch() kullan (@/shared/utils/turkishText). Ham toLowerCase().includes() İ/ı karakterlerini bozar.",
         },
+        TO_NUMBER_RESTRICTION,
       ],
+    },
+  },
+  // #7879: same toNumber restriction for the rest of src/ and open-sse/ — kept
+  // as a separate block (via `ignores`) so it does not clobber the
+  // app/components-scoped rule array above (flat config replaces a rule's
+  // options entirely per matching file, it does not merge arrays).
+  {
+    files: ["src/**/*.ts", "open-sse/**/*.ts"],
+    ignores: ["src/app/**", "src/components/**"],
+    rules: {
+      "no-restricted-syntax": ["error", TO_NUMBER_RESTRICTION],
+    },
+  },
+  // Canonical helper module itself is exempt from its own restriction.
+  {
+    files: ["src/shared/utils/numeric.ts"],
+    rules: {
+      "no-restricted-syntax": "off",
     },
   },
   // Relaxed rules for open-sse and tests (incremental adoption)
@@ -69,6 +143,31 @@ const eslintConfig = [
       "@typescript-eslint/no-explicit-any": "error",
       "@next/next/no-assign-module-variable": "off",
       "react-hooks/rules-of-hooks": "off",
+    },
+  },
+  // Ratchet: bar NEW unused vars/args/catches outside the `_` escape hatch.
+  // Pre-existing violations are frozen via config/quality/eslint-suppressions.json
+  // (same pattern as #7879 toNumber); only genuinely NEW unused bindings fail
+  // lint. `args: "all"` (not `after-used`) so a leading unused param is never
+  // silently skipped, e.g. `function handle(req, _opts, next)` must flag `req`.
+  {
+    files: ["src/**/*.{ts,tsx,js,jsx}", "open-sse/**/*.ts", "tests/**/*.{ts,tsx,mjs}"],
+    plugins: {
+      "@typescript-eslint": tseslint.plugin,
+    },
+    rules: {
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        {
+          args: "all",
+          argsIgnorePattern: "^_",
+          varsIgnorePattern: "^_",
+          caughtErrors: "all",
+          caughtErrorsIgnorePattern: "^_",
+          destructuredArrayIgnorePattern: "^_",
+          ignoreRestSiblings: true,
+        },
+      ],
     },
   },
   // Global ignores — keep ESLint scoped to source files only
@@ -94,6 +193,14 @@ const eslintConfig = [
       // their files move mid-scan, so never lint them from the main checkout.
       ".claude/**",
       ".omnivscodeagent/**",
+      // _tasks/ — planning/handoff/research artifacts (gitignored, external code)
+      "_tasks/**",
+      // .agents/ — skill definitions + their helper scripts (gitignored; the
+      // canonical copy lives here and is symlinked into .claude/).
+      ".agents/**",
+      // .source/ — fumadocs codegen output (@ts-nocheck + bundler-only import
+      // query params like `?collection=docs`, which are not valid TS on their own).
+      ".source/**",
       // VS Code extension and its large test fixtures
       "vscode-extension/**",
       "_references/**",

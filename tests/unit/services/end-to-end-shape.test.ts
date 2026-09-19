@@ -328,6 +328,7 @@ describe("cliproxy — response shapes", () => {
       assert.ok("installedVersion" in b, "cliproxy status must include installedVersion");
       assert.ok("updateAvailable" in b, "cliproxy status must include updateAvailable");
       assert.ok("autoStart" in b, "cliproxy status must include autoStart");
+      assert.ok("providerExpose" in b, "cliproxy status must include providerExpose");
       assert.ok(typeof b.updateAvailable === "boolean", "updateAvailable must be boolean");
     });
   });
@@ -548,5 +549,5 @@ describe("Cross-service shape consistency", () => {
 
 after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });

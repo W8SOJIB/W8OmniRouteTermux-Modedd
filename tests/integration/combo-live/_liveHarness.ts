@@ -146,12 +146,12 @@ export async function createLiveHarness(prefix: string): Promise<LiveHarness> {
       }
     }
   } catch (err: any) {
-    fs.rmSync(snapshotDir, { recursive: true, force: true });
+    fs.rmSync(snapshotDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     throw new Error(`[liveHarness] Failed to fetch VPS secrets via ssh: ${err.message}`);
   }
 
   if (!storageEncryptionKey || !apiKeySecret) {
-    fs.rmSync(snapshotDir, { recursive: true, force: true });
+    fs.rmSync(snapshotDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     throw new Error(
       "[liveHarness] Could not parse STORAGE_ENCRYPTION_KEY or API_KEY_SECRET from VPS .env"
     );
@@ -182,7 +182,7 @@ export async function createLiveHarness(prefix: string): Promise<LiveHarness> {
       { timeout: 60_000 }
     );
   } catch (err: any) {
-    fs.rmSync(snapshotDir, { recursive: true, force: true });
+    fs.rmSync(snapshotDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     throw new Error(`[liveHarness] Failed to scp production DB: ${err.message}`);
   }
 
@@ -400,7 +400,7 @@ export async function createLiveHarness(prefix: string): Promise<LiveHarness> {
     resetAllCircuitBreakers();
     core.resetDbInstance();
     // Destroy the snapshot — targets only the temp dir, NEVER /root/.omniroute.
-    fs.rmSync(snapshotDir, { recursive: true, force: true });
+    fs.rmSync(snapshotDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 
   // Populate the map eagerly so servedProvider (sync) works right after

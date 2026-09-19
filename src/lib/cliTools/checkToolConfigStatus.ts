@@ -1,7 +1,12 @@
 // DRY: shared between /api/cli-tools/status and /api/cli-tools/all-statuses (plan 14 F2)
 
 import fs from "fs/promises";
-import { getCliPrimaryConfigPath } from "@/shared/services/cliRuntime";
+import { getCliConfigHome, getCliPrimaryConfigPath } from "@/shared/services/cliRuntime";
+import { hasOmniRouteQwenCodeConfig } from "@/shared/services/qwenCodeConfig";
+import {
+  parseGrokBuildConfig,
+  resolveGrokBuildConfigPath,
+} from "@/shared/services/grokBuildConfig";
 import { getRuntimePorts } from "@/lib/runtime/ports";
 
 const { apiPort } = getRuntimePorts();
@@ -20,10 +25,23 @@ export async function checkToolConfigStatus(
   _configPathOverride?: string
 ): Promise<"configured" | "not_configured" | "not_installed" | "unknown" | "other"> {
   try {
-    const configPath = _configPathOverride ?? getCliPrimaryConfigPath(toolId);
+    const configPath =
+      _configPathOverride ??
+      (toolId === "grok-build"
+        ? resolveGrokBuildConfigPath(process.env, getCliConfigHome())
+        : getCliPrimaryConfigPath(toolId));
     if (!configPath) return "unknown";
 
     const content = await fs.readFile(configPath, "utf-8");
+
+    if (toolId === "grok-build") {
+      const settings = parseGrokBuildConfig(content);
+      return settings.default === "omniroute" &&
+        settings.model?.base_url &&
+        settings.model.api_backend === "chat_completions"
+        ? "configured"
+        : "not_configured";
+    }
 
     // Codex uses TOML config — parse as raw text, not JSON
     if (toolId === "codex") {
@@ -67,17 +85,8 @@ export async function checkToolConfigStatus(
         return (config?.env as Record<string, unknown>)?.ANTHROPIC_BASE_URL
           ? "configured"
           : "not_configured";
-      case "qwen": {
-        // Check modelProviders for OmniRoute entries
-        const mp = config?.modelProviders;
-        if (!mp) return "not_configured";
-        const qwenConfigStr = JSON.stringify(mp).toLowerCase();
-        return qwenConfigStr.includes("omniroute") ||
-          qwenConfigStr.includes(`localhost:${apiPort}`) ||
-          qwenConfigStr.includes(`127.0.0.1:${apiPort}`)
-          ? "configured"
-          : "not_configured";
-      }
+      case "qwen":
+        return hasOmniRouteQwenCodeConfig(config) ? "configured" : "not_configured";
       case "droid":
       case "openclaw":
       case "cline":
@@ -96,8 +105,8 @@ export async function checkToolConfigStatus(
         // (user may configure an external domain instead of localhost)
         if (
           toolId === "cline" &&
-          ((config.actModeApiProvider === "openai" || config.planModeApiProvider === "openai") &&
-            ((config.openAiBaseUrl as string) || "").trim().length > 0)
+          (config.actModeApiProvider === "openai" || config.planModeApiProvider === "openai") &&
+          ((config.openAiBaseUrl as string) || "").trim().length > 0
         ) {
           return "configured";
         }

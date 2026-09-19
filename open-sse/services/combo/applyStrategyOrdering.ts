@@ -4,6 +4,11 @@ import { resolveMaxConcurrentByConnection } from "./concurrencyCaps.ts";
 import { sortTargetsByContextSize } from "./comboStructure.ts";
 import { selectQuotaShareTarget } from "./quotaShareStrategy.ts";
 import {
+  applyPromptCacheAffinity,
+  expandPromptCacheAffinityTargets,
+  resolvePromptCacheAffinityKey,
+} from "./promptCacheAffinity.ts";
+import {
   orderTargetsByHeadroom,
   orderTargetsByResetAwareQuota,
   orderTargetsByResetWindow,
@@ -21,6 +26,7 @@ export interface ApplyStrategyOrderingDeps {
   body: Record<string, unknown>;
   log: ComboLogger;
   apiKeyAllowedConnections: string[] | null;
+  sessionKey?: string | null;
 }
 
 /**
@@ -40,7 +46,7 @@ export async function applyStrategyOrdering(
   initialOrderedTargets: ResolvedComboTarget[],
   deps: ApplyStrategyOrderingDeps
 ): Promise<ResolvedComboTarget[]> {
-  const { combo, config, body, log, apiKeyAllowedConnections } = deps;
+  const { combo, config, body, log, apiKeyAllowedConnections, sessionKey } = deps;
   let orderedTargets = initialOrderedTargets;
 
   if (strategy === "lkgp") {
@@ -196,6 +202,16 @@ export async function applyStrategyOrdering(
   } else if (strategy === "context-optimized") {
     orderedTargets = sortTargetsByContextSize(orderedTargets);
     log.info("COMBO", `Context-optimized ordering: largest first (${orderedTargets[0]?.modelStr})`);
+  } else if (strategy === "cache-optimized") {
+    if (resolvePromptCacheAffinityKey(body)) {
+      orderedTargets = await expandPromptCacheAffinityTargets(orderedTargets);
+    }
+    const affinity = applyPromptCacheAffinity(orderedTargets, body, true, "global", sessionKey);
+    orderedTargets = affinity.targets;
+    log.info(
+      "COMBO",
+      `Cache-optimized ordering: ${orderedTargets[0]?.modelStr}${orderedTargets[0]?.connectionId ? ` (${orderedTargets[0].connectionId})` : ""} first`
+    );
   } else if (strategy === "headroom") {
     orderedTargets = await orderTargetsByHeadroom(
       orderedTargets,

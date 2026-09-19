@@ -9,7 +9,7 @@
  * so the server rejects the request.
  *
  * This pool keeps one Chromium instance warm and serves "browser contexts"
- * (one per provider) on demand. Each context owns one or more pages; the
+ * (one per caller-defined isolation key) on demand. Each context owns one or more pages; the
  * caller is expected to be polite (one page per request, close on done).
  *
  * The pool prefers `cloakbrowser` (npm) when available — its binary-level
@@ -33,11 +33,14 @@ type Page = import("playwright").Page;
 export interface BrowserPoolContextOptions {
   cookieDomain: string;
   cookieString?: string | null;
+  localStorage?: Record<string, string>;
+  localStorageOrigin?: string;
   warmupUrl?: string | null;
   userAgent?: string;
   locale?: string;
   timezone?: string;
   preferCloakbrowser?: boolean;
+  proxyProviderKey?: string;
 }
 
 export interface PooledContext {
@@ -149,8 +152,7 @@ function evictStaleContexts(): void {
   for (const [key, pooled] of state.contexts) {
     if (now - pooled.lastUsed > CONTEXT_TTL_MS) {
       console.log(
-        "[BrowserPool] Evicted stale context:",
-        key,
+        "[BrowserPool] Evicted stale context",
         "(idle",
         ((now - pooled.lastUsed) / 1000).toFixed(0) + "s)"
       );
@@ -212,6 +214,14 @@ export async function resolvePlaywrightProxy(
     console.warn("[BrowserPool] Failed to resolve proxy from DB:", err);
     return undefined;
   }
+}
+
+export async function resolveBrowserContextProxy(
+  contextKey: string,
+  options: Pick<BrowserPoolContextOptions, "proxyProviderKey">,
+  deps?: ResolvePlaywrightProxyDeps
+): Promise<import("playwright").LaunchOptions["proxy"] | undefined> {
+  return resolvePlaywrightProxy(options.proxyProviderKey ?? contextKey, deps);
 }
 
 async function launchBrowser(): Promise<Browser> {
@@ -306,6 +316,38 @@ function settlePendingContext(key: string, failed: boolean): void {
   state.pendingContexts.delete(key);
 }
 
+// Seed a freshly created context with whatever session material the caller
+// supplied — cookies for cookie-auth providers, localStorage for the ones (zai-web)
+// whose session is a Bearer JWT the page reads at boot. Kept as a leaf helper so
+// the creation closure stays under the complexity ceiling.
+async function seedContextSession(
+  context: BrowserContext,
+  options: BrowserPoolContextOptions
+): Promise<void> {
+  if (options.cookieString) {
+    const cookies = parseCookieString(options.cookieString, options.cookieDomain);
+    if (cookies.length > 0) {
+      await context.addCookies(cookies);
+    }
+  }
+
+  if (!options.localStorage || Object.keys(options.localStorage).length === 0) return;
+
+  const origin = new URL(options.localStorageOrigin || options.warmupUrl || "").origin;
+  await context.addInitScript(
+    ({ expectedOrigin, entries }) => {
+      if (window.location.origin !== expectedOrigin) return;
+      for (const [name, value] of entries) {
+        window.localStorage.setItem(name, value);
+      }
+    },
+    {
+      expectedOrigin: origin,
+      entries: Object.entries(options.localStorage),
+    }
+  );
+}
+
 export async function acquireBrowserContext(
   key: string,
   options: BrowserPoolContextOptions
@@ -329,7 +371,10 @@ export async function acquireBrowserContext(
   if (pending) return pending;
 
   const createPromise = (async (): Promise<PooledContext> => {
-    const [browser, proxy] = await Promise.all([launchBrowser(), resolvePlaywrightProxy(key)]);
+    const [browser, proxy] = await Promise.all([
+      launchBrowser(),
+      resolveBrowserContextProxy(key, options),
+    ]);
     const isStealth = state.cloakLaunch !== null;
     const context = await browser.newContext({
       userAgent: options.userAgent || DEFAULT_USER_AGENT,
@@ -339,12 +384,7 @@ export async function acquireBrowserContext(
       ...(proxy ? { proxy } : {}),
     });
 
-    if (options.cookieString) {
-      const cookies = parseCookieString(options.cookieString, options.cookieDomain);
-      if (cookies.length > 0) {
-        await context.addCookies(cookies);
-      }
-    }
+    await seedContextSession(context, options);
 
     let warmupPage: Page | null = null;
     if (options.warmupUrl) {
@@ -491,7 +531,7 @@ export function __resetBrowserPoolMetricsForTest(): void {
 
 export async function readPageResponseBody(
   response: import("playwright").Response
-): Promise<{ status: number; headers: Record<string, string>; body: Buffer }> {
+): Promise<{ status: number; headers: Record<string, string>; body: Buffer<ArrayBuffer> }> {
   const headers: Record<string, string> = {};
   for (const [name, value] of Object.entries(response.headers())) {
     headers[name] = value;

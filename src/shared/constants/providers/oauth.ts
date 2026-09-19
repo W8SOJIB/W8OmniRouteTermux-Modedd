@@ -2,7 +2,49 @@
  * Provider catalog data — extracted from providers.ts (god-file decomposition).
  * Pure data literal; re-exported by the providers.ts barrel. No behavior change.
  */
+import { GITLAB_DUO_OAUTH_SETUP_MESSAGE } from "@/shared/constants/gitlabDuoSetupMessage";
+
 export const OAUTH_PROVIDERS = {
+  "ghe-copilot": {
+    id: "ghe-copilot",
+    alias: "ghe-copilot",
+    name: "GitHub Enterprise Copilot",
+    icon: "code",
+    color: "#10B981",
+    subscriptionRisk: true,
+    riskNoticeVariant: "oauth",
+    authHint:
+      "Enter your GHE instance URL (e.g., https://ghe.company.com) in provider settings, then authenticate via device flow.",
+  },
+  "xai-oauth": {
+    id: "xai-oauth",
+    alias: "xao",
+    name: "xAI OAuth (Grok)",
+    icon: "auto_awesome",
+    color: "#1DA1F2",
+    textIcon: "XA",
+    website: "https://x.ai",
+    subscriptionRisk: true,
+    riskNoticeVariant: "oauth",
+    // Render xAI OAuth through the unified xAI dashboard card. Keep this
+    // catalog entry addressable for existing routes and stored connections.
+    hiddenFromDashboard: true,
+    authHint:
+      "Sign in with xAI to use api.x.ai models such as Grok 4.5. This is separate from Grok Build JWT sessions, which use cli-chat-proxy.grok.com and grok-build model aliases.",
+  },
+  openference: {
+    id: "openference",
+    alias: "of",
+    name: "Openference",
+    icon: "openference",
+    color: "#6366F1",
+    textIcon: "OF",
+    website: "https://openference.com",
+    hasFree: true,
+    freeNote: "Free plan: 3-day trial with open-source models — no credit card required",
+    authHint:
+      "Sign in with your Openference account to route requests through api.openference.com. An active plan is required for inference — OAuth may authenticate but return 402 without one.",
+  },
   "grok-cli": {
     id: "grok-cli",
     alias: "gc",
@@ -12,7 +54,7 @@ export const OAUTH_PROVIDERS = {
     subscriptionRisk: true,
     riskNoticeVariant: "oauth",
     authHint:
-      "Paste your ~/.grok/auth.json (or the JWT access token) from the Grok Build CLI; refresh_token is rotated automatically.",
+      "Sign in with your browser, or paste your ~/.grok/auth.json (or the JWT access token) from the Grok Build CLI; refresh_token is rotated automatically either way.",
   },
   qoder: {
     id: "qoder",
@@ -23,18 +65,6 @@ export const OAUTH_PROVIDERS = {
     subscriptionRisk: true,
     riskNoticeVariant: "oauth",
     hasFree: true,
-  },
-  qwen: {
-    id: "qwen",
-    alias: "qw",
-    name: "Qwen Code",
-    icon: "psychology",
-    color: "#10B981",
-    subscriptionRisk: true,
-    riskNoticeVariant: "deprecated",
-    deprecated: true,
-    deprecationReason:
-      "Qwen OAuth free tier was discontinued on 2026-04-15. Use 'bailian-coding-plan', 'alibaba', 'alibaba-cn', or 'openrouter' provider with API key instead.",
   },
   agy: {
     id: "agy",
@@ -110,8 +140,8 @@ export const OAUTH_PROVIDERS = {
     color: "#FC6D26",
     textIcon: "GL",
     website: "https://docs.gitlab.com/user/duo_agent_platform/code_suggestions/",
-    authHint:
-      "OAuth application with ai_features + read_user scopes. Configure GITLAB_DUO_OAUTH_CLIENT_ID and optionally GITLAB_DUO_OAUTH_CLIENT_SECRET on this OmniRoute instance.",
+    // #8688: full actionable recipe (same string as authorize error + OAuthModal setup step)
+    authHint: GITLAB_DUO_OAUTH_SETUP_MESSAGE,
   },
   cursor: {
     id: "cursor",
@@ -157,15 +187,33 @@ export const OAUTH_PROVIDERS = {
     authHint:
       "Trae is an AI-native IDE by ByteDance (SOLO remote agent). Authorize via trae.ai in the popup, or sign in at solo.trae.ai and paste the Cloud-IDE-JWT (sent as 'Authorization: Cloud-IDE-JWT <token>', ~14-day lifetime) as the access token; web_id/biz_user_id/user_unique_id/scope/tenant/region propagate via providerSpecificData. No headless refresh for pasted tokens — re-paste on expiry.",
   },
+  raycast: {
+    id: "raycast",
+    alias: "rc",
+    name: "Raycast Pro AI",
+    icon: "terminal",
+    color: "#FF6363",
+    textIcon: "RC",
+    website: "https://raycast.com/ai",
+    subscriptionRisk: true,
+    riskNoticeVariant: "oauth",
+    authHint:
+      "Unofficial integration — uses your Raycast Pro subscription via credentials from the macOS app (Auto-Import or manual capture). May break on Raycast updates. Not for redistribution; personal use only.",
+  },
   "kimi-coding": {
     id: "kimi-coding",
     alias: "kmc",
-    name: "Kimi Coding",
+    name: "Kimi Code CLI",
     icon: "psychology",
     color: "#1E40AF",
     textIcon: "KC",
+    // Kimi official-partnership aff link (2026-07) — the "Kimi Coding Plan"
+    // tracking link. Was previously unset (no header link rendered at all).
+    website: "https://www.kimi.com/code?aff=omniroute",
     subscriptionRisk: true,
     riskNoticeVariant: "oauth",
+    authHint:
+      "Sign in with the same Kimi account used by Kimi Code CLI. OmniRoute uses the CLI OAuth flow and Kimi Coding Plan endpoints.",
   },
   kilocode: {
     id: "kilocode",
@@ -191,23 +239,36 @@ export const OAUTH_PROVIDERS = {
     subscriptionRisk: true,
     riskNoticeVariant: "oauth",
   },
-  windsurf: {
-    id: "windsurf",
-    alias: "ws",
-    name: "Windsurf (Devin CLI)",
-    icon: "air",
-    color: "#00C5A0",
-    textIcon: "WS",
+  clinepass: {
+    id: "clinepass",
+    alias: "cp",
+    name: "ClinePass",
+    icon: "smart_toy",
+    color: "#9D4EDD",
+    textIcon: "CP",
+    website: "https://cline.bot/cline-pass",
     subscriptionRisk: true,
     riskNoticeVariant: "oauth",
     authHint:
-      'In the Windsurf / VS Code IDE, open the command palette and run `Windsurf: Provide Auth Token` (or click the Jupyter "Get Windsurf Authentication Token" button), then copy the shown token and paste it here. Note: opening windsurf.com/show-auth-token directly only renders a "Redirecting" page — the IDE must initiate the flow (it adds a `?state=...` param) for the token to appear.',
-    website: "https://windsurf.com",
+      "ClinePass is Cline's $9.99/mo subscription bundling 10 open coding models. Sign in with your Cline account (same login as the Cline CLI/IDE), or paste a direct ClinePass API key (app.cline.bot → Settings → API Keys). A ClinePass subscription unlocks the cline-pass/* models. Reuses the Cline WorkOS OAuth flow.",
+  },
+  "devin-desktop": {
+    id: "devin-desktop",
+    alias: undefined,
+    name: "Devin Desktop",
+    icon: "terminal",
+    color: "#6366F1",
+    textIcon: "DD",
+    subscriptionRisk: true,
+    riskNoticeVariant: "oauth",
+    authHint:
+      "Paste an existing Devin API key from an authenticated Devin session. Key export availability and steps vary by Devin version and account.",
+    website: "https://devin.ai",
   },
   "devin-cli": {
     id: "devin-cli",
     alias: "dv",
-    name: "Devin CLI (Official)",
+    name: "Devin CLI",
     icon: "terminal",
     color: "#6366F1",
     textIcon: "DV",

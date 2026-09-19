@@ -11,7 +11,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { sanitizeChatRequestBody } from "../../open-sse/handlers/chatCore/sanitization.ts";
-import { checkIdempotencyCache } from "../../open-sse/handlers/chatCore/idempotency.ts";
+import {
+  checkIdempotencyCache,
+  composeIdempotencyKey,
+} from "../../open-sse/handlers/chatCore/idempotency.ts";
 import { FORMATS } from "../../open-sse/translator/formats.ts";
 import { saveIdempotency } from "../../src/lib/idempotencyLayer.ts";
 
@@ -32,7 +35,10 @@ test("sanitizeChatRequestBody: Responses target maps max_completion_tokens → m
 });
 
 test("sanitizeChatRequestBody: Responses target maps max_tokens → max_output_tokens", () => {
-  const out = sanitizeChatRequestBody({ max_tokens: 128 }, FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI);
+  // #9161: token-field selection keys on the OUTBOUND (target) protocol only — a
+  // Responses-shaped SOURCE no longer forces max_output_tokens (see
+  // codex-responses-to-chat-9161.test.ts for that direction).
+  const out = sanitizeChatRequestBody({ max_tokens: 128 }, FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES);
   assert.equal(out.max_output_tokens, 128);
   assert.equal(out.max_tokens, undefined);
 });
@@ -46,6 +52,7 @@ test("sanitizeChatRequestBody: strips empty message name and filters nameless to
       ],
       tools: [
         { type: "function", function: { name: "real_tool", parameters: {} } },
+        { type: "web_search_preview" },
         { type: "function", function: { name: "" } }, // dropped — empty name
         { type: "function", function: {} }, // dropped — no name
       ],
@@ -59,8 +66,9 @@ test("sanitizeChatRequestBody: strips empty message name and filters nameless to
   assert.equal(messages[1].name, "keepme", "non-empty name kept");
 
   const tools = out.tools as Array<Record<string, unknown>>;
-  assert.equal(tools.length, 1, "only the named tool survives");
+  assert.equal(tools.length, 2, "the named function and built-in tool survive");
   assert.equal((tools[0].function as Record<string, unknown>).name, "real_tool");
+  assert.deepEqual(tools[1], { type: "web_search_preview" });
 });
 
 test("checkIdempotencyCache returns { hit:null, idempotencyKey } on a miss", async () => {
@@ -74,14 +82,32 @@ test("checkIdempotencyCache returns { hit:null, idempotencyKey } on a miss", asy
     log: undefined,
   });
   assert.equal(result.hit, null);
-  assert.equal(result.idempotencyKey, "idem-miss-3821");
+  // #6558: the raw header key is now namespaced by provider/model + a messages
+  // digest (composeIdempotencyKey) so fusion panel/judge sub-requests can't collide.
+  assert.equal(
+    result.idempotencyKey,
+    composeIdempotencyKey({
+      rawKey: "idem-miss-3821",
+      provider: "openai",
+      model: "gpt-4.1",
+      messages: undefined,
+    })
+  );
 });
 
 test("checkIdempotencyCache returns a hit Response reusing the same key after a save", async () => {
-  const key = "idem-hit-3821";
+  const rawKey = "idem-hit-3821";
+  // #6558: the store is keyed by the COMPOSED key, so the save site saves under the
+  // same derivation checkIdempotencyCache returns — reproduce that here.
+  const key = composeIdempotencyKey({
+    rawKey,
+    provider: "openai",
+    model: "gpt-4.1",
+    messages: undefined,
+  })!;
   saveIdempotency(key, { object: "chat.completion", choices: [], usage: {} }, 200);
 
-  const headers = new Headers({ "idempotency-key": key });
+  const headers = new Headers({ "idempotency-key": rawKey });
   const result = await checkIdempotencyCache({
     clientRawRequest: { headers },
     provider: "openai",

@@ -18,12 +18,12 @@ Visual guide to every section of the OmniRoute dashboard.
 
 The v3.7.x → v3.8.0 cycle added zero-config auto routing, new providers, OAuth flows, deeper resilience, and a much richer CLI experience. Headline features below — full details further in the document and in linked specs.
 
-- 🤖 **Auto Combo / Zero-config auto-routing** — use prefixes `auto/coding`, `auto/fast`, `auto/cheap`, `auto/offline`, `auto/smart`, `auto/lkgp`. Backed by a 9-factor scoring engine and 4 curated **mode packs** (ship-fast, cost-saver, quality-first, offline-friendly)
+- 🤖 **Auto Combo / Zero-config auto-routing** — use prefixes `auto/coding`, `auto/fast`, `auto/cheap`, `auto/offline`, `auto/smart`, `auto/lkgp`. Backed by a 13-factor scoring engine and 4 curated **mode packs** (ship-fast, cost-saver, quality-first, offline-friendly)
 - 🆕 **Command Code provider** (#2199) — first-class registration with model catalog and quota tracking
 - 🆕 **Z.AI provider** — new free-tier provider with quota labels
 - 🎬 **KIE media expansion** — extended catalog including video generation models
-- 🔐 **Windsurf + Devin CLI OAuth flows** (#2168) — end-to-end browser-based login
-- 🆓 **9 new free providers** — LLM7, Lepton, Kluster, UncloseAI, BazaarLink, Completions, Enally, FreeTheAi, Command Code
+- 🔐 **Devin authentication** — Desktop imports an existing Devin API key; the CLI uses local `devin auth login` credentials
+- 🆓 **8 new free providers** — LLM7, Lepton, UncloseAI, BazaarLink, Completions, Enally, FreeTheAi, Command Code
 - 🎯 **Manifest-aware tier routing W1–W4** — provider manifests drive weighted tier selection
 - 🎨 **Cursor full OpenAI parity** — tool calls, streaming, session management end-to-end
 - 📊 **Cursor Pro plan usage** — quota & cycle data surfaced in the provider-limits dashboard
@@ -51,7 +51,7 @@ The v3.7.x → v3.8.0 cycle added zero-config auto routing, new providers, OAuth
 
 ## 🔌 Providers
 
-Manage AI provider connections: OAuth providers (Claude Code, Codex), API key providers (Groq, DeepSeek, OpenRouter), and free providers (Qoder, Qwen, Kiro). Kiro accounts include credit balance tracking — remaining credits, total allowance, and renewal date visible in Dashboard → Usage.
+Manage AI provider connections: OAuth providers (Claude Code, Codex), API key providers (Groq, DeepSeek, OpenRouter), and free providers (Qoder, Kiro). Kiro accounts include credit balance tracking — remaining credits, total allowance, and renewal date visible in Dashboard → Usage.
 
 OpenRouter connections can store a per-connection `preset` in Advanced Settings. When set, OmniRoute sends it as the OpenRouter top-level request field, for example `"preset": "email-copywriter"`, unless the client request already supplied its own `preset`.
 
@@ -61,7 +61,7 @@ OpenRouter connections can store a per-connection `preset` in Advanced Settings.
 
 ## 🎨 Combos
 
-Create model routing combos with 17 strategies: priority, weighted, fill-first, round-robin, p2c (power-of-two-choices), random, least-used, cost-optimized, reset-aware, reset-window, headroom, strict-random, auto, lkgp (last-known-good-provider), context-optimized, context-relay, and **fusion** (fan out to a panel of models in parallel, then synthesize one answer via a judge). Each combo chains multiple models with automatic fallback and includes quick templates and readiness checks.
+Create model routing combos with 19 public strategies: priority, weighted, round-robin, context-relay, fill-first, p2c (power-of-two choices), random, least-used, cost-optimized, reset-aware, reset-window, headroom, strict-random, auto, lkgp (last-known-good-provider), context-optimized, cache-optimized, **fusion** (fan out to a panel of models in parallel, then synthesize one answer via a judge), and **pipeline**. Each combo chains multiple models with automatic fallback and includes quick templates and readiness checks.
 
 Recent combo improvements:
 
@@ -69,6 +69,17 @@ Recent combo improvements:
 - **Repeated provider support** — reuse the same provider many times in one combo as long as the `(provider, model, connection)` tuple is unique
 - **Combo target health** — analytics and health surfaces now distinguish individual combo targets/steps instead of collapsing everything into model strings
 - **Composite tier ordering** — `defaultTier -> fallbackTier` now influences runtime execution/fallback order for top-level combo steps
+- **System prompt templates** — combo `system_message` supports server-side
+  `{{MODEL_ID}}`, `{{PROVIDER_ID}}`, `{{ACCOUNT}}` and `{{FINGERPRINT}}`
+  placeholders, expanded from the actually-routed target right before dispatch.
+  Allowlisted and non-recursive; unknown placeholders stay literal; empty values
+  expand to empty; client system prompts are never rewritten. `{{FINGERPRINT}}`
+  resolves only for fingerprint-based free providers with a pinned or
+  auto-rotated fingerprint — it expands to empty elsewhere (e.g.
+  single-fingerprint connections, non-fp providers). Expansion covers the
+  standard dispatch loop, round-robin, and pinned context-cache sessions;
+  fusion, chaos, pipeline and nested-execute strategies do not expand
+  placeholders yet.
 
 ![Combos Dashboard](../screenshots/02-combos.png)
 
@@ -136,13 +147,13 @@ One-click configuration for AI coding tools: Claude Code, Codex CLI, OpenClaw, K
 
 ## 🤖 CLI Agents _(v2.0.11+)_
 
-Dashboard for discovering and managing CLI agents. Shows a grid of 17 built-in agents (Codex, Claude, Goose, OpenClaw, Aider, OpenCode, Cline, Qwen Code, ForgeCode, Amazon Q, Open Interpreter, Cursor CLI, Warp, **Windsurf**, **Devin CLI**, **Kimi Coding**, **Command Code**) with:
+Dashboard for discovering and managing CLI agents. Shows a grid of 16 built-in agents (Codex, Claude, Goose, OpenClaw, Aider, OpenCode, Cline, ForgeCode, Amazon Q, Open Interpreter, Cursor CLI, Warp, **Windsurf**, **Devin CLI**, **Kimi Coding**, **Command Code**) with:
 
 - **Installation status** — Installed / Not Found with version detection
 - **Protocol badges** — stdio, HTTP, etc.
 - **Custom agents** — Register any CLI tool via form (name, binary, version command, spawn args)
 - **CLI Fingerprint Matching** — Per-provider toggle to match native CLI request signatures, reducing ban risk while preserving proxy IP
-- **OAuth-backed agents** — Windsurf & Devin CLI now use browser OAuth flows for authentication (v3.8.0+)
+- **Local Devin authentication** — Devin CLI uses `devin auth login`; no browser OAuth flow is required
 
 ---
 

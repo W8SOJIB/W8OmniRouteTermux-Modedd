@@ -2,7 +2,7 @@
 // …). Extracted from validation.ts (god-file decomposition) — top-level functions/data with no
 // dispatcher-state captures; behavior is byte-identical to the original inline defs.
 import { SAFE_OUTBOUND_FETCH_PRESETS, safeOutboundFetch } from "@/shared/network/safeOutboundFetch";
-import { getProviderOutboundGuard } from "@/shared/network/outboundUrlGuard";
+import { getProviderOutboundGuard } from "@/shared/network/outboundUrlGuardPolicy";
 import { withCustomUserAgent } from "./headers";
 import { toValidationErrorResult, validationWrite } from "./transport";
 
@@ -77,6 +77,13 @@ export const SEARCH_VALIDATOR_CONFIGS: Record<
       body: JSON.stringify({ query: "test", max_results: 1 }),
     },
   }),
+  context7: (apiKey) => ({
+    url: "https://context7.com/api/v1/search?query=test",
+    init: {
+      method: "GET",
+      headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
+    },
+  }),
   "google-pse-search": (apiKey, providerSpecificData = {}) => {
     const cx = providerSpecificData?.cx;
     if (!cx || typeof cx !== "string") {
@@ -147,6 +154,19 @@ export const SEARCH_VALIDATOR_CONFIGS: Record<
       body: JSON.stringify({ query: "test", max_results: 1 }),
     },
   }),
+  "x-search": (apiKey) => ({
+    url: "https://api.x.ai/v1/responses",
+    init: {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: "grok-4.6",
+        stream: false,
+        input: "test",
+        tools: [{ type: "x_search" }],
+      }),
+    },
+  }),
   "zai-search": (apiKey, providerSpecificData = {}) => {
     const baseUrl =
       typeof providerSpecificData?.baseUrl === "string" && providerSpecificData.baseUrl.trim()
@@ -173,14 +193,26 @@ export const SEARCH_VALIDATOR_CONFIGS: Record<
   // Probe each provider's real fetch endpoint with the same Bearer auth the executor
   // uses; validateSearchProvider maps 200/<500 → valid, 401/403 → invalid key,
   // >=500 → failure (a credit-exhausted / rate-limited key still validates).
-  firecrawl: (apiKey) => ({
-    url: "https://api.firecrawl.dev/v1/scrape",
-    init: {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ url: "https://example.com", formats: ["markdown"] }),
-    },
-  }),
+  firecrawl: (apiKey, providerSpecificData = {}) => {
+    const envBase = process.env.FIRECRAWL_BASE_URL?.trim();
+    const baseUrl = envBase
+      ? envBase.replace(/\/+$/, "")
+      : typeof providerSpecificData?.baseUrl === "string" && providerSpecificData.baseUrl.trim()
+        ? providerSpecificData.baseUrl.trim().replace(/\/+$/, "")
+        : "https://api.firecrawl.dev";
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiKey) {
+      headers["Authorization"] = `Bearer ${apiKey}`;
+    }
+    return {
+      url: `${baseUrl}/v1/scrape`,
+      init: {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ url: "https://example.com", formats: ["markdown"] }),
+      },
+    };
+  },
   "jina-reader": (apiKey) => ({
     url: "https://r.jina.ai/https://example.com",
     init: {

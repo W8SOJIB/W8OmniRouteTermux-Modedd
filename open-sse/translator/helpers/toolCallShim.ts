@@ -53,8 +53,13 @@ function sanitizeReadArgs(args: Record<string, unknown>): void {
   }
 
   if (typeof args.limit === "number") {
-    if (args.limit > READ_MAX_LIMIT) args.limit = READ_MAX_LIMIT;
-    if (args.limit < 1) delete args.limit;
+    // Read into a local: assigning back to `args.limit` (declared `unknown`) resets the
+    // `typeof` narrowing, so the second comparison would no longer see a number. The two
+    // branches are mutually exclusive (READ_MAX_LIMIT is 2000), so testing the original
+    // value keeps the behavior identical.
+    const limit = args.limit;
+    if (limit > READ_MAX_LIMIT) args.limit = READ_MAX_LIMIT;
+    if (limit < 1) delete args.limit;
   }
   if (typeof args.offset === "number" && args.offset < 0) args.offset = 0;
 
@@ -84,8 +89,18 @@ const TOOL_SHIMS: Record<string, ShimFn> = {
   },
 };
 
+function resolveToolCallShim(name: string | undefined | null): ShimFn | undefined {
+  if (typeof name !== "string" || !name) return undefined;
+  if (Object.prototype.hasOwnProperty.call(TOOL_SHIMS, name)) return TOOL_SHIMS[name];
+  const lower = name.toLowerCase();
+  for (const [key, fn] of Object.entries(TOOL_SHIMS)) {
+    if (key.toLowerCase() === lower) return fn;
+  }
+  return undefined;
+}
+
 export function hasToolCallShim(name: string | undefined | null): boolean {
-  return typeof name === "string" && Object.prototype.hasOwnProperty.call(TOOL_SHIMS, name);
+  return Boolean(resolveToolCallShim(name));
 }
 
 /**
@@ -95,7 +110,7 @@ export function hasToolCallShim(name: string | undefined | null): boolean {
  * the shim with `{}` as input (so required arrays still get injected).
  */
 export function applyToolCallShimToBuffer(name: string, raw: string): string {
-  const shim = TOOL_SHIMS[name];
+  const shim = resolveToolCallShim(name);
   if (!shim) return raw;
 
   let parsed: unknown;

@@ -56,7 +56,12 @@ export async function POST(request) {
       customUserAgent,
       baseUrl: bodyBaseUrl,
       region,
+      accessKeyId,
+      sessionToken,
       cx,
+      runtimeKey,
+      tunnelId,
+      connectorName,
     } = validation.data;
 
     let providerSpecificData: any = { validationModelId };
@@ -69,9 +74,18 @@ export async function POST(request) {
     if (region) {
       providerSpecificData.region = region;
     }
+    if (accessKeyId) {
+      providerSpecificData.accessKeyId = accessKeyId;
+    }
+    if (sessionToken) {
+      providerSpecificData.sessionToken = sessionToken;
+    }
     if (cx) {
       providerSpecificData.cx = cx;
     }
+    if (runtimeKey) providerSpecificData.runtimeKey = runtimeKey;
+    if (tunnelId) providerSpecificData.tunnelId = tunnelId;
+    if (connectorName) providerSpecificData.connectorName = connectorName;
 
     if (isOpenAICompatibleProvider(provider) || isAnthropicCompatibleProvider(provider)) {
       const node: any = await getProviderNodeById(provider);
@@ -151,6 +165,8 @@ export async function POST(request) {
       error: result.valid ? null : result.error || "Invalid API key",
       warning: result.warning || null,
       method: result.method || null,
+      capabilities: result.capabilities || null,
+      providerSpecificData: result.providerSpecificData || null,
     });
   } catch (error) {
     console.log("Error validating API key:", error);

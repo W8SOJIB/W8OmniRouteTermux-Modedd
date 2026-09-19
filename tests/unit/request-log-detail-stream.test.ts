@@ -1,10 +1,32 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
 import React from "react";
-import { renderToStaticMarkup } from "react-dom/server";
+import { renderToStaticMarkup as reactRenderToStaticMarkup } from "react-dom/server";
+import { NextIntlClientProvider } from "next-intl";
 
 const { default: RequestLoggerDetail } =
   await import("../../src/shared/components/RequestLoggerDetail.tsx");
+
+// #9245 (7ca73697b0) localized RequestLoggerDetail (useTranslations("requestLogger.detail")),
+// so the component must render inside NextIntlClientProvider. Use the REAL English
+// messages — the assertions below pin the actual en.json copy, not a stub.
+const here = dirname(fileURLToPath(import.meta.url));
+const enMessages = JSON.parse(
+  readFileSync(resolve(here, "../../src/i18n/messages/en.json"), "utf8")
+);
+
+function renderToStaticMarkup(element: React.ReactElement) {
+  return reactRenderToStaticMarkup(
+    React.createElement(
+      NextIntlClientProvider,
+      { locale: "en", timeZone: "UTC", messages: { requestLogger: enMessages.requestLogger } },
+      element
+    )
+  );
+}
 
 test("event stream shows only when debugEnabled and appears above legacy response", () => {
   const html = renderToStaticMarkup(
@@ -53,6 +75,53 @@ test("event stream shows only when debugEnabled and appears above legacy respons
   assert(
     html.indexOf(">Provider Event Stream<") < html.indexOf(">Response Payload (Legacy)<"),
     "Event Stream should appear before Response Payload (Legacy)"
+  );
+});
+
+// Regression: commit 692d6be80 ("unify active and finished requests into single
+// view") swapped the collapsible PayloadSection for the new StreamSection (added
+// autoscroll) when rendering the provider/client event streams, but never carried
+// the collapse toggle over — StreamSection had none. Provider/Client Event Stream
+// panes silently lost the ability to collapse from that point on.
+test("Provider Event Stream and Client Event Stream panes are collapsible", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(RequestLoggerDetail, {
+      log: {
+        status: 200,
+        method: "POST",
+        path: "/v1/chat/completions",
+        timestamp: "2026-04-09T21:27:08.000Z",
+        duration: 2500,
+        provider: "gemini",
+        sourceFormat: "openai-chat",
+        model: "test-model",
+        tokens: { in: 1, out: 1 },
+      },
+      detail: {
+        pipelinePayloads: {
+          streamChunks: {
+            provider: ['data: {"content": "hello"}\n\n'],
+            client: ['data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'],
+          },
+        },
+        responseBody: "{}",
+      },
+      loading: false,
+      debugEnabled: true,
+      onClose: () => {},
+      onCopy: async () => true,
+    })
+  );
+
+  assert.notEqual(
+    html.indexOf('aria-label="Collapse Provider Event Stream"'),
+    -1,
+    "Provider Event Stream should render a collapse toggle"
+  );
+  assert.notEqual(
+    html.indexOf('aria-label="Collapse Client Event Stream"'),
+    -1,
+    "Client Event Stream should render a collapse toggle"
   );
 });
 

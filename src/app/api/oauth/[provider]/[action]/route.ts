@@ -12,6 +12,7 @@ import {
 import {
   persistOAuthConnection,
   buildOAuthConnectionCreatePayload,
+  findExistingOAuthConnectionMatch,
 } from "@/lib/oauth/connectionPersistence";
 import { createDeviceFlowTicket, getDeviceFlowTicketStatus } from "@/lib/oauth/deviceFlowTickets";
 import {
@@ -22,6 +23,9 @@ import {
   resolveProxyForProvider,
 } from "@/models";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
+import { isValidGheUrl } from "@/shared/validation/providerSpecificData";
+import { AWS_REGION_PATTERN } from "@/lib/oauth/constants/oauth";
+import { antigravityDegradedProjectState } from "@/lib/oauth/antigravityProjectGate";
 import { syncToCloud } from "@/lib/cloudSync";
 import { startLocalServer } from "@/lib/oauth/utils/server";
 import { runWithProxyContextOrDirect } from "@omniroute/open-sse/utils/proxyFetch.ts";
@@ -35,19 +39,17 @@ import {
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
+import { GITLAB_DUO_OAUTH_SETUP_MESSAGE } from "@/shared/constants/gitlabDuoSetupMessage";
 import { keychainImportOnlyGuard } from "./keychainImportOnly";
+import { buildRemoteOAuthHint } from "./remoteOAuthHint";
 
-// Use globalThis to persist callback server state across Next.js HMR reloads
-if (!globalThis.__codexCallbackState) {
-  globalThis.__codexCallbackState = null;
-}
-// Windsurf / Devin CLI PKCE callback server state (separate from Codex)
-if (!globalThis.__windsurfCallbackState) {
-  globalThis.__windsurfCallbackState = null;
+// Persist one callback server per provider across Next.js HMR reloads.
+if (!globalThis.__pkceCallbackStates) {
+  globalThis.__pkceCallbackStates = {};
 }
 
 /** Providers that use the PKCE browser callback flow (like Codex). */
-const PKCE_CALLBACK_PROVIDERS = new Set(["codex"]);
+const PKCE_CALLBACK_PROVIDERS = new Set(["codex", "xai-oauth", "grok-cli", "openference"]);
 
 /**
  * Providers whose device flow runs in the user's browser (auth.openai.com blocks
@@ -56,18 +58,26 @@ const PKCE_CALLBACK_PROVIDERS = new Set(["codex"]);
  */
 const BROWSER_DEVICE_FLOW_PROVIDERS = new Set(["codex"]);
 
+/** Device Code providers whose token grant does not use a PKCE verifier. */
+const NO_PKCE_DEVICE_CODE_PROVIDERS = new Set([
+  "github",
+  "kimi-coding",
+  "kilocode",
+  "codebuddy-cn",
+  "grok-cli",
+  "ghe-copilot",
+]);
+
 /**
  * Providers whose PKCE flow has been retired but whose import-token path is
  * still active. Returning 410 Gone on `authorize` / `start-callback-server` /
  * `poll-callback` (instead of 400) tells callers the action is permanently
- * gone and points them at /import-token. windsurf/devin-cli were retired
- * 2026-05-29 because app.devin.ai/editor/signin returned 404 post-rebrand.
- * Phase 2 will reintroduce browser login via Firebase OAuth + RegisterUser.
+ * gone and points them at /import-token.
  */
-const RETIRED_PKCE_PROVIDERS = new Set(["windsurf", "devin-cli"]);
+const RETIRED_PKCE_PROVIDERS = new Set(["devin-desktop", "devin-cli"]);
 
 /** Providers that allow direct import of a raw API token (no OAuth exchange). */
-const IMPORT_TOKEN_PROVIDERS = new Set(["windsurf", "devin-cli", "grok-cli"]);
+const IMPORT_TOKEN_PROVIDERS = new Set(["devin-desktop", "devin-cli", "grok-cli"]);
 
 /**
  * Constant-time string comparison to prevent timing-oracle attacks (CWE-208).
@@ -116,7 +126,6 @@ export async function GET(
   // The action permanently does not exist for these providers regardless of who
   // is asking — answering 401 first would mislead callers into thinking the
   // route is gated rather than gone. See spec
-  // _tasks/superpowers/specs/2026-05-29-windsurf-login-fix-design.md.
   try {
     const earlyParams = await params;
     if (
@@ -130,9 +139,7 @@ export async function GET(
           error:
             `Browser OAuth disabled for ${earlyParams.provider} — use import-token via ` +
             `/api/oauth/${earlyParams.provider}/import-token. ` +
-            `In the Windsurf/VS Code IDE, run the "Windsurf: Provide Auth Token" command ` +
-            `(or click the Jupyter "Get Windsurf Authentication Token" button), then copy+paste the shown token. ` +
-            `Opening https://windsurf.com/show-auth-token directly only shows a "Redirecting" page — the IDE must initiate the ?state=... flow.`,
+            `Paste an existing Devin API key from an authenticated Devin session. Key export availability and steps vary by Devin version and account.`,
         },
         { status: 410 }
       );
@@ -165,17 +172,14 @@ export async function GET(
             "Qoder browser OAuth is experimental and disabled by default. Configure QODER_OAUTH_* environment variables or use a Personal Access Token.",
         });
       }
-      // #3861: GitLab Duo needs a self-registered OAuth app. Without a client_id,
+      // #3861 / #8688: GitLab Duo needs a self-registered OAuth app. Without a client_id,
       // buildAuthUrl returns null — surface a clear setup message instead of a 500.
+      // Same copy is shown in the OAuthModal setup step *before* authorize (#8688).
       if (provider === "gitlab-duo" && !authData.authUrl) {
         return NextResponse.json({
           ...authData,
           supported: false,
-          error:
-            "GitLab Duo OAuth is not configured. Register an OAuth application at " +
-            "https://gitlab.com/-/profile/applications with redirect URI " +
-            'http://localhost:20128/callback and scopes "ai_features read_user", then set ' +
-            "GITLAB_DUO_OAUTH_CLIENT_ID (and optionally GITLAB_DUO_OAUTH_CLIENT_SECRET) and restart.",
+          error: GITLAB_DUO_OAUTH_SETUP_MESSAGE,
         });
       }
       return NextResponse.json(authData);
@@ -193,6 +197,10 @@ export async function GET(
       const authData = generateAuthData(provider, null);
       const startUrl = searchParams.get("startUrl");
       const region = searchParams.get("region") || "us-east-1";
+      const gheUrl = searchParams.get("gheUrl");
+      if (gheUrl && !isValidGheUrl(gheUrl)) {
+        return NextResponse.json({ error: "gheUrl must be a valid HTTPS URL" }, { status: 400 });
+      }
 
       // Resolve proxy for this provider (provider-level → global → direct)
       const proxy = await resolveProxyForProvider(provider);
@@ -200,15 +208,31 @@ export async function GET(
       // Request device code (through proxy if configured)
       let deviceData;
       if (
-        provider === "github" ||
+        NO_PKCE_DEVICE_CODE_PROVIDERS.has(provider) ||
         provider === "kiro" ||
-        provider === "amazon-q" ||
-        provider === "kimi-coding" ||
-        provider === "kilocode" ||
-        provider === "codebuddy-cn"
+        provider === "amazon-q"
       ) {
-        // GitHub, Kiro/Amazon Q, Kimi Coding, and KiloCode don't use PKCE for device code
-        if ((provider === "kiro" || provider === "amazon-q") && startUrl) {
+        // These providers don't use PKCE for device code.
+        if (provider === "ghe-copilot" && gheUrl) {
+          // GHE Copilot targets the enterprise host configured via gheUrl
+          const providerOverrideConfig = {
+            ...providerData.config,
+            gheUrl,
+          };
+          deviceData = await runWithProxyContextOrDirect(proxy, () =>
+            (requestDeviceCode as any)(provider, null, providerOverrideConfig)
+          );
+        } else if ((provider === "kiro" || provider === "amazon-q") && startUrl) {
+          // GHSA-7x63: `region` is interpolated into the AWS OIDC endpoint URLs
+          // below, which requestDeviceCode() then fetches. Validate it against the
+          // canonical AWS region shape before it can steer the outbound host to an
+          // attacker-chosen target (userinfo/fragment tricks → SSRF / metadata).
+          if (!AWS_REGION_PATTERN.test(region)) {
+            return NextResponse.json(
+              { error: "region must be a valid AWS region (e.g. us-east-1)" },
+              { status: 400 }
+            );
+          }
           const providerOverrideConfig = {
             ...providerData.config,
             startUrl,
@@ -242,7 +266,7 @@ export async function GET(
     }
 
     if (action === "start-callback-server") {
-      return await handleStartCallbackServer(provider, searchParams);
+      return await handleStartCallbackServer(provider, searchParams, request);
     }
 
     if (action === "public-link-status") {
@@ -259,16 +283,24 @@ export async function GET(
     return NextResponse.json({ error: "Unknown action" }, { status: 400 });
   } catch (error) {
     console.error("OAuth GET error:", error);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    // Surface the SANITIZED upstream reason instead of a generic 500 that hides WHY the flow failed.
+    // device-code providers (qwen → qwen.ai, codebuddy-cn → copilot.tencent.com) throw a descriptive
+    // message ("Device code request failed: …", "CodeBuddy state request failed (403)") that was being
+    // swallowed, so a geo-block / upstream outage looked identical to a real server bug in the UI.
+    const detail = sanitizeErrorMessage(error instanceof Error ? error.message : String(error));
+    return NextResponse.json({ error: detail || "Internal server error" }, { status: 500 });
   }
 }
 
 /**
- * Start PKCE callback server for Codex, Windsurf, or Devin CLI.
- * Codex uses fixed port 1455; Windsurf/Devin CLI use a random free port (port 0).
+ * Start a provider-configured PKCE callback server.
  * Returns the auth URL and stores codeVerifier for later exchange.
  */
-async function handleStartCallbackServer(provider: string, searchParams: URLSearchParams) {
+async function handleStartCallbackServer(
+  provider: string,
+  searchParams: URLSearchParams,
+  request?: Request
+) {
   if (!PKCE_CALLBACK_PROVIDERS.has(provider)) {
     return NextResponse.json(
       { error: `Callback server not supported for provider: ${provider}` },
@@ -276,58 +308,72 @@ async function handleStartCallbackServer(provider: string, searchParams: URLSear
     );
   }
 
-  const isWindsurf = provider === "windsurf" || provider === "devin-cli";
-  const stateKey = isWindsurf ? "__windsurfCallbackState" : "__codexCallbackState";
+  const callbackStates = globalThis.__pkceCallbackStates;
 
   // Clean up existing server if any
-  if (globalThis[stateKey]?.close) {
+  if (callbackStates[provider]?.close) {
     try {
-      globalThis[stateKey].close();
+      callbackStates[provider].close();
     } catch (e) {
       /* ignore */
     }
   }
-  globalThis[stateKey] = null;
+  delete callbackStates[provider];
 
   try {
-    // Codex: fixed port 1455. Windsurf/Devin CLI: OS-assigned random port (0)
-    const serverPort = isWindsurf ? 0 : 1455;
+    const providerData = getProvider(provider);
+    const serverPort = providerData.fixedPort || 0;
+    const callbackPath = providerData.callbackPath || "/callback";
+    const callbackHost = providerData.callbackHost || "localhost";
     const { port, close } = await startLocalServer((params) => {
-      if (globalThis[stateKey]) {
-        globalThis[stateKey].callbackParams = params;
+      if (callbackStates[provider]) {
+        callbackStates[provider].callbackParams = params;
       }
     }, serverPort);
 
-    const redirectUri = `http://localhost:${port}/auth/callback`;
+    const redirectUri = `http://${callbackHost}:${port}${callbackPath}`;
     const authData = generateAuthData(provider, redirectUri);
 
-    globalThis[stateKey] = {
+    callbackStates[provider] = {
       callbackParams: null,
       close,
       port,
       redirectUri,
       codeVerifier: authData.codeVerifier,
+      state: authData.state,
       startedAt: Date.now(),
     };
 
     // Auto-cleanup after 5 minutes
     const startedAt = Date.now();
     setTimeout(() => {
-      if (globalThis[stateKey]?.startedAt === startedAt) {
+      if (callbackStates[provider]?.startedAt === startedAt) {
         try {
           close();
         } catch (e) {
           /* ignore */
         }
-        globalThis[stateKey] = null;
+        delete callbackStates[provider];
       }
     }, 300000);
+
+    // #7523: the PKCE callback server listens on the SERVER's loopback
+    // (localhost:PORT). When the operator drives the OAuth flow from a
+    // *different* machine (OmniRoute running on a remote host/VPS), the
+    // provider redirects the browser to the operator's own localhost:PORT,
+    // not the server's — so the final confirmation screen hangs forever.
+    // Detect a non-loopback Host and surface the reverse-tunnel instruction
+    // (or steer to the paste/import flow) instead of a silent hang.
+    const hostHeader =
+      request?.headers.get("x-forwarded-host") || request?.headers.get("host") || null;
+    const remoteHint = buildRemoteOAuthHint(hostHeader, port);
 
     return NextResponse.json({
       authUrl: authData.authUrl,
       codeVerifier: authData.codeVerifier,
       redirectUri,
       serverPort: port,
+      ...remoteHint,
     });
   } catch (error) {
     console.error("OAuth start-callback-server error:", error);
@@ -354,9 +400,7 @@ export async function POST(
           error:
             `Browser OAuth disabled for ${earlyParams.provider} — use import-token via ` +
             `/api/oauth/${earlyParams.provider}/import-token. ` +
-            `In the Windsurf/VS Code IDE, run the "Windsurf: Provide Auth Token" command ` +
-            `(or click the Jupyter "Get Windsurf Authentication Token" button), then copy+paste the shown token. ` +
-            `Opening https://windsurf.com/show-auth-token directly only shows a "Redirecting" page — the IDE must initiate the ?state=... flow.`,
+            `Paste an existing Devin API key from an authenticated Devin session. Key export availability and steps vary by Devin version and account.`,
         },
         { status: 410 }
       );
@@ -375,18 +419,15 @@ export async function POST(
     const { provider, action } = await params;
 
     // Phase 1 hotfix (2026-05-29): retired PKCE flows return 410 Gone before
-    // body parsing. windsurf/devin-cli `poll-callback` is permanently retired
-    // because the upstream PKCE endpoint returns 404. Use /import-token
-    // (handled later in this same handler) for those providers instead.
+    // body parsing. Devin Desktop/CLI `poll-callback` is permanently retired;
+    // use /import-token (handled later in this same handler) instead.
     if (RETIRED_PKCE_PROVIDERS.has(provider) && action === "poll-callback") {
       return NextResponse.json(
         {
           error:
             `Browser OAuth disabled for ${provider} — use import-token via ` +
             `/api/oauth/${provider}/import-token. ` +
-            `In the Windsurf/VS Code IDE, run the "Windsurf: Provide Auth Token" command ` +
-            `(or click the Jupyter "Get Windsurf Authentication Token" button), then copy+paste the shown token. ` +
-            `Opening https://windsurf.com/show-auth-token directly only shows a "Redirecting" page — the IDE must initiate the ?state=... flow.`,
+            `Paste an existing Devin API key from an authenticated Devin session. Key export availability and steps vary by Devin version and account.`,
         },
         { status: 410 }
       );
@@ -447,7 +488,15 @@ export async function POST(
       const normalizedState = typeof state === "string" && state.length > 0 ? state : undefined;
       const providerData = getProvider(provider);
 
-      if (providerData.flowType === "authorization_code_pkce" && !codeVerifier) {
+      // Capability check, not a bare flowType equality: grok-cli keeps flowType
+      // "device_code" as its primary flow (#7358) while ALSO exposing a browser
+      // PKCE login via supportsBrowserPkce (#7013 rework) — its exchange still
+      // needs a codeVerifier when the browser method was used. Other providers
+      // are untouched since only grok-cli sets supportsBrowserPkce.
+      if (
+        (providerData.flowType === "authorization_code_pkce" || providerData.supportsBrowserPkce) &&
+        !codeVerifier
+      ) {
         return NextResponse.json(
           {
             error: {
@@ -472,6 +521,12 @@ export async function POST(
         exchangeTokens(provider, code, redirectUri, codeVerifier, normalizedState)
       );
 
+      // #11284: when Cloud Code projectId discovery failed at connect time,
+      // SAVE the connection but mark it degraded (maintainer direction on
+      // #11284) — the refresh token stays stored and request-time bootstrap
+      // self-heals the row once Google assigns a project.
+      const degradedProject = antigravityDegradedProjectState(provider, tokenData);
+
       // Normalize: if name is missing, use email or displayName as fallback so accounts
       // always show a real label (e.g. user@gmail.com) instead of "Account #abc123"
       if (!tokenData.name && (tokenData.email || tokenData.displayName)) {
@@ -486,30 +541,23 @@ export async function POST(
       let connection: any;
       if (tokenData.email) {
         const existing = await getProviderConnections({ provider });
-        const match = existing.find((c: any) => {
-          if (c.id && safeEqual(connectionId, c.id)) return true;
-          // safeEqual: constant-time comparison to prevent timing attacks (CWE-208, finding #258-6/7)
-          if (!safeEqual(c.email, tokenData.email) || c.authType !== "oauth") return false;
-          // For Codex, also check workspaceId to avoid overwriting different workspace connections
-          if (provider === "codex" && tokenData.providerSpecificData?.workspaceId) {
-            const existingWorkspace = c.providerSpecificData?.workspaceId;
-            return safeEqual(existingWorkspace, tokenData.providerSpecificData.workspaceId);
-          }
-          return true;
-        });
+        // Codex accounts sharing an email require workspaceId/chatgptUserId
+        // agreement to be treated as the same account (#7737).
+        const match = findExistingOAuthConnectionMatch(existing, provider, tokenData, connectionId);
         const matchId = typeof match?.id === "string" ? match.id : null;
         if (matchId) {
           connection = await updateProviderConnection(matchId, {
             ...tokenData,
             expiresAt,
-            testStatus: "active",
+            testStatus: degradedProject?.testStatus ?? "active",
+            ...(degradedProject ?? {}),
             isActive: true,
           });
         }
       }
       if (!connection) {
         connection = await createProviderConnection(
-          buildOAuthConnectionCreatePayload(provider, tokenData, expiresAt)
+          buildOAuthConnectionCreatePayload(provider, tokenData, expiresAt, degradedProject)
         );
       }
 
@@ -518,6 +566,7 @@ export async function POST(
 
       return NextResponse.json({
         success: true,
+        ...(degradedProject ? { warning: degradedProject.warning } : {}),
         connection: {
           id: connection.id,
           provider: connection.provider,
@@ -535,13 +584,18 @@ export async function POST(
 
       // Poll for token (through proxy if configured)
       let result;
-      if (
-        provider === "github" ||
-        provider === "kimi-coding" ||
-        provider === "kilocode" ||
-        provider === "codebuddy-cn"
-      ) {
-        // For providers that don't use PKCE (GitHub, Kimi Coding, KiloCode), don't pass codeVerifier
+      if (provider === "ghe-copilot") {
+        // GHE Copilot needs gheUrl threaded through poll → postExchange
+        const gheUrl =
+          extraData && typeof extraData === "object" ? (extraData as any).gheUrl : undefined;
+        if (typeof gheUrl === "string" && gheUrl && !isValidGheUrl(gheUrl)) {
+          return NextResponse.json({ error: "gheUrl must be a valid HTTPS URL" }, { status: 400 });
+        }
+        result = await runWithProxyContextOrDirect(proxy, () =>
+          (pollForToken as any)(provider, deviceCode, null, gheUrl ? { gheUrl } : undefined)
+        );
+      } else if (NO_PKCE_DEVICE_CODE_PROVIDERS.has(provider)) {
+        // Non-PKCE device providers do not receive a code verifier.
         result = await runWithProxyContextOrDirect(proxy, () =>
           (pollForToken as any)(provider, deviceCode)
         );
@@ -574,17 +628,14 @@ export async function POST(
         let connection: any;
         if (result.tokens.email) {
           const existing = await getProviderConnections({ provider });
-          const match = existing.find((c: any) => {
-            if (c.id && safeEqual(connectionId, c.id)) return true;
-            // safeEqual: constant-time comparison to prevent timing attacks (CWE-208, finding #258-8/9)
-            if (!safeEqual(c.email, result.tokens.email) || c.authType !== "oauth") return false;
-            // For Codex, also check workspaceId to avoid overwriting different workspace connections
-            if (provider === "codex" && result.tokens.providerSpecificData?.workspaceId) {
-              const existingWorkspace = c.providerSpecificData?.workspaceId;
-              return safeEqual(existingWorkspace, result.tokens.providerSpecificData.workspaceId);
-            }
-            return true;
-          });
+          // Codex accounts sharing an email require workspaceId/chatgptUserId
+          // agreement to be treated as the same account (#7737).
+          const match = findExistingOAuthConnectionMatch(
+            existing,
+            provider,
+            result.tokens,
+            connectionId
+          );
           const matchId = typeof match?.id === "string" ? match.id : null;
           if (matchId) {
             connection = await updateProviderConnection(matchId, {
@@ -638,10 +689,9 @@ export async function POST(
         );
       }
 
-      // Windsurf and Devin CLI share __windsurfCallbackState; Codex uses its own slot
-      const stateKey = provider === "codex" ? "__codexCallbackState" : "__windsurfCallbackState";
+      const callbackStates = globalThis.__pkceCallbackStates;
 
-      if (!globalThis[stateKey]) {
+      if (!callbackStates[provider]) {
         return NextResponse.json({
           success: false,
           error: "no_server",
@@ -649,13 +699,13 @@ export async function POST(
         });
       }
 
-      if (!globalThis[stateKey].callbackParams) {
+      if (!callbackStates[provider].callbackParams) {
         return NextResponse.json({ success: false, pending: true });
       }
 
       // Callback received! Extract code and exchange for tokens
-      const params = globalThis[stateKey].callbackParams;
-      const { redirectUri, codeVerifier, close } = globalThis[stateKey];
+      const params = callbackStates[provider].callbackParams;
+      const { redirectUri, codeVerifier, state, close } = callbackStates[provider];
 
       // Clean up server
       try {
@@ -663,7 +713,7 @@ export async function POST(
       } catch (e) {
         /* ignore */
       }
-      globalThis[stateKey] = null;
+      delete callbackStates[provider];
 
       if (params.error) {
         return NextResponse.json({
@@ -681,6 +731,14 @@ export async function POST(
         });
       }
 
+      if (!safeEqual(params.state, state)) {
+        return NextResponse.json({
+          success: false,
+          error: "invalid_state",
+          errorDescription: "OAuth state mismatch",
+        });
+      }
+
       try {
         // Resolve proxy for this provider
         const proxy = await resolveProxyForProvider(provider);
@@ -689,6 +747,10 @@ export async function POST(
         const tokenData = await runWithProxyContextOrDirect(proxy, () =>
           exchangeTokens(provider, params.code, redirectUri, codeVerifier, params.state)
         );
+
+        // #11284: when Cloud Code projectId discovery failed at connect time,
+        // SAVE the connection but mark it degraded (maintainer direction).
+        const degradedProject = antigravityDegradedProjectState(provider, tokenData);
 
         // Normalize: if name is missing, use email as fallback display label
         if (!tokenData.name && (tokenData.email || tokenData.displayName)) {
@@ -703,30 +765,28 @@ export async function POST(
         let connection: any;
         if (tokenData.email) {
           const existing = await getProviderConnections({ provider });
-          const match = existing.find((c: any) => {
-            if (c.id && safeEqual(connectionId, c.id)) return true;
-            // safeEqual: constant-time comparison to prevent timing attacks (CWE-208, finding #258-6/7)
-            if (!safeEqual(c.email, tokenData.email) || c.authType !== "oauth") return false;
-            // For Codex, also check workspaceId to avoid overwriting different workspace connections
-            if (provider === "codex" && tokenData.providerSpecificData?.workspaceId) {
-              const existingWorkspace = c.providerSpecificData?.workspaceId;
-              return safeEqual(existingWorkspace, tokenData.providerSpecificData.workspaceId);
-            }
-            return true;
-          });
+          // Codex accounts sharing an email require workspaceId/chatgptUserId
+          // agreement to be treated as the same account (#7737).
+          const match = findExistingOAuthConnectionMatch(
+            existing,
+            provider,
+            tokenData,
+            connectionId
+          );
           const matchId = typeof match?.id === "string" ? match.id : null;
           if (matchId) {
             connection = await updateProviderConnection(matchId, {
               ...tokenData,
               expiresAt,
-              testStatus: "active",
+              testStatus: degradedProject?.testStatus ?? "active",
+              ...(degradedProject ?? {}),
               isActive: true,
             });
           }
         }
         if (!connection) {
           connection = await createProviderConnection(
-            buildOAuthConnectionCreatePayload(provider, tokenData, expiresAt)
+            buildOAuthConnectionCreatePayload(provider, tokenData, expiresAt, degradedProject)
           );
         }
 
@@ -734,6 +794,7 @@ export async function POST(
 
         return NextResponse.json({
           success: true,
+          ...(degradedProject ? { warning: degradedProject.warning } : {}),
           connection: {
             id: connection.id,
             provider: connection.provider,

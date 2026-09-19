@@ -30,7 +30,7 @@ import { markConnectionQuotaExhausted } from "../../open-sse/executors/antigravi
 
 test.after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 // ── Engine contract (regression guard) ───────────────────────────────────────
@@ -68,6 +68,16 @@ test("classify429: standard Gemini rate limit 'resource has been exhausted' -> r
     "quota_exhausted",
     "RESOURCE_EXHAUSTED rate limit should not be classified as quota_exhausted"
   );
+});
+
+test("classify429: exhausted capacity with reset after 0s is rate_limited", () => {
+  const message = "You have exhausted your capacity on this model. Your quota will reset after 0s.";
+  const category = classify429(message);
+  assert.equal(category, "rate_limited");
+
+  const decision = decide429(category, 2_000);
+  assert.equal(decision.kind, "soft_retry");
+  assert.equal(decision.retryAfterMs, 2_000);
 });
 
 // ── DB persistence (the missing wire — Bug #2) ───────────────────────────────

@@ -7,12 +7,27 @@ export const compressionModeSchema = z.enum([
   "aggressive",
   "ultra",
   "rtk",
+  "codex-responses",
+  "omniglyph",
   "stacked",
 ]);
 
 export const cavemanIntensitySchema = z.enum(["lite", "full", "ultra"]);
 export const rtkIntensitySchema = z.enum(["minimal", "standard", "aggressive"]);
 export const rtkRawOutputRetentionSchema = z.enum(["never", "failures", "always"]);
+
+export const codexResponsesConfigSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    minBytes: z.number().int().min(0).max(2_000_000).optional(),
+    maxOutputBytes: z.number().int().min(1).max(10_000_000).optional(),
+    maxCandidateBytes: z.number().int().min(1).max(2_000_000).optional(),
+    maxLines: z.number().int().min(1).max(10_000).optional(),
+    minSearchMatches: z.number().int().min(2).max(10_000).optional(),
+    minLogLines: z.number().int().min(2).max(10_000).optional(),
+    preserveToolNames: z.array(z.string().trim().min(1).max(100)).max(100).optional(),
+  })
+  .strict();
 
 export const cavemanConfigSchema = z
   .object({
@@ -56,10 +71,13 @@ export const rtkConfigSchema = z
     trustProjectFilters: z.boolean().optional(),
     rawOutputRetention: rtkRawOutputRetentionSchema.optional(),
     rawOutputMaxBytes: z.number().int().min(1024).max(10_000_000).optional(),
+    rawOutputMaxFiles: z.number().int().min(1).max(10_000_000).optional(),
+    rawOutputMaxAgeDays: z.number().int().min(1).max(3650).optional(),
     enableGrouping: z.boolean().optional(),
     groupingThreshold: z.number().int().min(2).max(100).optional(),
     stripCodeComments: z.boolean().optional(),
     preserveDocstrings: z.boolean().optional(),
+    enableRenderers: z.boolean().optional(),
   })
   .strict();
 
@@ -137,8 +155,47 @@ export const ultraConfigSchema = z
   })
   .strict();
 
+/** Headroom SmartCrusher detail settings (persisted under settings.headroom). */
+export const headroomConfigSchema = z
+  .object({
+    // Matches engine schema min 2 / max 10000 and DEFAULT_MIN_ROWS=8.
+    minRows: z.number().int().min(2).max(10000).optional(),
+  })
+  .strict();
+
+// Session Dedup / CCR detail settings (#8388 — sibling gap to headroom/#8056: the
+// EngineConfigPage detail form was renderable but PUT bodies had no slot to persist
+// into). Ranges mirror SESSION_DEDUP_SCHEMA / CCR_SCHEMA (engines/session-dedup,
+// engines/ccr) so the validation layer stays in lockstep with the engine's own bounds.
+export const sessionDedupConfigSchema = z
+  .object({
+    minBlockChars: z.number().int().min(1).max(100000).optional(),
+    fuzzy: z.boolean().optional(),
+  })
+  .strict();
+
+export const ccrConfigSchema = z
+  .object({
+    minChars: z.number().int().min(100).max(1_000_000).optional(),
+    retrievalRampFactor: z.number().min(1).max(100).optional(),
+  })
+  .strict();
+
 const noConfigSchema = z.object({}).strict();
 
+// Structural engines (session-dedup / ccr / headroom / relevance / llmlingua) do not
+// expose a fixed intensity enum in ENGINE_CATALOG — accept optional free-form intensity
+// and a loose config bag so GET→PUT round-trips of stackedPipeline succeed (#6747).
+const structuralStepConfigSchema = z.record(z.string(), z.unknown()).optional();
+
+/**
+ * Writable stacked-pipeline step shape for PUT /api/settings/compression and
+ * PUT /api/context/combos/[id]. MUST accept every engine id in ENGINE_CATALOG /
+ * GET /api/compression/engines and every engine the DB normalizer keeps
+ * (src/lib/db/compression.ts STACKED_PIPELINE_ENGINE_IDS). Issue #6747: a 5-engine
+ * discriminator rejected session-dedup/ccr/headroom/relevance/llmlingua on write even
+ * though GET returned them.
+ */
 export const stackedPipelineStepSchema = z.discriminatedUnion("engine", [
   z
     .object({
@@ -157,7 +214,8 @@ export const stackedPipelineStepSchema = z.discriminatedUnion("engine", [
   z
     .object({
       engine: z.literal("aggressive"),
-      intensity: z.literal("standard").optional(),
+      // #6747: previously only "standard"; GET / engines.level may echo "ultra"
+      intensity: z.enum(["standard", "ultra"]).optional(),
       config: aggressiveConfigSchema.optional(),
     })
     .strict(),
@@ -175,6 +233,55 @@ export const stackedPipelineStepSchema = z.discriminatedUnion("engine", [
       config: rtkConfigSchema.optional(),
     })
     .strict(),
+  z
+    .object({
+      engine: z.literal("codex-responses"),
+      intensity: z.string().optional(),
+      config: codexResponsesConfigSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      engine: z.literal("session-dedup"),
+      intensity: z.string().optional(),
+      config: structuralStepConfigSchema,
+    })
+    .strict(),
+  z
+    .object({
+      engine: z.literal("ccr"),
+      intensity: z.string().optional(),
+      config: structuralStepConfigSchema,
+    })
+    .strict(),
+  z
+    .object({
+      engine: z.literal("headroom"),
+      intensity: z.string().optional(),
+      config: structuralStepConfigSchema,
+    })
+    .strict(),
+  z
+    .object({
+      engine: z.literal("relevance"),
+      intensity: z.string().optional(),
+      config: structuralStepConfigSchema,
+    })
+    .strict(),
+  z
+    .object({
+      engine: z.literal("llmlingua"),
+      intensity: z.string().optional(),
+      config: structuralStepConfigSchema,
+    })
+    .strict(),
+  z
+    .object({
+      engine: z.literal("omniglyph"),
+      intensity: z.string().optional(),
+      config: structuralStepConfigSchema,
+    })
+    .strict(),
 ]);
 
 /**
@@ -183,24 +290,76 @@ export const stackedPipelineStepSchema = z.discriminatedUnion("engine", [
  * dropdowns and `stackedPipelineStepSchema`: every engine/intensity offered here is,
  * by construction, accepted by the API update schema.
  *
- * Do NOT add an engine here that is not a branch of `stackedPipelineStepSchema` — the
- * `PUT /api/context/combos/[id]` route validates against that discriminated union and
- * would reject the payload with HTTP 400 (#4955: the UI previously offered `headroom`,
- * `session-dedup`, `ccr`, `llmlingua`, none of which the union accepts, so selecting
- * one silently failed the save). The parity is guarded by a unit test.
+ * Every ENGINE_CATALOG id must appear here (empty intensity list = no level selector).
+ * Parity with `stackedPipelineStepSchema` is guarded by unit tests (#4955 / #6747).
+ * #4955 fixed a UI/schema drift by shrinking the UI; #6747 expands the schema so the
+ * full catalog (and GET stackedPipeline) can round-trip on PUT.
  */
 export const STACKED_PIPELINE_ENGINE_INTENSITIES: Record<string, readonly string[]> = {
-  rtk: ["minimal", "standard", "aggressive"],
-  caveman: ["lite", "full", "ultra"],
+  // Order matches ENGINE_CATALOG stackPriority for readability
+  "session-dedup": [],
+  ccr: [],
   lite: ["lite"],
-  aggressive: ["standard"],
+  rtk: ["minimal", "standard", "aggressive"],
+  "codex-responses": [],
+  headroom: [],
+  relevance: [],
+  caveman: ["lite", "full", "ultra"],
+  aggressive: ["standard", "ultra"],
+  llmlingua: [],
+  omniglyph: [],
   ultra: ["ultra"],
 };
+
+export const liteConfigSchema = z
+  .object({
+    compressToolResults: z.boolean().optional(),
+  })
+  .strict();
 
 export const engineToggleSchema = z.object({
   enabled: z.boolean(),
   level: z.string().optional(),
 });
+
+export const contextBudgetModeSchema = z.enum(["floor", "replace-autotrigger", "off"]);
+export const contextBudgetPolicySchema = z.enum(["reserve-output", "percentage", "absolute"]);
+
+export const contextBudgetLadderStageSchema = z
+  .object({
+    engine: z.string().trim().min(1),
+    intensity: z.string().optional(),
+  })
+  .strict();
+
+// Adaptive context-budget "dial" (#7005): the compute engine shipped in PR #4716 but was
+// never wired to this update schema, so any PUT containing `contextBudget` was rejected
+// with 400. Mirrors ContextBudgetConfig (open-sse/services/compression/adaptiveCompression/
+// types.ts) and the `.strict()` pattern used by ultraConfigSchema/aggressiveConfigSchema.
+export const contextBudgetConfigSchema = z
+  .object({
+    mode: contextBudgetModeSchema.optional(),
+    policy: contextBudgetPolicySchema.optional(),
+    outputReserve: z.number().int().min(0).optional(),
+    safetyMargin: z.number().int().min(0).optional(),
+    pct: z.number().min(0).max(1).optional(),
+    absoluteBudget: z.number().int().min(0).optional(),
+    ladderOverride: z.array(contextBudgetLadderStageSchema).optional(),
+  })
+  .strict();
+
+/**
+ * Perfil semântico do OmniGlyph. O perfil é um TETO: o pacote não deixa um
+ * override reabrir uma lane que o perfil fechou. `aggressive` é o default e a
+ * política que os recibos publicados mediram; `coding-safe`/`balanced` mantêm
+ * system, schemas de tools e tool results nativos, e não comprimem nada até a
+ * sessão acumular histórico.
+ */
+export const omniglyphConfigSchema = z
+  .object({
+    profile: z.enum(["coding-safe", "balanced", "aggressive", "passthrough"]),
+  })
+  .strict();
 
 export const compressionSettingsUpdateSchema = z
   .object({
@@ -219,15 +378,27 @@ export const compressionSettingsUpdateSchema = z
     cavemanOutputMode: cavemanOutputModeSchema.optional(),
     outputStyles: z.array(outputStyleSelectionSchema).optional(),
     rtkConfig: rtkConfigSchema.optional(),
+    codexResponsesConfig: codexResponsesConfigSchema.optional(),
     languageConfig: languageConfigSchema.optional(),
     aggressive: aggressiveConfigSchema.optional(),
     ultra: ultraConfigSchema.optional(),
+    lite: liteConfigSchema.optional(),
+    headroom: headroomConfigSchema.optional(),
+    sessionDedup: sessionDedupConfigSchema.optional(),
+    ccr: ccrConfigSchema.optional(),
+    contextBudget: contextBudgetConfigSchema.optional(),
     contextEditing: contextEditingConfigSchema.optional(),
+    omniglyph: omniglyphConfigSchema.optional(),
+    liveZone: z.object({ enabled: z.boolean() }).strict().optional(),
     engines: z.record(z.string(), engineToggleSchema).optional(),
     enginesExplicit: z.boolean().optional(),
     activeComboId: z.string().nullable().optional(),
     ultraEngine: z.enum(["heuristic", "slm"]).optional(),
     ultraSlmPrewarm: z.boolean().optional(),
+    // #8034 — per-model/endpoint compression exclusion patterns. Bounded length/size so a
+    // pathological PUT body can't blow up the per-request matcher; normalizeCompressionExclusions
+    // (open-sse/services/compression/exclusions.ts) is the authoritative post-read normalizer.
+    exclusions: z.array(z.string().max(200)).max(200).optional(),
   })
   .strict();
 

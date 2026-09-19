@@ -1,7 +1,15 @@
-// Nested combo runtime unit execution — see combo.ts for integration.
+/**
+ * @file runtimeUnits.ts
+ * @description Nested combo runtime unit execution — see combo.ts for integration.
+ *
+ * @changes
+ * - [2026-07-24] [Composer] - Skip execute-mode units at concurrency cap before dispatch
+ */
 import { errorResponse } from "../../utils/error.ts";
 import { recordComboRequest } from "../comboMetrics.ts";
 import { resolveDelayMs } from "./comboPredicates.ts";
+import { isRuntimeUnitAtConcurrencyCap } from "./runtimeUnitCapacity.ts";
+import { isQuotaExhaustionResponse, withQuotaExhaustionClassification } from "./quotaExhaustion.ts";
 import { validateResponseQuality, releaseQualityClone } from "./validateQuality.ts";
 import type { ResponseValidationConfig } from "./responseValidation.ts";
 import type {
@@ -11,6 +19,7 @@ import type {
   ComboNestingContext,
   HandleComboChatOptions,
   HandleSingleModel,
+  HiddenModelsByProvider,
   IsModelAvailable,
   ResolvedComboRefTarget,
   ResolvedComboUnit,
@@ -98,7 +107,7 @@ function buildChildNestingContext(args: {
   };
 }
 
-async function executeComboRefUnit(args: {
+export async function executeComboRefUnit(args: {
   body: Record<string, unknown>;
   unit: ResolvedComboRefTarget;
   allCombos: ComboCollectionLike;
@@ -179,6 +188,7 @@ export async function executeRuntimeUnitCombo(args: {
   nesting: ComboNestingContext;
   baseOptions: HandleComboChatOptions;
   runCombo: RuntimeUnitRunner;
+  hiddenModelsByProvider?: HiddenModelsByProvider;
 }): Promise<RuntimeUnitExecutionResult> {
   const maxRetries = Number(args.config.maxRetries ?? 1);
   const retryDelayMs = resolveDelayMs(args.config.retryDelayMs, 2000);
@@ -188,14 +198,58 @@ export async function executeRuntimeUnitCombo(args: {
   const effectiveStrategy = args.effectiveComboStrategy ?? args.strategy;
   let lastResponse: Response | null = null;
   let fallbackCount = 0;
+  let observedFailure = false;
+  let allObservedFailuresQuota = true;
+  const targetFailureTrust = new Map<
+    string,
+    { observedFailure: boolean; allObservedFailuresQuota: boolean }
+  >();
+  const observeFailure = async (response: Response, unit: ResolvedComboUnit): Promise<boolean> => {
+    const quotaExhausted = await isQuotaExhaustionResponse(
+      response,
+      unit.kind === "model" ? unit.provider : null,
+      unit.kind === "model" ? unit.modelStr : null
+    );
+    observedFailure = true;
+    allObservedFailuresQuota &&= quotaExhausted;
+    return quotaExhausted;
+  };
+  const finalFailure = (response: Response): Response =>
+    withQuotaExhaustionClassification(response, observedFailure ? allObservedFailuresQuota : null);
 
   for (const unit of orderedUnits) {
+    const protectedPriorityUnit =
+      effectiveStrategy === "priority" && unit.fallbackOnlyOnQuotaExhaustion === true;
+    if (
+      await isRuntimeUnitAtConcurrencyCap(
+        unit,
+        args.allCombos,
+        undefined,
+        args.hiddenModelsByProvider
+      )
+    ) {
+      args.log.info(
+        "COMBO",
+        `Skipping ${unit.kind} ${unitDisplayName(unit)} — concurrency cap reached`
+      );
+      lastResponse = errorResponse(503, `${unitDisplayName(unit)} is at concurrency capacity`);
+      await observeFailure(lastResponse, unit);
+      if (protectedPriorityUnit) return { response: finalFailure(lastResponse), unit };
+      fallbackCount += 1;
+      continue;
+    }
+
     for (let retry = 0; retry <= maxRetries; retry += 1) {
-      if (args.signal?.aborted)
-        return { response: errorResponse(499, "Client disconnected"), unit };
+      if (args.signal?.aborted) {
+        lastResponse = errorResponse(499, "Client disconnected");
+        await observeFailure(lastResponse, unit);
+        return { response: finalFailure(lastResponse), unit };
+      }
       args.nesting.attemptBudget.count += 1;
       if (args.nesting.attemptBudget.count > args.nesting.attemptBudget.limit) {
-        return { response: errorResponse(503, "Maximum combo retry limit reached"), unit };
+        lastResponse = errorResponse(503, "Maximum combo retry limit reached");
+        await observeFailure(lastResponse, unit);
+        return { response: finalFailure(lastResponse), unit };
       }
       if (retry > 0) {
         await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
@@ -251,8 +305,30 @@ export async function executeRuntimeUnitCombo(args: {
           });
           return { response, unit };
         }
+        lastResponse = errorResponse(502, "Upstream response failed quality validation");
+      }
+      if (lastResponse) {
+        const quotaExhausted = await observeFailure(lastResponse, unit);
+        if (protectedPriorityUnit) {
+          const trust = targetFailureTrust.get(unit.executionKey) ?? {
+            observedFailure: false,
+            allObservedFailuresQuota: true,
+          };
+          trust.observedFailure = true;
+          trust.allObservedFailuresQuota &&= quotaExhausted;
+          targetFailureTrust.set(unit.executionKey, trust);
+        }
       }
       if (![408, 429, 500, 502, 503, 504].includes(response.status)) break;
+    }
+    const protectedTargetTrust = targetFailureTrust.get(unit.executionKey);
+    if (
+      protectedPriorityUnit &&
+      protectedTargetTrust?.observedFailure &&
+      !protectedTargetTrust.allObservedFailuresQuota &&
+      lastResponse
+    ) {
+      return { response: finalFailure(lastResponse), unit };
     }
     fallbackCount += 1;
   }
@@ -263,7 +339,9 @@ export async function executeRuntimeUnitCombo(args: {
     strategy: effectiveStrategy,
   });
   return {
-    response: lastResponse || errorResponse(503, "All nested combo units unavailable"),
+    response: finalFailure(
+      lastResponse || errorResponse(503, "All nested combo units unavailable")
+    ),
     unit: null,
   };
 }

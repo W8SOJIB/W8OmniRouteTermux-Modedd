@@ -2,9 +2,55 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { applyCompression } from "../../../open-sse/services/compression/strategySelector.ts";
+import { adaptBodyForCompression } from "../../../open-sse/services/compression/bodyAdapter.ts";
 import { applyRtkCompression } from "../../../open-sse/services/compression/engines/rtk/index.ts";
 
 describe("compression body adapter", () => {
+  it("drops a custom tool call when compaction removes its mapped output (#8932)", () => {
+    const body = {
+      input: [
+        {
+          type: "custom_tool_call",
+          call_id: "call_patch_1",
+          name: "apply_patch",
+          input: "*** Begin Patch",
+        },
+        {
+          type: "custom_tool_call_output",
+          call_id: "call_patch_1",
+          output: "Done!",
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Continue." }],
+        },
+      ],
+    };
+    const adapter = adaptBodyForCompression(body);
+    const compressedMessages = (adapter.body.messages as Array<Record<string, unknown>>).filter(
+      (message) => message.role !== "tool"
+    );
+    const restored = adapter.restore(
+      { ...adapter.body, messages: compressedMessages },
+      { dropMissingMappedItems: true }
+    );
+    const input = restored.input as Array<Record<string, unknown>>;
+
+    assert.equal(
+      input.some((item) => item.type === "custom_tool_call"),
+      false
+    );
+    assert.equal(
+      input.some((item) => item.type === "custom_tool_call_output"),
+      false
+    );
+    assert.equal(
+      input.some((item) => item.type === "message"),
+      true
+    );
+  });
+
   it("applies Caveman compression to OpenAI Responses input messages", () => {
     const body = {
       model: "gpt-5.5-codex",
@@ -76,6 +122,92 @@ describe("compression body adapter", () => {
     const input = result.body.input as typeof body.input;
     assert.match(input[0].output, /\[rtk:dropped/);
     assert.equal(input[0].call_id, "call_1");
+  });
+
+  it("applies RTK compression to Codex custom_tool_call_output items", () => {
+    const repeatedOutput = Array.from({ length: 20 }, () => "same noisy line").join("\n");
+    const body = {
+      input: [
+        {
+          type: "custom_tool_call_output",
+          call_id: "call_patch_1",
+          output: repeatedOutput,
+        },
+      ],
+    };
+
+    const result = applyRtkCompression(body);
+
+    assert.equal(result.compressed, true);
+    assert.ok(!("messages" in result.body), "Responses body must not leak synthetic messages");
+    const input = result.body.input as typeof body.input;
+    assert.equal(input[0].type, "custom_tool_call_output");
+    assert.equal(input[0].call_id, "call_patch_1");
+    assert.match(input[0].output, /\[rtk:dropped/);
+  });
+
+  it("preserves wrapped custom tool output metadata while compressing its output", () => {
+    const repeatedOutput = Array.from({ length: 20 }, () => "same noisy line").join("\n");
+    const body = {
+      input: [
+        {
+          type: "custom_tool_call_output",
+          call_id: "call_exec_1",
+          output: JSON.stringify({ output: repeatedOutput, metadata: { exitCode: 0 } }),
+        },
+      ],
+    };
+
+    const result = applyRtkCompression(body);
+    const input = result.body.input as typeof body.input;
+    const restoredOutput = JSON.parse(input[0].output) as {
+      output: string;
+      metadata: { exitCode: number };
+    };
+
+    assert.equal(result.compressed, true);
+    assert.match(restoredOutput.output, /\[rtk:dropped/);
+    assert.deepEqual(restoredOutput.metadata, { exitCode: 0 });
+  });
+
+  it("restores custom tool output to content when that was the source field", () => {
+    const repeatedOutput = Array.from({ length: 20 }, () => "same noisy line").join("\n");
+    const body = {
+      input: [
+        {
+          type: "custom_tool_call_output",
+          call_id: "call_exec_2",
+          content: repeatedOutput,
+        },
+      ],
+    };
+
+    const result = applyRtkCompression(body);
+    const input = result.body.input as Array<Record<string, unknown>>;
+
+    assert.equal(result.compressed, true);
+    assert.match(input[0].content as string, /\[rtk:dropped/);
+    assert.ok(!("output" in input[0]), "restore must not add a conflicting output field");
+  });
+
+  it("restores function call output to content when that was the source field", () => {
+    const repeatedOutput = Array.from({ length: 20 }, () => "same noisy line").join("\n");
+    const body = {
+      input: [
+        {
+          type: "function_call_output",
+          call_id: "call_2",
+          content: repeatedOutput,
+        },
+      ],
+    };
+
+    const result = applyRtkCompression(body);
+    const input = result.body.input as Array<Record<string, unknown>>;
+
+    assert.equal(result.compressed, true);
+    assert.match(input[0].content as string, /\[rtk:dropped/);
+    assert.ok(!("output" in input[0]), "restore must not add a conflicting output field");
   });
 
   it("restores compressed array output on Responses function_call_output items", () => {

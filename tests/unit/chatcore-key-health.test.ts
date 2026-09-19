@@ -15,7 +15,10 @@ const touched: string[] = [];
 
 function creds(connectionId: string, psd: Record<string, unknown> = {}) {
   touched.push(connectionId);
-  return { connectionId, providerSpecificData: psd };
+  // Key health only applies to connections that actually carry key material —
+  // the synthetic noauth connection (apiKey/accessToken null) is covered by the
+  // dedicated #9827 no-op test below.
+  return { connectionId, apiKey: "kh-test-key", accessToken: null, providerSpecificData: psd };
 }
 
 afterEach(() => {
@@ -66,5 +69,22 @@ test("honors selectedKeyId — scopes the update to the active extra key, not pr
 test("non-401 / non-2xx status does not touch key health", () => {
   const conn = "kh-5xx-noop";
   recordKeyHealthStatus(500, creds(conn), noopLog);
+  assert.equal(getAllKeyHealth()[`${conn}:primary`], undefined);
+});
+
+test("401 on a keyless connection is a no-op — no key to fail (#9827)", () => {
+  const before = Object.keys(getAllKeyHealth()).length;
+  // Synthetic noauth credentials (authType "none") carry no key material.
+  recordKeyHealthStatus(
+    401,
+    { connectionId: "noauth", apiKey: null, accessToken: null, providerSpecificData: {} },
+    noopLog
+  );
+  assert.equal(Object.keys(getAllKeyHealth()).length, before);
+});
+
+test("CPA pool failures do not poison the selected native connection key", () => {
+  const conn = "kh-cpa-pool-isolation";
+  recordKeyHealthStatus(401, creds(conn), noopLog, "cliproxyapi");
   assert.equal(getAllKeyHealth()[`${conn}:primary`], undefined);
 });

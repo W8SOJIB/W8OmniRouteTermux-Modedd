@@ -20,6 +20,7 @@ export const comboStepMetaSchema = {
   id: z.string().trim().min(1).max(200).optional(),
   weight: z.number().min(0).max(100).optional().default(0),
   label: z.string().trim().min(1).max(200).optional(),
+  fallbackOnlyOnQuotaExhaustion: z.boolean().optional(),
 };
 
 export const comboModelStepInputSchema = z.object({
@@ -86,6 +87,8 @@ export const scoringWeightsSchema = z
     tierAffinity: z.number().min(0).max(1).optional().default(0.05),
     specificityMatch: z.number().min(0).max(1).optional().default(0.05),
     contextAffinity: z.number().min(0).max(1).optional().default(0.08),
+    cacheAffinity: z.number().min(0).max(1).optional().default(0),
+    sessionAvailability: z.number().min(0).max(1).optional().default(0.05),
     resetWindowAffinity: z.number().min(0).max(1).optional().default(0),
   })
   .optional();
@@ -114,6 +117,8 @@ export const compressionModeSchema = z.enum([
   "ultra",
   "rtk",
   "stacked",
+  "codex-responses",
+  "omniglyph",
 ]);
 
 export const comboCompressionOverrideSchema = z.union([z.literal(""), compressionModeSchema]);
@@ -178,9 +183,13 @@ export const comboRuntimeConfigSchema = z
     handoffProviders: z.array(z.string().trim().min(1).max(100)).max(10).optional(),
     maxMessagesForSummary: z.coerce.number().int().min(5).max(100).optional(),
     maxComboDepth: z.coerce.number().int().min(1).max(10).optional(),
+    // #11134: shared per-request attempt budget. Bounds mirror
+    // MAX_GLOBAL_ATTEMPTS_HARD_CAP (200) in comboPredicates.ts.
+    maxGlobalAttempts: z.coerce.number().int().min(1).max(200).optional(),
     nestedComboMode: z.enum(["flatten", "execute"]).optional(),
     trackMetrics: z.boolean().optional(),
     reasoningTokenBufferEnabled: z.boolean().optional(),
+    reasoningTransportFallback: z.enum(["skip", "drop"]).optional(),
     compressionMode: compressionModeSchema.optional(),
     failoverBeforeRetry: z.boolean().optional(),
     maxSetRetries: z.coerce.number().int().min(0).max(10).optional(),
@@ -226,6 +235,25 @@ export const comboRuntimeConfigSchema = z
         minPanel: z.coerce.number().int().min(1).max(50).optional(),
         stragglerGraceMs: z.coerce.number().int().min(0).max(120_000).optional(),
         panelHardTimeoutMs: z.coerce.number().int().min(1000).max(600_000).optional(),
+        // Hard cap on panel size (issue #1905) — see FUSION_DEFAULTS.maxPanel in
+        // open-sse/services/fusion.ts. Bounds how many models can be fanned out
+        // and buffered in memory concurrently before the container's heap ceiling
+        // is at risk.
+        maxPanel: z.coerce.number().int().min(1).max(200).optional(),
+      })
+      .strict()
+      .optional(),
+    // Context window requirements for combo target filtering and sorting.
+    // minContextWindow: filters out models with context windows below this threshold.
+    // maxContextWindow: filters out models with context windows above this threshold.
+    // preferLargeContext: sorts remaining targets by context size (descending).
+    // contextFilterMode: "strict" excludes unknown-context models, "lenient" includes them.
+    contextRequirements: z
+      .object({
+        minContextWindow: z.coerce.number().int().min(0).max(10_000_000).optional(),
+        maxContextWindow: z.coerce.number().int().min(0).max(10_000_000).optional(),
+        preferLargeContext: z.boolean().optional(),
+        contextFilterMode: z.enum(["strict", "lenient"]).optional(),
       })
       .strict()
       .optional(),
@@ -262,24 +290,61 @@ export const comboNameSchema = z
     "Name can only contain letters, numbers, spaces, -, _, /, ., [ and ]."
   );
 
-export const createComboSchema = z.object({
-  name: comboNameSchema,
-  description: z.string().max(2000).optional(),
-  models: z.array(comboModelEntry).optional().default([]),
-  strategy: comboStrategySchema.optional().default("priority"),
-  config: comboRuntimeConfigSchema.optional(),
-  allowedProviders: z.array(z.string().max(200)).optional(),
-  system_message: z.string().max(50000).optional(),
-  tool_filter_regex: z.string().max(1000).optional(),
-  context_cache_protection: z.boolean().optional(),
-  context_length: z.number().int().min(1000).max(2000000).optional(),
-  // Optional embedding dimensions override for embedding combos.
-  // When set, the value is injected into every upstream embedding request as
-  // the `dimensions` field (and translated to `outputDimensionality` for Gemini).
-  // Stored as a string to match the OpenAI API convention; coerced to number
-  // by the embedding handler. Leave unset to use each model's default.
-  dimensions: z.string().regex(/^\d+$/, "dimensions must be a positive integer string").optional().nullable(),
-});
+type QuotaOnlyComboRefState = {
+  models?: Array<z.infer<typeof comboModelEntry>>;
+  strategy?: string;
+  config?: z.infer<typeof comboRuntimeConfigSchema>;
+};
+
+export function requiresQuotaOnlyComboRefExecute(value: QuotaOnlyComboRefState): boolean {
+  const hasProtectedComboRef = value.models?.some(
+    (step) =>
+      typeof step === "object" &&
+      step.kind === "combo-ref" &&
+      step.fallbackOnlyOnQuotaExhaustion === true
+  );
+  return (
+    (value.strategy === undefined || value.strategy === "priority") &&
+    hasProtectedComboRef === true &&
+    value.config?.nestedComboMode !== "execute"
+  );
+}
+
+function validateQuotaOnlyComboRefs(value: QuotaOnlyComboRefState, ctx: z.RefinementCtx): void {
+  if (requiresQuotaOnlyComboRefExecute(value)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Quota-only combo references require nestedComboMode execute",
+      path: ["config", "nestedComboMode"],
+    });
+  }
+}
+
+export const createComboSchema = z
+  .object({
+    name: comboNameSchema,
+    description: z.string().max(2000).optional(),
+    models: z.array(comboModelEntry).min(1, "a combo requires at least one model"),
+    strategy: comboStrategySchema.optional().default("priority"),
+    config: comboRuntimeConfigSchema.optional(),
+    allowedProviders: z.array(z.string().trim().min(1).max(200)).max(100).optional(),
+    allowedModelFamilies: z.array(z.string().trim().min(1).max(100)).max(100).optional(),
+    system_message: z.string().max(50000).optional(),
+    tool_filter_regex: z.string().max(1000).optional(),
+    context_cache_protection: z.boolean().optional(),
+    context_length: z.number().int().min(1000).max(2000000).optional(),
+    // Optional embedding dimensions override for embedding combos.
+    // When set, the value is injected into every upstream embedding request as
+    // the `dimensions` field (and translated to `outputDimensionality` for Gemini).
+    // Stored as a string to match the OpenAI API convention; coerced to number
+    // by the embedding handler. Leave unset to use each model's default.
+    dimensions: z
+      .string()
+      .regex(/^\d+$/, "dimensions must be a positive integer string")
+      .optional()
+      .nullable(),
+  })
+  .superRefine(validateQuotaOnlyComboRefs);
 
 export const updateComboDefaultsSchema = z
   .object({
@@ -318,17 +383,28 @@ export const updateComboSchema = z
   .object({
     name: comboNameSchema.optional(),
     description: z.string().max(2000).optional().nullable(),
-    models: z.array(comboModelEntry).optional(),
+    // An update may not remove every model from a combo, or a working combo
+    // loses every target. Creation refuses an empty list too: since the CLI
+    // gained --models (#10954), an empty draft has no remaining legitimate path.
+    models: z
+      .array(comboModelEntry)
+      .min(1, "an update cannot remove every model from a combo")
+      .optional(),
     strategy: comboStrategySchema.optional(),
     config: comboRuntimeConfigSchema.optional(),
     isActive: z.boolean().optional(),
-    allowedProviders: z.array(z.string().max(200)).optional(),
+    allowedProviders: z.array(z.string().trim().min(1).max(200)).max(100).optional(),
+    allowedModelFamilies: z.array(z.string().trim().min(1).max(100)).max(100).optional(),
     system_message: z.string().max(50000).optional(),
     tool_filter_regex: z.string().max(1000).optional(),
     context_cache_protection: z.boolean().optional(),
     context_length: z.number().int().min(1000).max(2000000).optional().nullable(),
     compressionOverride: comboCompressionOverrideSchema.optional(),
-    dimensions: z.string().regex(/^\d+$/, "dimensions must be a positive integer string").optional().nullable(),
+    dimensions: z
+      .string()
+      .regex(/^\d+$/, "dimensions must be a positive integer string")
+      .optional()
+      .nullable(),
   })
   .superRefine((value, ctx) => {
     if (
@@ -339,6 +415,7 @@ export const updateComboSchema = z
       value.config === undefined &&
       value.isActive === undefined &&
       value.allowedProviders === undefined &&
+      value.allowedModelFamilies === undefined &&
       value.system_message === undefined &&
       value.tool_filter_regex === undefined &&
       value.context_cache_protection === undefined &&
@@ -370,4 +447,11 @@ export const reorderCombosSchema = z
 
 export const testComboSchema = z.object({
   comboName: z.string().trim().min(1, "comboName is required"),
+});
+
+// POST /api/combos/duplicate - Resolve an auto-combo template (e.g. "auto/best-coding")
+// into a static, editable combo snapshot.
+export const duplicateAutoComboSchema = z.object({
+  name: z.string().trim().min(1, 'Missing required field: "name" (e.g. auto/best-coding)'),
+  strategy: comboStrategySchema.optional(),
 });

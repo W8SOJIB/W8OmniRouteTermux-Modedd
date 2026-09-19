@@ -36,7 +36,10 @@ import {
   applySectionOrder,
   applyItemOrder,
   normalizeHiddenSidebarItems,
+  HIDEABLE_SIDEBAR_ITEM_IDS,
+  resolveRuntimeSidebarSections,
   type HideableSidebarItemId,
+  type SidebarItemId,
   type SidebarSectionId,
   type SidebarItemOrder,
   type SidebarPresetId,
@@ -215,18 +218,57 @@ interface ItemRowProps {
 }
 
 // Items that must always remain visible (safety guard)
-const PROTECTED_ITEM_IDS = new Set(["settings-sidebar"]);
+const PROTECTED_ITEM_IDS = new Set<SidebarItemId>(["proxy", "settings-sidebar"]);
+
+function isHideableSidebarItemId(id: SidebarItemId): id is HideableSidebarItemId {
+  return HIDEABLE_SIDEBAR_ITEM_IDS.includes(id as HideableSidebarItemId);
+}
+
+function GroupItemVisibilityControl({
+  item,
+  hiddenSet,
+  onToggleItem,
+}: {
+  item: SidebarItemDefinition;
+  hiddenSet: Set<HideableSidebarItemId>;
+  onToggleItem: (id: HideableSidebarItemId) => void;
+}) {
+  const tSidebar = useTranslations("sidebar");
+  const hideableId = isHideableSidebarItemId(item.id) ? item.id : null;
+  if (hideableId !== null) {
+    return (
+      <Toggle
+        size="sm"
+        checked={!hiddenSet.has(hideableId)}
+        onChange={() => onToggleItem(hideableId)}
+      />
+    );
+  }
+
+  return (
+    <span
+      className="material-symbols-outlined text-[16px] text-text-muted/40"
+      title={tSidebar("cannotHide")}
+      aria-label={tSidebar("alwaysVisible")}
+    >
+      lock
+    </span>
+  );
+}
 
 function ItemRow({ item, hiddenSet, onToggleItem, getLabel }: ItemRowProps) {
   const tSidebar = useTranslations("sidebar");
-  const isProtected = PROTECTED_ITEM_IDS.has(item.id);
+  const hideableId = isHideableSidebarItemId(item.id) ? item.id : null;
+  const isProtected = PROTECTED_ITEM_IDS.has(item.id) || hideableId === null;
   return (
     <div className="flex items-center justify-between gap-4 px-4 py-3">
       <div className="flex items-center gap-2 min-w-0">
         <span className="material-symbols-outlined text-[16px] text-text-muted/50 shrink-0">
           {item.icon}
         </span>
-        <p className="font-medium truncate">{getLabel(item.i18nKey, item.id)}</p>
+        <p className="font-medium truncate">
+          {getLabel(item.i18nKey, item.labelFallback ?? item.id)}
+        </p>
       </div>
       {isProtected ? (
         <span
@@ -237,7 +279,7 @@ function ItemRow({ item, hiddenSet, onToggleItem, getLabel }: ItemRowProps) {
           lock
         </span>
       ) : (
-        <Toggle checked={!hiddenSet.has(item.id)} onChange={() => onToggleItem(item.id)} />
+        <Toggle checked={!hiddenSet.has(hideableId)} onChange={() => onToggleItem(hideableId)} />
       )}
     </div>
   );
@@ -288,7 +330,8 @@ function GroupRow({
           </span>
         </button>
         <span className="text-xs text-text-muted/40">
-          {group.items.filter((i) => !hiddenSet.has(i.id)).length}/{group.items.length}
+          {group.items.filter((i) => !isHideableSidebarItemId(i.id) || !hiddenSet.has(i.id)).length}
+          /{group.items.length}
         </span>
         {canToggleSeparator && (
           <div className="flex items-center gap-2 border-l border-border/60 pl-3">
@@ -309,12 +352,14 @@ function GroupRow({
                 <span className="material-symbols-outlined text-[14px] text-text-muted/40 shrink-0">
                   {item.icon}
                 </span>
-                <p className="text-sm font-medium truncate">{getLabel(item.i18nKey, item.id)}</p>
+                <p className="text-sm font-medium truncate">
+                  {getLabel(item.i18nKey, item.labelFallback ?? item.id)}
+                </p>
               </div>
-              <Toggle
-                size="sm"
-                checked={!hiddenSet.has(item.id)}
-                onChange={() => onToggleItem(item.id)}
+              <GroupItemVisibilityControl
+                item={item}
+                hiddenSet={hiddenSet}
+                onToggleItem={onToggleItem}
               />
             </div>
           ))}
@@ -351,6 +396,7 @@ export default function SidebarTab() {
   const [activePreset, setActivePreset] = useState<SidebarPresetId | null>(null);
   const [confirmPreset, setConfirmPreset] = useState<SidebarPresetId | null>(null);
   const [showDebug, setShowDebug] = useState(false);
+  const [radarAdminUrl, setRadarAdminUrl] = useState<unknown>(null);
 
   useEffect(() => {
     fetch("/api/settings")
@@ -372,6 +418,7 @@ export default function SidebarTab() {
         );
         setActivePreset(data?.[SIDEBAR_PRESET_KEY] ?? null);
         setShowDebug(data?.debugMode === true);
+        setRadarAdminUrl(data?.radarAdminUrl ?? null);
         setLoading(false);
       })
       .catch(() => setLoading(false));
@@ -418,11 +465,14 @@ export default function SidebarTab() {
     patch({ [HIDDEN_SIDEBAR_GROUP_LABELS_SETTING_KEY]: next, [SIDEBAR_PRESET_KEY]: null });
   };
 
-  const visibleSections = SIDEBAR_SECTIONS.filter((s) => s.visibility !== "debug" || showDebug).map(
-    (s) => ({ ...s, title: getLabel(s.titleKey, s.titleFallback) })
-  );
+  const visibleSections = resolveRuntimeSidebarSections(SIDEBAR_SECTIONS, {
+    radarAdminUrl,
+  }).filter((s) => s.visibility !== "debug" || showDebug);
 
-  const orderedSections = applySectionOrder(visibleSections, sectionOrder);
+  const orderedSections = applySectionOrder(visibleSections, sectionOrder).map((s) => ({
+    ...s,
+    title: getLabel(s.titleKey, s.titleFallback),
+  }));
 
   const sectionIds = orderedSections.map((s) => s.id);
 
@@ -471,6 +521,7 @@ export default function SidebarTab() {
 
   const presetLabels: Record<SidebarPresetId, string> = {
     all: getSettingsLabel("presetAll", "All"),
+    essentials: getSettingsLabel("presetEssentials", "Essentials"),
     minimal: getSettingsLabel("presetMinimal", "Minimal"),
     developer: getSettingsLabel("presetDeveloper", "Developer"),
     admin: getSettingsLabel("presetAdmin", "Admin"),
@@ -478,6 +529,10 @@ export default function SidebarTab() {
 
   const presetDescriptions: Record<SidebarPresetId, string> = {
     all: getSettingsLabel("presetAllDesc", "Show everything"),
+    essentials: getSettingsLabel(
+      "presetEssentialsDesc",
+      "Beginner path — Advanced tools stay searchable"
+    ),
     minimal: getSettingsLabel("presetMinimalDesc", "Core pages only"),
     developer: getSettingsLabel("presetDeveloperDesc", "Dev & proxy tools"),
     admin: getSettingsLabel("presetAdminDesc", "Monitoring & audit"),

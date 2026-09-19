@@ -30,7 +30,7 @@ type UsageSummaryRow = {
 
 function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -218,7 +218,7 @@ test("database settings reader normalizes legacy negative cache size to the posi
     "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('databaseSettings', ?, ?)"
   ).run("optimization.cacheSize", JSON.stringify(-2000));
 
-  assert.equal(databaseSettings.getUserDatabaseSettings().optimization.cacheSize, 16384);
+  assert.equal(databaseSettings.getUserDatabaseSettings().optimization.cacheSize, 65536);
 });
 
 test("purgeDetailedLogs deletes request_detail_logs", async () => {

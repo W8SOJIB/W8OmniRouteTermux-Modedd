@@ -29,7 +29,7 @@ const core = await import("../../src/lib/db/core.ts");
 function cleanup() {
   core.resetDbInstance();
   if (fs.existsSync(TEST_DATA_DIR)) {
-    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
@@ -37,7 +37,7 @@ function cleanup() {
 test.afterEach(() => cleanup());
 test.after(() => {
   if (fs.existsSync(TEST_DATA_DIR)) {
-    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -186,4 +186,38 @@ test("omniroute_memory_search: hardcoded fallback config has retrievalStrategy=e
     "exact",
     "fallback from catch path must use retrievalStrategy=exact"
   );
+});
+
+// ── IDOR: the authenticated caller's principal must win over a caller-supplied
+// apiKeyId (GHSA-cpv3-xr7r-xf8q). With a resolvable caller (here: OMNIROUTE_API_KEY
+// on the stdio path → "env-key"), omniroute_memory_add must store under the
+// caller, NOT under the arbitrary apiKeyId in the tool arguments.
+test("omniroute_memory_add: caller principal wins over a spoofed apiKeyId (GHSA-cpv3)", async () => {
+  const db = core.getDbInstance();
+  const prevEnvKey = process.env.OMNIROUTE_API_KEY;
+  process.env.OMNIROUTE_API_KEY = "test-mcp-caller-key";
+  try {
+    const { memoryTools } = await import("../../open-sse/mcp-server/tools/memoryTools.ts");
+    const result = await memoryTools.omniroute_memory_add.handler({
+      apiKeyId: "victim-b",
+      type: "factual",
+      key: "idor-k1",
+      content: "owned-by-caller",
+    });
+    assert.equal(result.success, true, "add must succeed");
+
+    const rows = db
+      .prepare("SELECT api_key_id FROM memories WHERE key = 'idor-k1'")
+      .all() as Array<{ api_key_id: string }>;
+    assert.equal(rows.length, 1, "exactly one memory row expected");
+    assert.equal(
+      rows[0].api_key_id,
+      "env-key",
+      "memory must be stored under the resolved caller (env-key), not the spoofed apiKeyId"
+    );
+    assert.notEqual(rows[0].api_key_id, "victim-b", "must NOT store under the caller-supplied id");
+  } finally {
+    if (prevEnvKey === undefined) delete process.env.OMNIROUTE_API_KEY;
+    else process.env.OMNIROUTE_API_KEY = prevEnvKey;
+  }
 });

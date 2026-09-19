@@ -25,7 +25,7 @@ function resetRuntime() {
 async function resetStorage() {
   resetRuntime();
   coreDb.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -71,7 +71,7 @@ test.beforeEach(async () => {
 test.after(() => {
   resetRuntime();
   coreDb.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("extractToolCalls supports OpenAI, Anthropic and Gemini shapes", () => {

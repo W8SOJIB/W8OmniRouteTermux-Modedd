@@ -35,7 +35,7 @@ beforeEach(() => {
 
 after(() => {
   coreDb.resetDbInstance();
-  fs.rmSync(testDataDir, { recursive: true, force: true });
+  fs.rmSync(testDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("no config (disabled by default) returns the provider's own executor", async () => {

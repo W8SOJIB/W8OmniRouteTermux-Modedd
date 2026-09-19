@@ -18,6 +18,12 @@
 
 import zlib from "node:zlib";
 import crypto from "node:crypto";
+import { decodeNativeTodoWriteCompletion } from "./cursorAgentProtobuf/nativeTodoWrite.ts";
+import {
+  cursorImageAttachmentPath,
+  encodeSelectedImageBody,
+  type EncodedImage,
+} from "./cursorAgentProtobuf/imageEncoding.ts";
 import {
   WT_VARINT,
   WT_LEN,
@@ -35,7 +41,6 @@ import {
   findField,
   decodeStringField,
   decodeVarintField,
-  type Field,
 } from "./cursorAgentProtobuf/wire.ts";
 
 // ─── Field numbers (from agent.proto descriptor) ───────────────────────────
@@ -63,24 +68,7 @@ const UM_MESSAGE_ID = 2; // UserMessage.message_id
 const UM_SELECTED_CONTEXT = 3; // UserMessage.selected_context (empty placeholder required)
 const UM_MODE = 4; // UserMessage.mode (cursor-agent sends 1)
 
-// ─── Vision input (image) field numbers ────────────────────────────────────
-// Pinned from cursor-agent's agent.v1 protobuf descriptor (bundle version
-// 2026.06.02-8c11d9f, cross-checked against composer-api's older-endpoint
-// encoder for shape). Images attach to the current UserMessage through its
-// selected_context (field 3): UserMessage.selected_context is a SelectedContext
-// whose `selected_images` (field 1) is a repeated SelectedImage. Each
-// SelectedImage carries the raw bytes inline in its `data_or_blob_id` oneof
-// (the `data` case, field 8) — cursor-agent's CLI instead sends a local file
-// `path`, which a proxy cannot use, so we inline the bytes like composer-api.
 const SC_SELECTED_IMAGES = 1; // SelectedContext.selected_images [repeated SelectedImage]
-
-const SI_UUID = 2; // SelectedImage.uuid
-const SI_DIMENSION = 4; // SelectedImage.dimension (SelectedImage.Dimension)
-const SI_MIME_TYPE = 7; // SelectedImage.mime_type
-const SI_DATA = 8; // SelectedImage.data (oneof data_or_blob_id) — inline image bytes
-
-const DIM_WIDTH = 1; // SelectedImage.Dimension.width (int32)
-const DIM_HEIGHT = 2; // SelectedImage.Dimension.height (int32)
 
 const RM_MODEL_ID = 1; // RequestedModel.model_id
 const RM_PARAMETERS = 3; // RequestedModel.parameters [repeated]
@@ -168,6 +156,9 @@ const ESM_WRITE_SHELL_STDIN_ARGS = 23;
 const ARG_PATH = 1; // ReadArgs.path / WriteArgs.path / DeleteArgs.path / LsArgs.path
 const ARG_SHELL_COMMAND = 1; // ShellArgs.command
 const ARG_SHELL_WORKING_DIR = 2; // ShellArgs.working_directory
+const ARG_SHELL_TIMEOUT = 3; // ShellArgs.timeout
+const ARG_SHELL_IS_BACKGROUND = 11; // ShellArgs.is_background
+const ARG_SHELL_HARD_TIMEOUT = 14; // ShellArgs.hard_timeout
 const ARG_FETCH_URL = 1; // FetchArgs.url
 
 // KvServerMessage / KvClientMessage
@@ -294,6 +285,12 @@ const CURSOR_MODEL_ALIASES: Record<string, string> = {
   "composer-2-5-fast": "composer-2.5-fast",
   "composer-2.5-sdk-fast": "composer-2.5-fast",
   "composer-latest-fast": "composer-2.5-fast",
+  "grok-4.5-medium": "cursor-grok-4.5-medium",
+  "grok-4.5-fast-medium": "cursor-grok-4.5-medium-fast",
+  "grok-4.5-high": "cursor-grok-4.5-high",
+  "grok-4.5-fast-high": "cursor-grok-4.5-high-fast",
+  "grok-4.5-xhigh": "cursor-grok-4.5-xhigh",
+  "grok-4.5-fast-xhigh": "cursor-grok-4.5-xhigh-fast",
 };
 
 export function normalizeCursorModelId(modelId: string): string {
@@ -302,22 +299,142 @@ export function normalizeCursorModelId(modelId: string): string {
   return alias ?? id;
 }
 
+// #7289: pinned Claude/GPT model ids carry an effort/reasoning suffix
+// (e.g. "claude-opus-4-8-high", "gpt-5.5-high"). cursor's server has no route
+// for the suffixed id — it only accepts the base id plus an out-of-band
+// ModelParameter. Ground truth captured from the real cursor-agent client:
+// Claude ids surface the suffix as {id:"effort", value:<suffix>}, GPT ids as
+// {id:"reasoning", value:<suffix>}. "-fast"/"-thinking" are separate toggles
+// (already handled elsewhere / not covered by this suffix set) and must not
+// be misread as an effort value.
+//
+// Grok (`cursor-grok-*` / legacy `grok-*`) follows the Claude-style `effort`
+// parameter. Without the split, ids like `cursor-grok-4.5-high` return empty
+// turns (same symptom as #7289). Combined `-high-fast` is supported.
+const CURSOR_EFFORT_SUFFIXES = ["low", "medium", "high", "xhigh", "max"] as const;
+
+/**
+ * If `normalized` starts with `prefix` and ends with one of the known effort
+ * suffixes, split it into the base model id plus a `{id: paramId, value}`
+ * ModelParameter. Returns null when no known suffix matches, leaving the id
+ * untouched (e.g. "claude-2.5" with no suffix, or an unrecognized tail).
+ */
+function splitCursorEffortSuffix(
+  normalized: string,
+  prefix: string,
+  paramId: string
+): { modelId: string; parameters: Array<{ id: string; value: string }> } | null {
+  if (!normalized.startsWith(prefix)) {
+    return null;
+  }
+  for (const suffix of CURSOR_EFFORT_SUFFIXES) {
+    const marker = `-${suffix}`;
+    if (normalized.endsWith(marker) && normalized.length > prefix.length + marker.length) {
+      return {
+        modelId: normalized.slice(0, -marker.length),
+        parameters: [{ id: paramId, value: suffix }],
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Grok family: strip optional `-fast`, then effort suffix → ModelParameters.
+ * Prefer `cursor-grok-` over bare `grok-` so `cursor-grok-*` is not mis-matched.
+ */
+function resolveGrokRequestedModel(
+  normalized: string
+): { modelId: string; parameters: Array<{ id: string; value: string }> } | null {
+  const prefix = normalized.startsWith("cursor-grok-")
+    ? "cursor-grok-"
+    : normalized.startsWith("grok-")
+      ? "grok-"
+      : null;
+  if (!prefix) return null;
+
+  let id = normalized;
+  const extraParams: Array<{ id: string; value: string }> = [];
+  if (id.endsWith("-fast") && id.length > prefix.length + "-fast".length) {
+    id = id.slice(0, -"-fast".length);
+    extraParams.push({ id: "fast", value: "true" });
+  }
+
+  const effortSplit = splitCursorEffortSuffix(id, prefix, "effort");
+  if (effortSplit) {
+    return {
+      modelId: effortSplit.modelId,
+      parameters: [...effortSplit.parameters, ...extraParams],
+    };
+  }
+  if (extraParams.length > 0) {
+    return { modelId: id, parameters: extraParams };
+  }
+  return null;
+}
+
 /**
  * cursor-agent rewrites model ids before putting them on the wire:
- *   "auto"            → RequestedModel { model_id: "default" }
- *   "composer-2-fast" → RequestedModel { model_id: "composer-2",
- *                                        parameters: [{id: "fast", value: "true"}] }
+ *   "auto"                 → RequestedModel { model_id: "default" }
+ *   "auto-cost"            → RequestedModel { model_id: "default",
+ *                                             parameters: [{id: "optimization", value: "cost"}] }
+ *   "composer-2-fast"      → RequestedModel { model_id: "composer-2",
+ *                                             parameters: [{id: "fast", value: "true"}] }
+ *   "claude-opus-4-8-high" → RequestedModel { model_id: "claude-opus-4-8",
+ *                                             parameters: [{id: "effort", value: "high"}] }
+ *   "gpt-5.5-high"         → RequestedModel { model_id: "gpt-5.5",
+ *                                             parameters: [{id: "reasoning", value: "high"}] }
+ *   "cursor-grok-4.5-high" → RequestedModel { model_id: "cursor-grok-4.5",
+ *                                             parameters: [{id: "effort", value: "high"}] }
  *
- * Other ids (e.g. "claude-4.6-sonnet-medium") are passed through verbatim
- * after spelling-variant normalization (see normalizeCursorModelId).
+ * Other ids are passed through verbatim after spelling-variant normalization
+ * (see normalizeCursorModelId).
  */
-export function resolveRequestedModel(modelId: string): {
+/** Cursor Router optimization levels (OpenCodex `CURSOR_ROUTING_LEVELS`). */
+export const CURSOR_ROUTING_LEVELS = ["cost", "balance", "intelligence"] as const;
+export type CursorRoutingLevel = (typeof CURSOR_ROUTING_LEVELS)[number];
+
+/**
+ * ModelParameter id for Cursor's Cost/Balance/Intelligence control on wire model
+ * `default` (OpenCodex `CURSOR_ROUTING_LEVEL_PARAMETER_ID`).
+ */
+export const CURSOR_ROUTING_LEVEL_PARAMETER_ID = "optimization";
+
+export type ResolveRequestedModelOptions = {
+  /**
+   * When set and containing the normalized client model id, send that id
+   * verbatim on AgentRun (skip composer-fast / Claude / GPT splits).
+   * Live AvailableModels returns flattened effort-suffixed ids; stripping them
+   * to a missing base causes Cursor `AI Model Not Found`. Auto / auto-* still
+   * map to wire `default` (+ optimization) even when present in this set.
+   */
+  liveCatalogIds?: ReadonlySet<string>;
+};
+
+export function resolveRequestedModel(
+  modelId: string,
+  opts?: ResolveRequestedModelOptions
+): {
   modelId: string;
   parameters: Array<{ id: string; value: string }>;
 } {
   const normalized = normalizeCursorModelId(modelId);
   if (normalized === "auto") {
     return { modelId: "default", parameters: [] };
+  }
+  // OpenCodex-style router variants: auto-cost / auto-balance / auto-intelligence
+  // → wire `default` + ModelParameter { id: "optimization", value: <level> }.
+  for (const level of CURSOR_ROUTING_LEVELS) {
+    if (normalized === `auto-${level}`) {
+      return {
+        modelId: "default",
+        parameters: [{ id: CURSOR_ROUTING_LEVEL_PARAMETER_ID, value: level }],
+      };
+    }
+  }
+  // Live catalog is authoritative for exact ids (flattened effort variants).
+  if (opts?.liveCatalogIds?.has(normalized)) {
+    return { modelId: normalized, parameters: [] };
   }
   // Strip the "-fast" suffix and surface it as a parameter — only the composer
   // family observably needs this split today, but the protocol field is generic.
@@ -326,6 +443,18 @@ export function resolveRequestedModel(modelId: string): {
       modelId: normalized.slice(0, -"-fast".length),
       parameters: [{ id: "fast", value: "true" }],
     };
+  }
+  const grokSplit = resolveGrokRequestedModel(normalized);
+  if (grokSplit) {
+    return grokSplit;
+  }
+  const claudeSplit = splitCursorEffortSuffix(normalized, "claude-", "effort");
+  if (claudeSplit) {
+    return claudeSplit;
+  }
+  const gptSplit = splitCursorEffortSuffix(normalized, "gpt-", "reasoning");
+  if (gptSplit) {
+    return gptSplit;
   }
   return { modelId: normalized, parameters: [] };
 }
@@ -362,58 +491,17 @@ export type AgentRunInput = {
   // which the executor's processFrame replies to with the stored bytes.
   systemPrompt?: string;
   blobStore?: Map<string, Buffer>;
-  // Vision input: images attached to the current user turn. Encoded inline as
-  // SelectedContext.selected_images[] (see encodeSelectedImageBody). Empty /
-  // undefined keeps the request byte-identical to the text-only path.
+  // Vision input: images attached to the current user turn. Encoded as
+  // SelectedContext.selected_images[] via blobIdWithData (see
+  // encodeSelectedImageBody). Empty / undefined keeps the request
+  // byte-identical to the text-only path.
   images?: EncodedImage[];
+  /** Exact live AvailableModels ids — see resolveRequestedModel liveCatalogIds. */
+  liveCatalogIds?: ReadonlySet<string>;
 };
 
-/**
- * A resolved image ready to embed in a cursor request. `data` is the raw
- * decoded image bytes (already SSRF-checked / size-capped by the executor's
- * resolveCursorImages helper). `mimeType` (e.g. "image/png") helps cursor
- * decode the inline bytes; `width`/`height` populate the optional Dimension
- * sub-message when cheaply known; `uuid` is a stable per-image id.
- */
-export type EncodedImage = {
-  data: Buffer;
-  mimeType?: string;
-  width?: number;
-  height?: number;
-  uuid: string;
-};
-
-/**
- * Encode the body of a SelectedImage message (no outer field tag — the caller
- * wraps it via encodeMessage(SC_SELECTED_IMAGES, [body])). Sets the inline
- * `data` oneof case plus uuid, optional dimension, and mime_type. Fields are
- * written in ascending field-number order (canonical protobuf layout).
- */
-export function encodeSelectedImageBody(img: EncodedImage): Buffer {
-  const parts: Buffer[] = [encodeString(SI_UUID, img.uuid)];
-  if (
-    typeof img.width === "number" &&
-    typeof img.height === "number" &&
-    Number.isFinite(img.width) &&
-    Number.isFinite(img.height) &&
-    img.width > 0 &&
-    img.height > 0
-  ) {
-    parts.push(
-      encodeMessage(SI_DIMENSION, [
-        encodeUInt32Field(DIM_WIDTH, Math.floor(img.width)),
-        encodeUInt32Field(DIM_HEIGHT, Math.floor(img.height)),
-      ])
-    );
-  }
-  if (img.mimeType) {
-    parts.push(encodeString(SI_MIME_TYPE, img.mimeType));
-  }
-  // data_or_blob_id oneof = data (inline bytes) — field 8, written last to
-  // keep ascending field order.
-  parts.push(encodeBytes(SI_DATA, img.data));
-  return Buffer.concat(parts);
-}
+export { cursorImageAttachmentPath, encodeSelectedImageBody };
+export type { EncodedImage };
 
 /**
  * Convert OpenAI tool definitions to cursor McpToolDefinition bodies. Used
@@ -437,17 +525,22 @@ export function openAIToolsToMcpDefs(tools: OpenAITool[]): McpToolDefinition[] {
 export function encodeAgentRunRequest(input: AgentRunInput): Buffer {
   const conversationId = input.conversationId || crypto.randomUUID();
   const messageId = input.messageId || crypto.randomUUID();
-  const { modelId, parameters } = resolveRequestedModel(input.modelId);
+  const { modelId, parameters } = resolveRequestedModel(input.modelId, {
+    liveCatalogIds: input.liveCatalogIds,
+  });
 
   // UserMessage { text, message_id, selected_context, mode=1 }.
   // selected_context is normally an empty placeholder (required by the server
   // even when empty — see below), but when the turn carries vision input we
-  // populate its selected_images[] with the inline-encoded images. The
-  // empty-images path produces byte-identical output to the text-only request.
+  // populate its selected_images[] with blobIdWithData-encoded images (and
+  // store the bytes in blobStore for getBlob). The empty-images path produces
+  // byte-identical output to the text-only request.
   const selectedContextParts: Buffer[] = [];
   if (input.images && input.images.length > 0) {
     for (const img of input.images) {
-      selectedContextParts.push(encodeMessage(SC_SELECTED_IMAGES, [encodeSelectedImageBody(img)]));
+      selectedContextParts.push(
+        encodeMessage(SC_SELECTED_IMAGES, [encodeSelectedImageBody(img, input.blobStore)])
+      );
     }
   }
   // The empty selected_context placeholder and mode=1 match cursor-agent's
@@ -547,6 +640,15 @@ export type DecodedDelta =
   | { kind: "heartbeat" }
   | { kind: "tool_call_started" }
   | { kind: "tool_call_completed" }
+  | {
+      kind: "native_todo_write";
+      toolCallId: string;
+      merge: boolean;
+      todos: Array<{
+        content: string;
+        status: "pending" | "in_progress" | "completed" | "cancelled";
+      }>;
+    }
   | { kind: "kv_server_message" }
   | { kind: "unknown"; field: number };
 
@@ -578,6 +680,10 @@ export function decodeAgentServerMessage(payload: Buffer): DecodedDelta[] {
           out.push({ kind: "tool_call_started" });
           break;
         case IU_TOOL_CALL_COMPLETED:
+          if (update.wireType === 2) {
+            const todoWrite = decodeNativeTodoWriteCompletion(update.bytes);
+            if (todoWrite) out.push(todoWrite);
+          }
           out.push({ kind: "tool_call_completed" });
           break;
         case IU_TOKEN_DELTA:
@@ -667,7 +773,7 @@ export function decodeKvServerEvent(payload: Buffer): KvServerEvent | null {
 
     if (getBlobArgs) {
       // GetBlobArgs { blob_id (1): bytes }
-      let blobId = Buffer.alloc(0);
+      let blobId: Buffer = Buffer.alloc(0);
       for (const f of decodeFields(getBlobArgs)) {
         if (f.fieldNumber === GBA_BLOB_ID && f.wireType === 2) {
           blobId = f.bytes;
@@ -677,8 +783,8 @@ export function decodeKvServerEvent(payload: Buffer): KvServerEvent | null {
     }
     if (setBlobArgs) {
       // SetBlobArgs { blob_id (1): bytes, blob_data (2): bytes }
-      let blobId = Buffer.alloc(0);
-      let blobData = Buffer.alloc(0);
+      let blobId: Buffer = Buffer.alloc(0);
+      let blobData: Buffer = Buffer.alloc(0);
       for (const f of decodeFields(setBlobArgs)) {
         if (f.fieldNumber === SBA_BLOB_ID && f.wireType === 2) {
           blobId = f.bytes;
@@ -716,6 +822,9 @@ export type ExecServerEvent =
       execId: string;
       command: string;
       workingDir: string;
+      timeout: number;
+      isBackground: boolean;
+      hardTimeout: number;
     }
   | {
       kind: "exec_shell_stream";
@@ -723,6 +832,9 @@ export type ExecServerEvent =
       execId: string;
       command: string;
       workingDir: string;
+      timeout: number;
+      isBackground: boolean;
+      hardTimeout: number;
     }
   | {
       kind: "exec_bg_shell";
@@ -730,6 +842,9 @@ export type ExecServerEvent =
       execId: string;
       command: string;
       workingDir: string;
+      timeout: number;
+      isBackground: boolean;
+      hardTimeout: number;
     }
   | { kind: "exec_fetch"; execMsgId: number; execId: string; url: string }
   | { kind: "exec_write_shell_stdin"; execMsgId: number; execId: string }
@@ -742,6 +857,34 @@ export type ExecServerEvent =
       // args populated by Phase 5 (decodeMcpArgs); empty {} until then.
       args: Record<string, unknown>;
     };
+
+type DecodedShellArgs = {
+  command: string;
+  workingDir: string;
+  timeout: number;
+  isBackground: boolean;
+  hardTimeout: number;
+};
+
+function decodeShellArgs(payload: Buffer): DecodedShellArgs {
+  const decoded: DecodedShellArgs = {
+    command: decodeStringField(payload, ARG_SHELL_COMMAND),
+    workingDir: decodeStringField(payload, ARG_SHELL_WORKING_DIR),
+    timeout: 0,
+    isBackground: false,
+    hardTimeout: 0,
+  };
+  for (const field of decodeFields(payload)) {
+    if (field.wireType !== 0) continue;
+    if (field.fieldNumber === ARG_SHELL_TIMEOUT) decoded.timeout = Number(field.varint);
+    else if (field.fieldNumber === ARG_SHELL_IS_BACKGROUND) {
+      decoded.isBackground = field.varint !== 0n;
+    } else if (field.fieldNumber === ARG_SHELL_HARD_TIMEOUT) {
+      decoded.hardTimeout = Number(field.varint);
+    }
+  }
+  return decoded;
+}
 
 export function decodeExecServerEvent(payload: Buffer): ExecServerEvent | null {
   for (const top of decodeFields(payload)) {
@@ -804,30 +947,33 @@ export function decodeExecServerEvent(payload: Buffer): ExecServerEvent | null {
         return { kind: "exec_grep", execMsgId, execId };
       case ESM_DIAGNOSTICS_ARGS:
         return { kind: "exec_diagnostics", execMsgId, execId };
-      case ESM_SHELL_ARGS:
+      case ESM_SHELL_ARGS: {
+        const shell = decodeShellArgs(variantBytes);
         return {
           kind: "exec_shell",
           execMsgId,
           execId,
-          command: decodeStringField(variantBytes, ARG_SHELL_COMMAND),
-          workingDir: decodeStringField(variantBytes, ARG_SHELL_WORKING_DIR),
+          ...shell,
         };
-      case ESM_SHELL_STREAM_ARGS:
+      }
+      case ESM_SHELL_STREAM_ARGS: {
+        const shell = decodeShellArgs(variantBytes);
         return {
           kind: "exec_shell_stream",
           execMsgId,
           execId,
-          command: decodeStringField(variantBytes, ARG_SHELL_COMMAND),
-          workingDir: decodeStringField(variantBytes, ARG_SHELL_WORKING_DIR),
+          ...shell,
         };
-      case ESM_BACKGROUND_SHELL_SPAWN:
+      }
+      case ESM_BACKGROUND_SHELL_SPAWN: {
+        const shell = decodeShellArgs(variantBytes);
         return {
           kind: "exec_bg_shell",
           execMsgId,
           execId,
-          command: decodeStringField(variantBytes, ARG_SHELL_COMMAND),
-          workingDir: decodeStringField(variantBytes, ARG_SHELL_WORKING_DIR),
+          ...shell,
         };
+      }
       case ESM_FETCH_ARGS:
         return {
           kind: "exec_fetch",

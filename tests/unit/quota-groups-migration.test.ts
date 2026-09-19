@@ -30,7 +30,7 @@ async function resetStorage() {
   for (let attempt = 0; attempt < 10; attempt++) {
     try {
       if (fs.existsSync(TEST_DATA_DIR)) {
-        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
       break;
     } catch (err: any) {
@@ -50,7 +50,7 @@ test.beforeEach(async () => {
 
 test.after(async () => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 // Helper to get a raw DB handle for inspection / seeding.
@@ -197,7 +197,7 @@ test("listPools returns groupId on every pool", () => {
   poolsDb.createPool({ connectionId: "lp-1", name: "Pool Default" });
   poolsDb.createPool({ connectionId: "lp-2", name: "Pool G2", groupId: "g2" });
 
-  const pools = poolsDb.listPools();
+  const { items: pools } = poolsDb.listPools();
   assert.equal(pools.length, 2);
 
   const pDef = pools.find((p) => p.name === "Pool Default")!;

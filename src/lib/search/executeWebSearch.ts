@@ -4,9 +4,10 @@ import * as defaultLog from "@/sse/utils/logger";
 import {
   getAllSearchProviders,
   getSearchProvider,
+  resolveSearchProvider,
   selectProvider,
   supportsSearchType,
-  SEARCH_CREDENTIAL_FALLBACKS,
+  getSearchCredentialFallbacks,
   SEARCH_PROVIDERS,
   type SearchProviderConfig,
 } from "@omniroute/open-sse/config/searchRegistry.ts";
@@ -24,7 +25,7 @@ export interface ExecuteWebSearchInput {
   provider?: string;
   max_results?: number;
   limit?: number;
-  search_type?: "web" | "news";
+  search_type?: "web" | "news" | "x";
   offset?: number;
   country?: string;
   language?: string;
@@ -63,8 +64,10 @@ export class WebSearchExecutionError extends Error {
 async function resolveSearchCredentials(providerId: string) {
   const creds = await getProviderCredentials(providerId).catch(() => null);
   if (creds) return creds;
-  const fallbackId = SEARCH_CREDENTIAL_FALLBACKS[providerId];
-  if (fallbackId) return getProviderCredentials(fallbackId).catch(() => null);
+  for (const fallbackId of getSearchCredentialFallbacks(providerId)) {
+    const fallback = await getProviderCredentials(fallbackId).catch(() => null);
+    if (fallback) return fallback;
+  }
   return null;
 }
 
@@ -107,7 +110,12 @@ function assertValidSearchInput(input: ExecuteWebSearchInput) {
   if (input.query.trim().length > 500) {
     throw new WebSearchExecutionError("Query must be 500 characters or fewer", 400);
   }
-  if (input.search_type && input.search_type !== "web" && input.search_type !== "news") {
+  if (
+    input.search_type &&
+    input.search_type !== "web" &&
+    input.search_type !== "news" &&
+    input.search_type !== "x"
+  ) {
     throw new WebSearchExecutionError(`Unsupported search_type: ${String(input.search_type)}`, 400);
   }
 }
@@ -118,10 +126,12 @@ export async function executeWebSearch(
   assertValidSearchInput(input);
 
   const log = input.log || defaultLog;
+  if (input.provider === "x_search") input.provider = "x-search";
+  if (input.provider === "x-search") input.search_type = "x";
   const searchType = input.search_type || "web";
 
   if (input.provider) {
-    const explicitProvider = getSearchProvider(input.provider);
+    const explicitProvider = resolveSearchProvider(input.provider);
     if (!explicitProvider) {
       throw new WebSearchExecutionError(`Unknown search provider: ${input.provider}`, 400);
     }
@@ -173,8 +183,14 @@ export async function executeWebSearch(
     credentials = await resolveSearchCredentials(providerConfig.id);
 
     if (!credentials) {
+      // A CONFIGURED provider always wins over a free `fallbackOnly` one (issue #11524):
+      // sweep every regular provider for real credentials BEFORE considering the
+      // last-resort ones. Running the fallbackOnly loop first made `duckduckgo-free`
+      // (costPerQuery 0, no credentials required) win unconditionally, so an operator's
+      // paid search connection was silently ignored whenever the cheapest auto-selected
+      // provider happened to have no credentials.
       const sortedIds = Object.values(SEARCH_PROVIDERS)
-        .filter((provider) => supportsSearchType(provider, searchType))
+        .filter((provider) => !provider.fallbackOnly && supportsSearchType(provider, searchType))
         .sort((a, b) => a.costPerQuery - b.costPerQuery)
         .map((provider) => provider.id);
 
@@ -185,6 +201,25 @@ export async function executeWebSearch(
         if (altConfig && altCreds) {
           providerConfig = altConfig;
           credentials = altCreds;
+          break;
+        }
+      }
+    }
+
+    if (!credentials) {
+      const fallbackProviders = Object.values(SEARCH_PROVIDERS)
+        .filter((provider) => provider.fallbackOnly && supportsSearchType(provider, searchType))
+        .sort((a, b) => a.costPerQuery - b.costPerQuery);
+
+      for (const fallbackProvider of fallbackProviders) {
+        providerConfig = fallbackProvider;
+        if (fallbackProvider.id === "duckduckgo-free") {
+          credentials = {};
+          break;
+        }
+        const fallbackCredentials = await resolveSearchCredentials(fallbackProvider.id);
+        if (fallbackCredentials) {
+          credentials = fallbackCredentials;
           break;
         }
       }
@@ -203,7 +238,7 @@ export async function executeWebSearch(
       .filter((provider) => supportsSearchType(provider, searchType))
       .sort((a, b) => a.costPerQuery - b.costPerQuery)
       .map((provider) => provider.id)
-      .filter((providerId) => providerId !== providerConfig.id);
+      .filter((providerId) => providerId !== providerConfig!.id);
 
     for (const providerId of otherIds) {
       const creds = await resolveSearchCredentials(providerId);
@@ -249,6 +284,8 @@ export async function executeWebSearch(
       alternateProvider: alternateProviderId,
       alternateCredentials,
       log,
+      connectionId: credentials?.connectionId || undefined,
+      apiKeyId: input.apiKeyId || undefined,
     });
 
     if (!result.success || !result.data) {

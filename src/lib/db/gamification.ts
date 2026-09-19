@@ -131,13 +131,24 @@ export function getRank(apiKeyId: string, scope: string): number {
   return rankRow.rank;
 }
 
+export const LEADERBOARD_MAX_LIMIT = 200;
+
 export function getTopN(scope: string, limit: number, offset: number = 0): LeaderboardRow[] {
+  // Guard the SQLite LIMIT/OFFSET bind. A negative LIMIT means "no limit" in
+  // SQLite (returns the whole table), and a non-integer throws a datatype
+  // mismatch, so an unvalidated `?limit` on a caller route (e.g. the leaderboard
+  // endpoints) could read the entire leaderboard or 500. Clamp to a coherent
+  // range here as a defense-in-depth backstop, independent of route validation.
+  const safeLimit = Number.isFinite(limit)
+    ? Math.min(Math.max(Math.trunc(limit), 0), LEADERBOARD_MAX_LIMIT)
+    : 0;
+  const safeOffset = Number.isFinite(offset) ? Math.max(Math.trunc(offset), 0) : 0;
   const rows = db()
     .prepare(
       `SELECT api_key_id, scope, score, updated_at FROM leaderboard
      WHERE scope = ? ORDER BY score DESC LIMIT ? OFFSET ?`
     )
-    .all(scope, limit, offset) as Array<{
+    .all(scope, safeLimit, safeOffset) as Array<{
     api_key_id: string;
     scope: string;
     score: number;

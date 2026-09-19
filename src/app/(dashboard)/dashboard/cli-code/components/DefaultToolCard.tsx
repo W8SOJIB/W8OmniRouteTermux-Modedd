@@ -2,7 +2,6 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { Card, Button, ModelSelectModal } from "@/shared/components";
-import Image from "next/image";
 import { useTranslations } from "next-intl";
 import { copyToClipboard } from "@/shared/utils/clipboard";
 import { buildOpenCodeConfigDocument } from "@/shared/services/opencodeConfig";
@@ -24,6 +23,7 @@ export default function DefaultToolCard({
   const t = useTranslations("cliTools");
   const translateOrFallback = useCallback(
     (key, fallback, values = undefined) => {
+      if (!t.has(key)) return fallback;
       try {
         return t(key, values);
       } catch {
@@ -48,6 +48,7 @@ export default function DefaultToolCard({
   );
   const isMultiModelTool = tool.modelSelectionMode === "multiple";
   const usesOpenCodePreview = tool.previewConfigMode === "opencode";
+  const usesQwenCodePreview = tool.previewConfigMode === "qwen";
   const selectedKeyObj = apiKeys?.find((k) => k.id === selectedApiKeyId);
 
   const resolveApiKeyValue = useCallback(
@@ -99,40 +100,44 @@ export default function DefaultToolCard({
 
   // Persist and restore model selection per tool via localStorage
   useEffect(() => {
-    const savedModel = localStorage.getItem(`omniroute-cli-model-${toolId}`);
-    if (savedModel) {
-      if (isMultiModelTool) {
-        try {
-          const parsed = JSON.parse(savedModel);
-          if (Array.isArray(parsed)) {
-            const normalized = parsed.map((value) => String(value || "").trim()).filter(Boolean);
-            setModelValues(normalized);
-            setModelValue(normalized[0] || "");
-          } else {
+    const restoreTimer = window.setTimeout(() => {
+      const savedModel = localStorage.getItem(`omniroute-cli-model-${toolId}`);
+      if (savedModel) {
+        if (isMultiModelTool) {
+          try {
+            const parsed = JSON.parse(savedModel);
+            if (Array.isArray(parsed)) {
+              const normalized = parsed.map((value) => String(value || "").trim()).filter(Boolean);
+              setModelValues(normalized);
+              setModelValue(normalized[0] || "");
+            } else {
+              setModelValue(savedModel);
+              setModelValues([savedModel]);
+            }
+          } catch {
             setModelValue(savedModel);
             setModelValues([savedModel]);
           }
-        } catch {
+        } else {
           setModelValue(savedModel);
-          setModelValues([savedModel]);
         }
-      } else {
-        setModelValue(savedModel);
       }
-    }
-    const savedKey = localStorage.getItem(`omniroute-cli-key-${toolId}`);
-    // (#523) localStorage may contain a masked key string from before the fix —
-    // match by prefix/suffix against known keys to find the id.
-    if (savedKey && apiKeys?.length > 0) {
-      const prefix = savedKey.slice(0, 8);
-      const suffix = savedKey.slice(-4);
-      const matchedKey = apiKeys.find(
-        (k) =>
-          (k.rawKey && k.rawKey.startsWith(prefix) && k.rawKey.endsWith(suffix)) ||
-          (k.key && k.key.startsWith(prefix) && k.key.endsWith(suffix))
-      );
-      if (matchedKey) setSelectedApiKeyId(matchedKey.id);
-    }
+      const savedKey = localStorage.getItem(`omniroute-cli-key-${toolId}`);
+      // (#523) localStorage may contain a masked key string from before the fix —
+      // match by prefix/suffix against known keys to find the id.
+      if (savedKey && apiKeys?.length > 0) {
+        const prefix = savedKey.slice(0, 8);
+        const suffix = savedKey.slice(-4);
+        const matchedKey = apiKeys.find(
+          (k) =>
+            (k.rawKey && k.rawKey.startsWith(prefix) && k.rawKey.endsWith(suffix)) ||
+            (k.key && k.key.startsWith(prefix) && k.key.endsWith(suffix))
+        );
+        if (matchedKey) setSelectedApiKeyId(matchedKey.id);
+      }
+    }, 0);
+
+    return () => window.clearTimeout(restoreTimer);
   }, [toolId, apiKeys, isMultiModelTool]);
 
   const handleModelChange = useCallback(
@@ -187,15 +192,18 @@ export default function DefaultToolCard({
   }, [isExpanded, runtimeStatus, t, toolId]);
 
   const replaceVars = useCallback(
-    (text) => {
+    (text, modelOverride = "") => {
       const keyToUse = resolveApiKeyValue();
 
       return text
         .replace(/\{\{baseUrl\}\}/g, baseUrlWithV1)
         .replace(/\{\{apiKey\}\}/g, keyToUse)
-        .replace(/\{\{model\}\}/g, getSelectedModelLabels()[0] || t("modelPlaceholder"));
+        .replace(
+          /\{\{model\}\}/g,
+          modelOverride || getSelectedModelLabels()[0] || t("modelPlaceholder")
+        );
     },
-    [baseUrl, getSelectedModelLabels, resolveApiKeyValue, t]
+    [baseUrlWithV1, getSelectedModelLabels, resolveApiKeyValue, t]
   );
 
   const handleCopy = async (text, field) => {
@@ -211,6 +219,9 @@ export default function DefaultToolCard({
 
   const getRenderedCodeBlock = useCallback(() => {
     if (!tool.codeBlock?.code) return "";
+    if (usesQwenCodePreview) {
+      return replaceVars(tool.codeBlock.code, getSelectedModels()[0]);
+    }
     if (!usesOpenCodePreview) return replaceVars(tool.codeBlock.code);
 
     const keyToUse = resolveApiKeyValue();
@@ -226,13 +237,14 @@ export default function DefaultToolCard({
       2
     );
   }, [
-    baseUrl,
+    baseUrlWithV1,
     getSelectedModels,
     getSelectedModelLabelMap,
     replaceVars,
     resolveApiKeyValue,
-    tool.codeBlock?.code,
+    tool.codeBlock,
     usesOpenCodePreview,
+    usesQwenCodePreview,
   ]);
 
   const handleSelectModel = (model) => {
@@ -265,7 +277,11 @@ export default function DefaultToolCard({
       // (#523) Prefer keyId lookup so the backend writes the real key to disk.
       const selectedKeyId = selectedApiKeyId?.trim() || null;
 
-      const res = await fetch(`/api/cli-tools/guide-settings/${toolId}`, {
+      const saveEndpoint =
+        toolId === "qwen"
+          ? "/api/cli-tools/qwen-settings"
+          : `/api/cli-tools/guide-settings/${toolId}`;
+      const res = await fetch(saveEndpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -286,6 +302,8 @@ export default function DefaultToolCard({
           text:
             (typeof data.error === "string" ? data.error : data.error?.message) ||
             t("failedToSave"),
+          // 422 from the container guard: the body is host-CLI guidance, not a failure.
+          containerEphemeralTarget: Boolean(data.containerEphemeralTarget),
         });
       }
     } catch (error) {
@@ -571,12 +589,16 @@ export default function DefaultToolCard({
           <div className="mt-2">
             {message && (
               <div
-                className={`flex items-center gap-2 px-2 py-1.5 rounded text-xs mb-2 ${message.type === "success" ? "bg-green-500/10 text-green-600" : "bg-red-500/10 text-red-600"}`}
+                className={`flex gap-2 px-2 py-1.5 rounded text-xs mb-2 ${message.containerEphemeralTarget ? "items-start" : "items-center"} ${message.type === "success" ? "bg-green-500/10 text-green-600" : "bg-red-500/10 text-red-600"}`}
               >
                 <span className="material-symbols-outlined text-[14px]">
                   {message.type === "success" ? "check_circle" : "error"}
                 </span>
-                <span>{message.text}</span>
+                {/* The container refusal is a multi-line runbook — keep its line
+                    breaks instead of collapsing it into one unreadable line. */}
+                <span className={message.containerEphemeralTarget ? "whitespace-pre-line" : ""}>
+                  {message.text}
+                </span>
               </div>
             )}
             <div className="flex items-center gap-2">
@@ -620,38 +642,32 @@ export default function DefaultToolCard({
   };
 
   const renderIcon = () => {
+    // Tool SVGs are non-square (e.g. opencode is 234×42, cursor is 467×532).
+    // next/image's dev check warns whenever the rendered aspect-ratio size
+    // differs from the square width/height attributes, so these render as a
+    // plain <img> capped at 32px on both axes — true ratio, no dev noise.
+    const renderImg = (src: string) => (
+      // eslint-disable-next-line @next/next/no-img-element -- local static SVG asset
+      <img
+        src={src}
+        alt={tool.name}
+        width={32}
+        height={32}
+        className="size-8 object-contain rounded-lg"
+        style={{ width: "auto", height: "auto", maxWidth: 32, maxHeight: 32 }}
+        onError={(e) => {
+          (e.currentTarget as HTMLElement).style.display = "none";
+        }}
+      />
+    );
     if (tool.image) {
-      return (
-        <Image
-          src={tool.image}
-          alt={tool.name}
-          width={32}
-          height={32}
-          className="size-8 object-contain rounded-lg"
-          sizes="32px"
-          onError={(e) => {
-            (e.currentTarget as HTMLElement).style.display = "none";
-          }}
-        />
-      );
+      return renderImg(tool.image);
     }
     if (tool.imageLight || tool.imageDark) {
       const themedSrc = isDark
         ? tool.imageDark || tool.imageLight
         : tool.imageLight || tool.imageDark;
-      return (
-        <Image
-          src={themedSrc}
-          alt={tool.name}
-          width={32}
-          height={32}
-          className="size-8 object-contain rounded-lg"
-          sizes="32px"
-          onError={(e) => {
-            (e.currentTarget as HTMLElement).style.display = "none";
-          }}
-        />
-      );
+      return renderImg(themedSrc);
     }
     if (tool.icon) {
       return (

@@ -1,19 +1,22 @@
 import {
-  ANTIGRAVITY_BASE_URLS,
+  ANTIGRAVITY_BOOTSTRAP_BASE_URLS,
+  ANTIGRAVITY_RUNTIME_BASE_URLS,
   getAntigravityFetchAvailableModelsUrls,
 } from "@omniroute/open-sse/config/antigravityUpstream.ts";
-import {
-  ANTIGRAVITY_LOAD_CODE_ASSIST_API_CLIENT,
-  ANTIGRAVITY_LOAD_CODE_ASSIST_USER_AGENT,
-  getAntigravityLoadCodeAssistClientMetadata,
-} from "@omniroute/open-sse/services/antigravityHeaders.ts";
 import {
   GITHUB_COPILOT_API_VERSION,
   GITHUB_COPILOT_CHAT_PLUGIN_VERSION,
   GITHUB_COPILOT_CHAT_USER_AGENT,
   GITHUB_COPILOT_EDITOR_VERSION,
 } from "@omniroute/open-sse/config/providerHeaderProfiles.ts";
+import {
+  GROK_BUILD_DEVICE_CODE_URL,
+  GROK_BUILD_OAUTH_ISSUER,
+  GROK_BUILD_OAUTH_SCOPES,
+  GROK_BUILD_TOKEN_URL,
+} from "@omniroute/open-sse/config/grokBuild.ts";
 import { resolvePublicCred } from "@omniroute/open-sse/utils/publicCreds.ts";
+import { CURSOR_AGENT_CLI_VERSION } from "@omniroute/open-sse/utils/cursorAgentCliVersion.ts";
 import { buildGitLabOAuthEndpoints, GITLAB_DUO_DEFAULT_BASE_URL } from "../gitlab";
 
 /**
@@ -71,15 +74,6 @@ export const CODEX_CONFIG = {
   },
 };
 
-// Qwen OAuth Configuration (Device Code Flow with PKCE)
-export const QWEN_CONFIG = {
-  clientId: resolvePublicCred("qwen_id", "QWEN_OAUTH_CLIENT_ID"),
-  deviceCodeUrl: "https://qwen.ai/api/v1/oauth2/device/code",
-  tokenUrl: "https://qwen.ai/api/v1/oauth2/token",
-  scope: "openid profile email model.completion",
-  codeChallengeMethod: "S256",
-};
-
 // Qoder OAuth Configuration (Authorization Code)
 const QODER_OAUTH_AUTHORIZE_URL = process.env.QODER_OAUTH_AUTHORIZE_URL || "";
 const QODER_OAUTH_TOKEN_URL = process.env.QODER_OAUTH_TOKEN_URL || "";
@@ -119,11 +113,57 @@ export const CODEBUDDY_CN_CONFIG = {
   pollInterval: 5000,
 };
 
-// Grok Build (xAI) OAuth Configuration (Import-Token Flow with refresh)
+// Grok Build (xAI) OAuth Configuration (Device Code + import-token fallback)
 // Public client_id resolved through resolvePublicCred so it is never a literal.
 export const GROK_CLI_CONFIG = {
   clientId: resolvePublicCred("grok_id", "GROK_OAUTH_CLIENT_ID"),
+  issuer: GROK_BUILD_OAUTH_ISSUER,
+  deviceCodeUrl: GROK_BUILD_DEVICE_CODE_URL,
+  tokenUrl: GROK_BUILD_TOKEN_URL,
+  scope: GROK_BUILD_OAUTH_SCOPES.join(" "),
+};
+
+// Grok Build (xAI) OAuth Configuration (Browser PKCE Flow — added #7013)
+// Same auth.x.ai authorize/token endpoints and public client_id as XAI_OAUTH_CONFIG,
+// but scoped to the Grok Build (cli-chat-proxy.grok.com) entitlement and kept as a
+// separate config so grok-cli's own baseUrl/model registry stay untouched.
+export const GROK_BUILD_OAUTH_CONFIG = {
+  clientId: resolvePublicCred("grok_id", "GROK_OAUTH_CLIENT_ID"),
+  authorizeUrl: "https://auth.x.ai/oauth2/authorize",
   tokenUrl: "https://auth.x.ai/oauth2/token",
+  scope: "openid profile email offline_access grok-cli:access",
+  codeChallengeMethod: "S256",
+  loopbackPort: 56122, // distinct from xai-oauth's 56121 — both can run concurrently
+  callbackPath: "/callback",
+  callbackHost: "127.0.0.1",
+};
+
+// xAI API OAuth Configuration (Authorization Code Flow with PKCE)
+// This intentionally uses a separate provider from Grok Build: both use the
+// public Grok CLI OAuth client, but their inference endpoints and model
+// entitlements differ (`api.x.ai` vs `cli-chat-proxy.grok.com`).
+export const XAI_OAUTH_CONFIG = {
+  clientId: resolvePublicCred("grok_id", "GROK_OAUTH_CLIENT_ID"),
+  authorizeUrl: "https://auth.x.ai/oauth2/authorize",
+  tokenUrl: "https://auth.x.ai/oauth2/token",
+  scope: "openid profile email offline_access grok-cli:access api:access",
+  codeChallengeMethod: "S256",
+  loopbackPort: 56121,
+  callbackPath: "/callback",
+  callbackHost: "127.0.0.1",
+};
+
+// Openference OAuth Configuration (Authorization Code Flow with PKCE)
+export const OPENFERENCE_CONFIG = {
+  clientId: resolvePublicCred("openference_id"),
+  authorizeUrl: "https://openference.com/app/oauth/authorize",
+  tokenUrl: "https://openference.com/oauth/token",
+  userinfoUrl: "https://openference.com/oauth/userinfo",
+  scope: "openid profile email model:invoke offline_access",
+  codeChallengeMethod: "S256",
+  loopbackPort: 56123,
+  callbackPath: "/callback",
+  callbackHost: "127.0.0.1",
 };
 
 // Kimi Coding OAuth Configuration (Device Code Flow)
@@ -169,19 +209,18 @@ export const ANTIGRAVITY_CONFIG = {
     "https://www.googleapis.com/auth/experimentsandconfigs",
   ],
   // Antigravity specific
-  apiEndpoint: ANTIGRAVITY_BASE_URLS[0],
+  apiEndpoint: ANTIGRAVITY_RUNTIME_BASE_URLS[0],
   apiVersion: "v1internal",
-  loadCodeAssistEndpoints: ANTIGRAVITY_BASE_URLS.map(
+  loadCodeAssistEndpoints: ANTIGRAVITY_BOOTSTRAP_BASE_URLS.map(
     (baseUrl) => `${baseUrl}/v1internal:loadCodeAssist`
   ),
-  onboardUserEndpoints: ANTIGRAVITY_BASE_URLS.map((baseUrl) => `${baseUrl}/v1internal:onboardUser`),
+  onboardUserEndpoints: ANTIGRAVITY_BOOTSTRAP_BASE_URLS.map(
+    (baseUrl) => `${baseUrl}/v1internal:onboardUser`
+  ),
   fetchAvailableModelsEndpoints: getAntigravityFetchAvailableModelsUrls(),
-  loadCodeAssistEndpoint: `${ANTIGRAVITY_BASE_URLS[0]}/v1internal:loadCodeAssist`,
-  onboardUserEndpoint: `${ANTIGRAVITY_BASE_URLS[0]}/v1internal:onboardUser`,
+  loadCodeAssistEndpoint: `${ANTIGRAVITY_BOOTSTRAP_BASE_URLS[0]}/v1internal:loadCodeAssist`,
+  onboardUserEndpoint: `${ANTIGRAVITY_BOOTSTRAP_BASE_URLS[0]}/v1internal:onboardUser`,
   fetchAvailableModelsEndpoint: getAntigravityFetchAvailableModelsUrls()[0],
-  loadCodeAssistUserAgent: ANTIGRAVITY_LOAD_CODE_ASSIST_USER_AGENT,
-  loadCodeAssistApiClient: ANTIGRAVITY_LOAD_CODE_ASSIST_API_CLIENT,
-  loadCodeAssistClientMetadata: getAntigravityLoadCodeAssistClientMetadata(),
 };
 
 // Antigravity CLI (`agy`) OAuth Configuration.
@@ -207,9 +246,6 @@ export const AGY_CONFIG = {
   loadCodeAssistEndpoint: ANTIGRAVITY_CONFIG.loadCodeAssistEndpoint,
   onboardUserEndpoint: ANTIGRAVITY_CONFIG.onboardUserEndpoint,
   fetchAvailableModelsEndpoint: ANTIGRAVITY_CONFIG.fetchAvailableModelsEndpoint,
-  loadCodeAssistUserAgent: ANTIGRAVITY_CONFIG.loadCodeAssistUserAgent,
-  loadCodeAssistApiClient: ANTIGRAVITY_CONFIG.loadCodeAssistApiClient,
-  loadCodeAssistClientMetadata: ANTIGRAVITY_CONFIG.loadCodeAssistClientMetadata,
 };
 
 // OpenAI OAuth Configuration (Authorization Code Flow with PKCE)
@@ -239,6 +275,22 @@ export const GITHUB_CONFIG = {
   scopes: "read:user",
   apiVersion: GITHUB_COPILOT_API_VERSION,
   copilotTokenUrl: "https://api.github.com/copilot_internal/v2/token",
+  userAgent: GITHUB_COPILOT_CHAT_USER_AGENT,
+  editorVersion: GITHUB_COPILOT_EDITOR_VERSION,
+  editorPluginVersion: GITHUB_COPILOT_CHAT_PLUGIN_VERSION,
+};
+
+// GitHub Enterprise (GHE) Copilot OAuth Configuration (Device Code Flow)
+export const GHE_COPILOT_CONFIG = {
+  clientId:
+    process.env.GHE_COPILOT_OAUTH_CLIENT_ID ||
+    resolvePublicCred("github_copilot_id", "GITHUB_OAUTH_CLIENT_ID"),
+  deviceCodeUrl: "", // Derived dynamically in provider flow
+  tokenUrl: "", // Derived dynamically in provider flow
+  userInfoUrl: "", // Derived dynamically in provider flow
+  scopes: "read:user",
+  apiVersion: GITHUB_COPILOT_API_VERSION,
+  copilotTokenUrl: "", // Derived dynamically in provider flow
   userAgent: GITHUB_COPILOT_CHAT_USER_AGENT,
   editorVersion: GITHUB_COPILOT_EDITOR_VERSION,
   editorPluginVersion: GITHUB_COPILOT_CHAT_PLUGIN_VERSION,
@@ -313,20 +365,26 @@ export const KIRO_CONFIG = {
   authMethods: ["builder-id", "idc", "google", "github", "import"],
 };
 
-// Cursor OAuth Configuration (Import Token from Cursor IDE)
+// Cursor OAuth Configuration (deep-control PKCE + optional IDE import)
 // Cursor stores credentials in SQLite database: state.vscdb
-// Keys: cursorAuth/accessToken, storage.serviceMachineId
+// Keys: cursorAuth/accessToken, cursorAuth/refreshToken, storage.serviceMachineId
+// Deep-control PKCE + refresh aligned with OpenCodex (lidge-jun/opencodex src/oauth/cursor.ts).
+// clientVersion pin lives in open-sse/utils/cursorAgentCliVersion.ts — single source of truth.
 export const CURSOR_CONFIG = {
   // API endpoints
   apiEndpoint: "https://api2.cursor.sh",
   chatEndpoint: "/aiserver.v1.ChatService/StreamUnifiedChatWithTools",
-  modelsEndpoint: "/aiserver.v1.AiService/GetDefaultModelNudgeData",
+  modelsEndpoint: "/aiserver.v1.AiService/AvailableModels",
+  // Standalone deep-control login (no IDE/CLI required)
+  loginUrl: "https://cursor.com/loginDeepControl",
+  pollUrl: "https://api2.cursor.sh/auth/poll",
+  refreshUrl: "https://api2.cursor.sh/auth/exchange_user_api_key",
   // Additional endpoints
   api3Endpoint: "https://api3.cursor.sh", // Telemetry
   agentEndpoint: "https://agent.api5.cursor.sh", // Privacy mode
   agentNonPrivacyEndpoint: "https://agentn.api5.cursor.sh", // Non-privacy mode
-  // Client metadata
-  clientVersion: "3.2.14",
+  // Client metadata — pin from cursorAgentCliVersion (not a second hardcoded string)
+  clientVersion: CURSOR_AGENT_CLI_VERSION,
   clientType: "ide",
   // Token storage locations (for user reference)
   tokenStoragePaths: {
@@ -337,6 +395,7 @@ export const CURSOR_CONFIG = {
   // Database keys
   dbKeys: {
     accessToken: "cursorAuth/accessToken",
+    refreshToken: "cursorAuth/refreshToken",
     machineId: "storage.serviceMachineId",
   },
 };
@@ -376,57 +435,25 @@ export const TRAE_CONFIG = {
     "Authorize via trae.ai in the popup, or sign in to solo.trae.ai and paste the Cloud-IDE-JWT from the Authorization header (~14-day lifetime).",
 };
 
-// Windsurf / Devin CLI Configuration
-//
-// 2026-05-29 (Phase 1 hotfix):
-//   The browser PKCE flow targeting https://app.devin.ai/editor/signin returned
-//   404 post-rebrand. PKCE-only fields (`authorizeUrl`, `codeChallengeMethod`,
-//   `callbackPort`, `callbackPath`, `apiServerUrl`, `exchangePath`) are kept
-//   below for archival reference but are NO LONGER consumed by any code path —
-//   the provider exports flowType="import_token" only.
-//
-//   Phase 2 will reintroduce browser login via Firebase OAuth + RegisterUser
-//   (ported from fendoushaonian/WindSurf-gRPC-API).
-//   Spec: _tasks/superpowers/specs/2026-05-29-windsurf-login-fix-design.md.
-//
-// Active fields:
-//   - inferenceUrl       → used by WindsurfExecutor (open-sse/executors/windsurf.ts)
-//   - showAuthTokenUrl   → reference URL; the real token only renders when the
-//                          IDE "Windsurf: Provide Auth Token" command opens it
-//                          with an IDE-supplied ?state= param (see field below)
-//   - firebaseApiKey     → reserved for Phase 2
-//   - ideName            → sent in extension headers
-export const WINDSURF_CONFIG = {
-  // RETIRED 2026-05-29 — endpoint returns 404 post-rebrand. Phase 2 will replace.
-  authorizeUrl: "https://app.devin.ai/editor/signin",
-  // RETIRED 2026-05-29 — PKCE flow disabled, see header comment.
-  codeChallengeMethod: "S256" as const,
-  // RETIRED 2026-05-29 — no callback server is started for windsurf/devin-cli.
-  callbackPort: 0,
-  // RETIRED 2026-05-29 — no callback path is registered for windsurf/devin-cli.
-  callbackPath: "/auth/callback",
-  // RETIRED 2026-05-29 — exchange endpoint no longer reached because PKCE is disabled.
+// Raycast Pro AI — reverse-engineered, unofficial API. LOCAL / PERSONAL USE ONLY.
+// See docs/security/PUBLIC_CREDS.md pattern: no secrets in repo; credentials from user's Mac.
+export const RAYCAST_CONFIG = {
+  apiEndpoint: "https://backend.raycast.com",
+  chatEndpoint: "/api/v1/ai/chat_completions",
+  modelsEndpoint: "/api/v1/ai/models",
+  clientType: "macos-app",
+  captureInstructions:
+    "macOS only: use Auto-Import (Keychain + Raycast DB) or capture Bearer, X-Raycast-DeviceId, and optional X-Raycast-Signature JWT from backend.raycast.com traffic.",
+};
+
+// Devin Desktop / Devin CLI import-token configuration.
+// Public product identity is Devin. The upstream transport still identifies
+// the IDE as `windsurf`; authentication itself is import-only.
+export const DEVIN_DESKTOP_CONFIG = {
   apiServerUrl: "https://server.codeium.com",
-  // RETIRED 2026-05-29 — see apiServerUrl.
-  exchangePath: "/exa.seat_management_pb.SeatManagementService/ExchangePKCEAuthorizationCode",
-  // ── Active fields (still consumed by runtime) ─────────────────────────────
-  // Inference server URL (gRPC-web requests go here)
-  inferenceUrl: "https://server.self-serve.windsurf.com",
-  // Primary login path: the user runs the "Windsurf: Provide Auth Token" command
-  // inside the Windsurf/VS Code IDE (or clicks the Jupyter "Get Windsurf
-  // Authentication Token" button), which opens this URL WITH an IDE-supplied
-  // `?state=<xyz>` param and renders the token. Opening this bare URL directly
-  // only shows a "Redirecting" page with no token (#3324).
-  showAuthTokenUrl: "https://windsurf.com/show-auth-token",
-  // Token refresh via Firebase Secure Token Service (reserved for Phase 2).
-  // Default is the public Firebase Web client identifier embedded in the
-  // Windsurf/Devin CLI binary; users may override via WINDSURF_FIREBASE_API_KEY.
-  firebaseApiKey: resolvePublicCred("windsurf_fb", "WINDSURF_FIREBASE_API_KEY"),
-  firebaseTokenUrl: "https://securetoken.googleapis.com/v1/token",
-  // IDE identity sent with every gRPC request
+  inferenceUrl: "https://inference.codeium.com",
   ideName: "windsurf",
-  ideVersion: "3.14.0",
-  extensionVersion: "3.14.0",
+  defaultVersion: "3.6.27",
 };
 
 // Zed IDE credential import — no standard OAuth flow.
@@ -471,24 +498,31 @@ export const PROVIDERS = {
   CLAUDE: "claude",
   CODEX: "codex",
   GEMINI: "gemini",
-  QWEN: "qwen",
   QODER: "qoder",
   ANTIGRAVITY: "antigravity",
   AGY: "agy",
   KIMI_CODING: "kimi-coding",
   OPENAI: "openai",
   GITHUB: "github",
+  GHE_COPILOT: "ghe-copilot",
   GITLAB_DUO: "gitlab-duo",
   KIRO: "kiro",
   AMAZON_Q: "amazon-q",
   CURSOR: "cursor",
+  // #8895 — registered in src/lib/oauth/providers/index.ts but missing here, so
+  // every consumer reading PROVIDERS (onboarding wizard, test-connection routing)
+  // did not know Raycast Pro exists as an OAuth provider.
+  RAYCAST: "raycast",
   KILOCODE: "kilocode",
   CLINE: "cline",
-  WINDSURF: "windsurf",
+  CLINEPASS: "clinepass",
+  DEVIN_DESKTOP: "devin-desktop",
   DEVIN_CLI: "devin-cli",
   TRAE: "trae",
   CODEBUDDY_CN: "codebuddy-cn",
   GROK_CLI: "grok-cli",
+  XAI_OAUTH: "xai-oauth",
+  OPENFERENCE: "openference",
   ZED: "zed",
   ZED_HOSTED: "zed-hosted",
 };

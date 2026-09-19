@@ -99,7 +99,7 @@ describe("RTK strip-code-comments — runtime reachability", () => {
 describe("RTK strip-code-comments — config persistence", () => {
   beforeEach(() => {
     core.resetDbInstance();
-    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
   });
 
@@ -109,7 +109,7 @@ describe("RTK strip-code-comments — config persistence", () => {
 
   after(() => {
     core.resetDbInstance();
-    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     if (ORIGINAL_DATA_DIR === undefined) delete process.env.DATA_DIR;
     else process.env.DATA_DIR = ORIGINAL_DATA_DIR;
   });

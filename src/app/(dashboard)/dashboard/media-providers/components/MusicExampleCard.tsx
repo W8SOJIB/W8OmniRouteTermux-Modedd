@@ -5,6 +5,7 @@ import { useTranslations } from "next-intl";
 import { useApiKey } from "../../providers/hooks/useApiKey";
 import { useProviderModels } from "../../providers/hooks/useProviderModels";
 import { buildCurl } from "../../providers/utils/buildCurl";
+import { PLAYGROUND_KEY_ID_HEADER, resolvePlaygroundKeyId } from "../../providers/utils/playgroundAuth";
 import { PlaygroundCard } from "./PlaygroundCard";
 
 interface Props {
@@ -24,12 +25,12 @@ function extractError(data: unknown): string | null {
 
 export function MusicExampleCard({ providerId }: Props) {
   const t = useTranslations("miniPlayground");
-  const { apiKey } = useApiKey();
+  const { apiKey, keys } = useApiKey();
   const { models } = useProviderModels(providerId);
 
   const firstModel = models[0]?.id ?? "";
   const [model, setModel] = useState<string>("");
-  const [prompt, setPrompt] = useState<string>("Upbeat jazz piano with light percussion");
+  const [prompt, setPrompt] = useState<string>(() => t("musicSample"));
   const [duration, setDuration] = useState<number>(10);
   const [running, setRunning] = useState<boolean>(false);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
@@ -45,7 +46,7 @@ export function MusicExampleCard({ providerId }: Props) {
       (typeof window !== "undefined" ? window.location.origin : "http://localhost:20128") +
       ENDPOINT_PATH,
     headers: {
-      Authorization: `Bearer ${apiKey || "<your-api-key>"}`,
+      Authorization: "Bearer <your-api-key>",
       "Content-Type": "application/json",
     },
     body: buildBody(),
@@ -58,13 +59,18 @@ export function MusicExampleCard({ providerId }: Props) {
     setAudioUrl(null);
     const t0 = performance.now();
     try {
+      // Authenticate via the dashboard session cookie — never send the masked
+      // apiKey as a Bearer token (it is not a real credential; see #9935).
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        "x-connection-id": providerId,
+      };
+      const playgroundKeyId = resolvePlaygroundKeyId(apiKey, keys);
+      if (playgroundKeyId) headers[PLAYGROUND_KEY_ID_HEADER] = playgroundKeyId;
       const res = await fetch(ENDPOINT_PATH, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          "x-connection-id": providerId,
-        },
+        credentials: "same-origin",
+        headers,
         body: JSON.stringify(buildBody()),
       });
       const elapsed = performance.now() - t0;
@@ -90,7 +96,7 @@ export function MusicExampleCard({ providerId }: Props) {
           setAudioUrl(url);
           setLatencyMs(elapsed);
         } else {
-          setError("No audio URL in response: " + JSON.stringify(data));
+          setError(t("noAudioUrl", { response: JSON.stringify(data) }));
         }
       } else {
         const blob = await res.blob();
@@ -99,7 +105,7 @@ export function MusicExampleCard({ providerId }: Props) {
         setLatencyMs(elapsed);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Request failed");
+      setError(err instanceof Error ? err.message : t("requestFailed"));
     } finally {
       setRunning(false);
     }
@@ -110,7 +116,7 @@ export function MusicExampleCard({ providerId }: Props) {
   const renderAudio = () => (
     <div className="p-3">
       <audio controls src={audioUrl!} className="w-full">
-        Your browser does not support audio.
+        {t("browserAudioUnsupported")}
       </audio>
     </div>
   );
@@ -119,7 +125,7 @@ export function MusicExampleCard({ providerId }: Props) {
 
   return (
     <PlaygroundCard
-      kindLabel="Music"
+      kindLabel={t("music")}
       apiEndpoint={ENDPOINT_PATH}
       onRun={handleRun}
       curlSnippet={curlSnippet}
@@ -165,7 +171,7 @@ export function MusicExampleCard({ providerId }: Props) {
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           rows={2}
-          placeholder="Upbeat jazz piano with light percussion"
+          placeholder={t("musicSample")}
           className="w-full rounded-md border border-border bg-bg-subtle text-sm px-2 py-1.5 text-text-main focus:outline-none focus:ring-1 focus:ring-primary resize-none"
         />
       </div>

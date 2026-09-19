@@ -14,6 +14,10 @@ export default defineConfig({
       "open-sse/services/autoCombo/__tests__/**/*.test.ts",
       "open-sse/services/combo/__tests__/**/*.test.ts",
       "open-sse/services/__tests__/antigravity-quota-family.test.ts",
+      // #8890 shipped this suite into a directory no runner collects, so it had
+      // never executed once (check:test-discovery flags it as a NEW orphan).
+      "open-sse/services/__tests__/fail-fast-concurrency-gate.test.ts",
+      "src/lib/memory/__tests__/generic-backend.test.ts",
       "tests/unit/autoCombo/**/*.test.ts",
       "tests/unit/encryption.spec.ts",
       "src/shared/components/**/*.test.tsx",
@@ -28,6 +32,10 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      // Mirrors tsconfig paths. Without it, a UI test importing from open-sse
+      // resolves to undefined instead of failing loudly — which silently made
+      // every provider look credentialed in the free-tier card tests.
+      "@omniroute/open-sse": path.resolve(__dirname, "./open-sse"),
     },
   },
 });

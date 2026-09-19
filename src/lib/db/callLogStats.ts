@@ -25,6 +25,15 @@ export interface ProviderMetricRow {
   lastErrorStatus: number | null;
 }
 
+/** One provider's traffic over a bounded window. See `getProviderUsageSince`. */
+export interface ProviderUsageRow {
+  provider: string;
+  requests: number;
+  successes: number;
+  avgLatencyMs: number | null;
+  lastRequestAt: string | null;
+}
+
 export interface SearchProviderStatRow {
   provider: string;
   requests: number;
@@ -56,7 +65,10 @@ export interface SearchProviderCountRow {
 
 /**
  * Returns one row per provider with call-level aggregates plus last-status
- * subselects. Excludes rows where provider is NULL or '-'.
+ * subselects. Excludes rows where provider is NULL or '-', and excludes
+ * providers with no live row in `provider_connections` — a deleted provider
+ * connection must not keep surfacing as a ghost topology node forever from
+ * its retained historical call_logs rows. See #10714.
  */
 export function getProviderMetrics(): ProviderMetricRow[] {
   const db = getDbInstance();
@@ -96,9 +108,49 @@ export function getProviderMetrics(): ProviderMetricRow[] {
           ) as lastErrorStatus
         FROM call_logs c
         WHERE c.provider IS NOT NULL AND c.provider != '-'
+          AND EXISTS (
+            SELECT 1 FROM provider_connections pc WHERE pc.provider = c.provider
+          )
         GROUP BY c.provider`
     )
     .all() as ProviderMetricRow[];
+}
+
+// ---------------------------------------------------------------------------
+// /api/free-provider-rankings — windowed usage aggregate
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-provider usage over a time window: how much traffic a provider actually
+ * served, and how much of it succeeded.
+ *
+ * Deliberately NOT `getProviderMetrics()` with a `since` parameter: that query
+ * carries two correlated subqueries (`lastStatus`, `lastErrorStatus`) which a
+ * ranking never displays, and they dominate its cost — `call_logs` is indexed
+ * on `timestamp` alone, so each correlated pass rescans the whole window per
+ * provider. Here a single bounded `GROUP BY` uses `idx_cl_timestamp` and stops
+ * there. The rules are shared with its neighbour, not the query: same success
+ * definition, same `#10714` guard against providers whose connections are gone.
+ */
+export function getProviderUsageSince(since: string): ProviderUsageRow[] {
+  const db = getDbInstance();
+  return db
+    .prepare(
+      `SELECT
+          c.provider,
+          COUNT(*) as requests,
+          SUM(CASE WHEN c.status >= 200 AND c.status < 400 THEN 1 ELSE 0 END) as successes,
+          ROUND(AVG(c.duration)) as avgLatencyMs,
+          MAX(c.timestamp) as lastRequestAt
+        FROM call_logs c
+        WHERE c.provider IS NOT NULL AND c.provider != '-'
+          AND c.timestamp >= @since
+          AND EXISTS (
+            SELECT 1 FROM provider_connections pc WHERE pc.provider = c.provider
+          )
+        GROUP BY c.provider`
+    )
+    .all({ since }) as ProviderUsageRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -232,4 +284,35 @@ export function getFallbackStats(
     )
     .get(params) as FallbackStatsRow | undefined;
   return row ?? { total: 0, with_requested: 0, fallback_eligible: 0, fallbacks: 0 };
+}
+
+/**
+ * Failure-family breakdown over `call_logs` for the usage analytics endpoint.
+ * Failures are rows with status >= 400 or a non-empty error summary; successes
+ * are excluded in SQL. Pre-migration rows and failures the classifier does not
+ * recognize (null family) land in the explicit `unclassified` bucket.
+ *
+ * @param whereClause - SQL WHERE clause (may be empty string) using the same
+ *                      named params as the usage_history queries.
+ * @param params      - Named params object (string values).
+ */
+export function getErrorTypeBreakdown(
+  whereClause: string,
+  params: Record<string, string>
+): Array<{ errorType: string; count: number }> {
+  const db = getDbInstance();
+  const rows = db
+    .prepare(
+      `
+      SELECT
+        COALESCE(error_type, 'unclassified') AS errorType,
+        COUNT(*) AS count
+      FROM call_logs
+      ${whereClause} ${whereClause ? "AND" : "WHERE"} (status >= 400 OR error_summary IS NOT NULL)
+      GROUP BY 1
+      ORDER BY count DESC, errorType ASC
+      `
+    )
+    .all(params) as Array<{ errorType: string; count: number }>;
+  return rows.map((row) => ({ errorType: String(row.errorType), count: Number(row.count) }));
 }

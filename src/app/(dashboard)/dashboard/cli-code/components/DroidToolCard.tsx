@@ -102,7 +102,9 @@ export default function DroidToolCard({
       if (existing.length > 0) {
         setModelList(existing.map((m) => m.model).filter(Boolean));
         const first = existing[0];
-        if (first?.apiKey) {
+        // apiKey may be a structured secret reference (object) rather than a
+        // plaintext string. Only match on strings.
+        if (typeof first?.apiKey === "string" && first.apiKey) {
           // (#523) Keys from /api/keys are masked. Match by prefix/suffix.
           const fileKeyPrefix = first.apiKey.slice(0, 8);
           const fileKeySuffix = first.apiKey.slice(-4);
@@ -486,7 +488,7 @@ export default function DroidToolCard({
                         onClick={() => addModel()}
                         disabled={!modelInput.trim() || modelList.includes(modelInput.trim())}
                         className="px-2 py-1.5 rounded border bg-surface border-border hover:border-primary text-xs shrink-0 disabled:opacity-50"
-                        title="Add model"
+                        title={t("addModel")}
                       >
                         <span className="material-symbols-outlined text-[14px]">add</span>
                       </button>

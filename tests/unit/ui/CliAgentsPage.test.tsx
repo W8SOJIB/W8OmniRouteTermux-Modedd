@@ -4,6 +4,7 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ToolBatchStatusMap } from "@/shared/types/cliBatchStatus";
+import { CLI_TOOLS } from "@/shared/constants/cliTools";
 
 // ── Mocks (declared before any imports that depend on them) ───────────────────
 
@@ -48,21 +49,24 @@ vi.mock("@/app/(dashboard)/dashboard/cli-code/components/CliStatusBadge", () => 
 
 // ── Static imports after mocks ────────────────────────────────────────────────
 
-const { default: CliAgentsPageClient } = await import(
-  "@/app/(dashboard)/dashboard/cli-agents/CliAgentsPageClient"
-);
+const { default: CliAgentsPageClient } =
+  await import("@/app/(dashboard)/dashboard/cli-agents/CliAgentsPageClient");
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
-/** 6 agent tool ids from the catalog (§3.2 of plan-14) */
-const AGENT_IDS = [
-  "openclaw",
-  "hermes-agent",
-  "goose",
-  "interpreter",
-  "warp",
-  "agent-deck",
-] as const;
+/**
+ * Agent tool ids from the catalog (§3.2 of plan-14, category: "agent" in
+ * src/shared/constants/cliTools.ts). "omp" and "letta" were added to the
+ * catalog after plan-14 shipped, bringing the count from 6 to 8.
+ */
+// Derivado do catalogo, NAO escrito a mao. A lista hardcoded anterior ja tinha
+// derivado duas vezes (6 -> 8 com omp/letta, depois 8 -> 9 com prime-agent), e a
+// consequencia nao e obvia: um agente ausente daqui nao entra no mapa de status,
+// cai no default not_installed e contamina os testes de filtro/contagem com um
+// card extra. Derivar mantem o fixture em sincronia com a fonte por construcao.
+const AGENT_IDS = Object.values(CLI_TOOLS)
+  .filter((tool) => tool.category === "agent")
+  .map((tool) => tool.id);
 
 function makeBatchStatusMap(overrides: Partial<ToolBatchStatusMap> = {}): ToolBatchStatusMap {
   const base: ToolBatchStatusMap = {};
@@ -144,9 +148,9 @@ describe("CliAgentsPageClient", () => {
     expect(container.textContent).toContain("pageTitle");
   }, 15000);
 
-  it("2. renders exactly 6 agent tool cards", async () => {
+  it("2. renders exactly one card per agent in the catalog", async () => {
     const container = await renderPage();
-    expect(countAgentCards(container)).toBe(6);
+    expect(countAgentCards(container)).toBe(AGENT_IDS.length);
   }, 15000);
 
   it("3. search filter — 'hermes' shows 1 card (hermes-agent)", async () => {
@@ -169,9 +173,7 @@ describe("CliAgentsPageClient", () => {
     const visibleCards = countAgentCards(container);
     expect(visibleCards).toBe(1);
 
-    const remainingHrefs = Array.from(
-      container.querySelectorAll<HTMLAnchorElement>("a[href]")
-    )
+    const remainingHrefs = Array.from(container.querySelectorAll<HTMLAnchorElement>("a[href]"))
       .filter((a) => a.getAttribute("href")?.startsWith("/dashboard/cli-agents/"))
       .map((a) => a.getAttribute("href") ?? "");
 

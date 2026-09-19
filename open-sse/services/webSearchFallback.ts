@@ -1,7 +1,10 @@
 import { FORMATS } from "../translator/formats.ts";
 
 export const OMNIROUTE_WEB_SEARCH_FALLBACK_TOOL_NAME = "omniroute_web_search";
-const WEB_SEARCH_TOOL_TYPES = new Set(["web_search", "web_search_preview"]);
+// Prefix match — Anthropic sends date-suffixed variants (web_search_20250305, …).
+// The other two detectors (openai-responses/helpers.ts, webSearchRouting.ts) already
+// use /^web_search/ prefix matching; this aligns the fallback detector with them.
+const WEB_SEARCH_TOOL_TYPES = /^web_search/;
 const SEARCH_CONTEXT_DEFAULTS: Record<string, number> = {
   low: 5,
   medium: 8,
@@ -9,6 +12,10 @@ const SEARCH_CONTEXT_DEFAULTS: Record<string, number> = {
 };
 
 type JsonRecord = Record<string, unknown>;
+type WebSearchFallbackBody = JsonRecord & {
+  tools?: unknown;
+  tool_choice?: unknown;
+};
 
 export interface WebSearchFallbackPlan {
   enabled: boolean;
@@ -23,13 +30,13 @@ function toRecord(value: unknown): JsonRecord {
 function isBuiltInWebSearchTool(tool: unknown): tool is JsonRecord {
   const toolRecord = toRecord(tool);
   const toolType = typeof toolRecord.type === "string" ? toolRecord.type : "";
-  return WEB_SEARCH_TOOL_TYPES.has(toolType) && !toolRecord.function;
+  return WEB_SEARCH_TOOL_TYPES.test(toolType) && !toolRecord.function;
 }
 
 function isBuiltInWebSearchToolChoice(toolChoice: unknown): boolean {
   const choice = toRecord(toolChoice);
   const toolType = typeof choice.type === "string" ? choice.type : "";
-  return WEB_SEARCH_TOOL_TYPES.has(toolType);
+  return WEB_SEARCH_TOOL_TYPES.test(toolType);
 }
 
 function buildFallbackDescription(tool: JsonRecord): string {
@@ -142,12 +149,20 @@ export function supportsNativeWebSearchFallbackBypass({
   sourceFormat,
   targetFormat,
   nativeCodexPassthrough,
+  interceptSearchOverride,
 }: {
   provider?: string | null;
   sourceFormat?: string | null;
-  targetFormat: string | null | undefined;
+  targetFormat?: string | null;
   nativeCodexPassthrough: boolean;
+  // Per-model rule (#3384) — resolveInterceptSearch() in src/lib/db/interceptionRules.ts.
+  // true = force interception (never bypass); false = force native bypass; undefined =
+  // fall through to the native-bypass defaults below.
+  interceptSearchOverride?: boolean;
 }): boolean {
+  if (typeof interceptSearchOverride === "boolean") {
+    return !interceptSearchOverride;
+  }
   // Native Codex (OpenAI Responses) passthrough: the upstream runs web search itself.
   if (nativeCodexPassthrough) return true;
   // Gemini target: the Gemini translator maps built-in web search to googleSearch natively.
@@ -164,13 +179,14 @@ export function supportsNativeWebSearchFallbackBypass({
   return false;
 }
 
-export function prepareWebSearchFallbackBody<T extends JsonRecord>(
+export function prepareWebSearchFallbackBody<T extends WebSearchFallbackBody>(
   body: T,
   options: {
     provider?: string | null;
     sourceFormat?: string | null;
     targetFormat?: string | null;
     nativeCodexPassthrough: boolean;
+    interceptSearchOverride?: boolean;
   }
 ): { body: T; fallback: WebSearchFallbackPlan } {
   const tools = Array.isArray(body.tools) ? body.tools : null;

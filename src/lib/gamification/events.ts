@@ -25,7 +25,8 @@ export async function emitGamificationEvent(params: {
     | "combo_use"
     | "token_share"
     | "invite_redeem"
-    | "daily_login";
+    | "daily_login"
+    | "radar_supporter";
   metadata?: Record<string, unknown>;
 }): Promise<void> {
   const { apiKeyId, action, metadata } = params;
@@ -33,6 +34,13 @@ export async function emitGamificationEvent(params: {
   if (!apiKeyId) return; // Skip if no API key
 
   try {
+    // A verified Radar supporter is a recognition event, not an XP or
+    // leaderboard action. The caller supplies only a one-way key identity.
+    if (action === "radar_supporter") {
+      await checkAndUnlockBadge(apiKeyId, "radar-supporter", false);
+      return;
+    }
+
     // 1. Award XP
     const xpAmount = getXpForAction(action);
     if (xpAmount > 0) {
@@ -87,7 +95,7 @@ export async function emitGamificationEvent(params: {
   } catch (err) {
     // Never throw — gamification must not break the request pipeline
     log.error("events.error", {
-      apiKeyId,
+      ...(action === "radar_supporter" ? {} : { apiKeyId }),
       action,
       error: err instanceof Error ? err.message : String(err),
     });
@@ -114,22 +122,25 @@ function getXpForAction(action: string): number {
 /**
  * Check and unlock a specific badge.
  */
-async function checkAndUnlockBadge(apiKeyId: string, badgeId: string): Promise<void> {
+async function checkAndUnlockBadge(
+  apiKeyId: string,
+  badgeId: string,
+  logIdentity = true
+): Promise<void> {
   const { unlockBadge, hasBadge } = await import("../db/gamification");
   // #3472: dedup via user_badges directly. getBadges() INNER-JOINs badge_definitions, which is
   // empty until seeded, so it falsely reported "not earned" and re-emitted the unlock event on
   // every request.
   if (!hasBadge(apiKeyId, badgeId)) {
     unlockBadge(apiKeyId, badgeId);
-    log.info("events.badge_unlocked", { apiKeyId, badgeId });
+    log.info("events.badge_unlocked", logIdentity ? { apiKeyId, badgeId } : { badgeId });
 
     // Look up badge details from badge_definitions
     const { getDbInstance } = await import("../db/core");
     const badgeRow = getDbInstance()
       .prepare("SELECT name, description, icon, rarity FROM badge_definitions WHERE id = ?")
       .get(badgeId) as
-      | { name: string; description: string | null; icon: string | null; rarity: string }
-      | undefined;
+      { name: string; description: string | null; icon: string | null; rarity: string } | undefined;
 
     // Record notification for SSE toast
     const { recordBadgeUnlock } = await import("./notifications");

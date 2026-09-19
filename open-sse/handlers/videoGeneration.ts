@@ -1,26 +1,35 @@
 /**
  * Video Generation Handler
  *
- * Handles POST /v1/videos/generations requests.
- * Proxies to upstream video generation providers.
- *
- * Supported provider formats:
- * - ComfyUI: submit AnimateDiff/SVD workflow → poll → fetch video
- * - SD WebUI: POST to AnimateDiff extension endpoint
- *
- * Response format (OpenAI-like):
- * {
- *   "created": 1234567890,
- *   "data": [{ "b64_json": "...", "format": "mp4" }]
- * }
+ * Handles POST /v1/videos/generations requests. Proxies to upstream video
+ * generation providers (ComfyUI AnimateDiff/SVD, SD WebUI AnimateDiff, and
+ * more — see the per-format handlers below). Response format (OpenAI-like):
+ * { "created": 1234567890, "data": [{ "url": "https://…", "format": "mp4" }] }
  */
 
 import { getVideoProvider, parseVideoModel } from "../config/videoRegistry.ts";
 import { kieExecutor } from "../executors/kie.ts";
 import { vertexGenerateVideo } from "../executors/vertexMedia.ts";
 import { handleGoogleFlowVideoGeneration } from "./videoGeneration/googleFlowHandler.ts";
+import { handleDeepinfraVideoGeneration } from "./videoGeneration/deepinfraHandler.ts";
+import { handleLeonardoVideoGeneration } from "./videoGeneration/leonardoHandler.ts";
+import { handleDashscopeVideoGeneration } from "./videoGeneration/dashscopeHandler.ts";
+import { handleNovitaVideoGeneration } from "./videoGeneration/novitaHandler.ts";
+import { handleXaiVideoGeneration } from "./videoGeneration/xaiGrokImagineHandler.ts";
+import { handleSegmindVideoGeneration } from "./videoGeneration/providers/segmind.ts";
+import { handleAdobeFireflyVideoGeneration } from "./videoGeneration/adobeFireflyHandler.ts";
+import { handleOpenAIVideoGeneration } from "./videoGeneration/openai.ts";
+import { getVideoJobPreset, handleVideoJobGeneration } from "./videoGeneration/job.ts";
+import {
+  extractRunwayFailureMessage,
+  normalizeRunwayVideoResult,
+  resolvePositiveInteger,
+  resolveRunwayDuration,
+  resolveRunwayPromptImage,
+  resolveRunwayRatio,
+} from "./videoGeneration/runwayHelpers.ts";
 import { getExecutor } from "../executors/index.ts";
-import { isJsonObject, parseKieResultJson } from "../utils/kieTask.ts";
+import { getKieTaskId, isJsonObject, parseKieResultJson } from "../utils/kieTask.ts";
 import {
   buildRunwayApiUrl,
   buildRunwayHeaders,
@@ -31,15 +40,98 @@ import {
   pollComfyResult,
   fetchComfyOutput,
   extractComfyOutputFiles,
+  resolveComfyUiBaseUrl,
 } from "../utils/comfyuiClient.ts";
 import { saveCallLog } from "@/lib/usageDb";
+import { getAllCustomModels } from "@/lib/db/models";
 import { sanitizeErrorMessage } from "../utils/error.ts";
+import {
+  FetchTimeoutError,
+  fetchWithTimeout,
+  getConfiguredTimeout,
+} from "@/shared/utils/fetchTimeout";
+import { handleFalVideoGeneration } from "./mediaGeneration/fal.ts";
+
+/**
+ * Resolve the base URL for OpenAI-compatible video generation endpoints.
+ * Prefers providerSpecificData.baseUrl (from custom node config), falls back to
+ * top-level credentials.baseUrl, then to the provided fallback.
+ */
+export function resolveVideoBaseUrl(
+  credentials:
+    { baseUrl?: unknown; providerSpecificData?: { baseUrl?: unknown } | null } | null | undefined,
+  fallback: string
+): string {
+  const psd = credentials?.providerSpecificData;
+  const psdBaseUrl =
+    psd && typeof psd === "object" && typeof psd.baseUrl === "string" && psd.baseUrl.trim()
+      ? psd.baseUrl.trim()
+      : null;
+  const topLevelBaseUrl =
+    typeof credentials?.baseUrl === "string" && credentials.baseUrl.trim()
+      ? credentials.baseUrl.trim()
+      : null;
+  const nodeBaseUrl = psdBaseUrl || topLevelBaseUrl;
+
+  if (!nodeBaseUrl) return fallback;
+
+  // Trim trailing slashes
+  let normalized = nodeBaseUrl;
+  while (normalized.endsWith("/")) normalized = normalized.slice(0, -1);
+  if (normalized.endsWith("/videos/generations")) return normalized;
+  const stripped = normalized.replace(/\/videos\/generations$/, "");
+  return `${stripped}/videos/generations`;
+}
+
+/**
+ * Read generationConfig.preset from the custom model row for the given
+ * provider/model id. Returns null when the model has no preset configured (or
+ * the registry is unreadable), so callers can fall back to the sync path.
+ */
+async function getCustomModelVideoPreset(
+  providerId: string,
+  modelId: string
+): Promise<string | null> {
+  try {
+    const customModelsMap = (await getAllCustomModels()) as Record<
+      string,
+      Array<Record<string, unknown>>
+    >;
+    const models = customModelsMap[providerId];
+    if (!Array.isArray(models)) return null;
+    for (const model of models) {
+      if (!model || typeof model !== "object" || model.id !== modelId) continue;
+      const generationConfig = model.generationConfig;
+      if (
+        generationConfig &&
+        typeof generationConfig === "object" &&
+        typeof (generationConfig as Record<string, unknown>).preset === "string"
+      ) {
+        return (generationConfig as Record<string, unknown>).preset as string;
+      }
+      return null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Handle video generation request
  */
-export async function handleVideoGeneration({ body, credentials, log }) {
-  const { provider, model } = parseVideoModel(body.model);
+
+/**
+ * Handle video generation request
+ */
+export async function handleVideoGeneration({ body, credentials, log, resolvedProvider = null }) {
+  let { provider, model } = parseVideoModel(body.model);
+  if (resolvedProvider) {
+    provider = resolvedProvider;
+    model = body.model.startsWith(provider + "/")
+      ? body.model.slice(provider.length + 1)
+      : body.model;
+  }
 
   if (!provider) {
     return {
@@ -51,15 +143,76 @@ export async function handleVideoGeneration({ body, credentials, log }) {
 
   const providerConfig = getVideoProvider(provider);
   if (!providerConfig) {
-    return {
-      success: false,
-      status: 400,
-      error: `Unknown video provider: ${provider}`,
+    if (!resolvedProvider) {
+      return {
+        success: false,
+        status: 400,
+        error: `Unknown video provider: ${provider}`,
+      };
+    }
+    // Custom provider node. When the custom model row carries a
+    // generationConfig.preset (e.g. "agnes-video-job"), dispatch through the
+    // submit → poll job pipeline; otherwise mirror the images route and use the
+    // generic OpenAI-compatible handler with a synthetic config.
+    const presetName = await getCustomModelVideoPreset(provider, model);
+    if (presetName !== null) {
+      if (!getVideoJobPreset(presetName)) {
+        return {
+          success: false,
+          status: 502,
+          error: `Unknown video job preset: ${presetName}`,
+        };
+      }
+      if (log)
+        log.info("VIDEO", `Custom model ${provider}/${model} — using job preset ${presetName}`);
+      return handleVideoJobGeneration({
+        model,
+        presetName,
+        body,
+        credentials,
+        log,
+      });
+    }
+    if (log)
+      log.info("VIDEO", `Custom model ${provider}/${model} — using OpenAI-compatible handler`);
+    const syntheticConfig = {
+      id: provider,
+      baseUrl: resolveVideoBaseUrl(
+        credentials,
+        "http://generative.language.googleapis.com/v1beta/openai/videos/generations"
+      ),
+      authType: "apikey",
+      authHeader: "bearer",
+      format: "openai-video",
     };
+    return handleOpenAIVideoGeneration({
+      model,
+      body,
+      credentials,
+      provider,
+      providerConfig: syntheticConfig,
+      log,
+    });
+  }
+  if (getVideoJobPreset(providerConfig.format)) {
+    return handleVideoJobGeneration({
+      model,
+      presetName: providerConfig.format,
+      body,
+      credentials,
+      log,
+    });
+  }
+  if (providerConfig.format === "openai-video") {
+    return handleOpenAIVideoGeneration({ model, provider, providerConfig, body, credentials, log });
   }
 
   if (providerConfig.format === "vertex-veo") {
     return handleVertexVeoGeneration({ model, body, credentials, log });
+  }
+
+  if (providerConfig.format === "fal-ai-video") {
+    return handleFalVideoGeneration({ model, provider, providerConfig, body, credentials, log });
   }
 
   if (providerConfig.format === "google-flow") {
@@ -67,7 +220,16 @@ export async function handleVideoGeneration({ body, credentials, log }) {
   }
 
   if (providerConfig.format === "comfyui") {
-    return handleComfyUIVideoGeneration({ model, provider, providerConfig, body, log });
+    return handleComfyUIVideoGeneration({
+      model,
+      provider,
+      providerConfig: {
+        ...providerConfig,
+        baseUrl: resolveComfyUiBaseUrl(credentials, providerConfig.baseUrl),
+      },
+      body,
+      log,
+    });
   }
 
   if (providerConfig.format === "sdwebui-video") {
@@ -101,6 +263,17 @@ export async function handleVideoGeneration({ body, credentials, log }) {
     });
   }
 
+  if (providerConfig.format === "deepinfra-video") {
+    return handleDeepinfraVideoGeneration({
+      model,
+      provider,
+      providerConfig,
+      body,
+      credentials,
+      log,
+    });
+  }
+
   if (providerConfig.format === "dashscope-video") {
     return handleDashscopeVideoGeneration({
       model,
@@ -112,182 +285,41 @@ export async function handleVideoGeneration({ body, credentials, log }) {
     });
   }
 
+  if (providerConfig.format === "segmind") {
+    return handleSegmindVideoGeneration({
+      model,
+      provider,
+      providerConfig,
+      body,
+      credentials,
+      log,
+    });
+  }
+  if (providerConfig.format === "novita-video") {
+    return handleNovitaVideoGeneration({ model, provider, providerConfig, body, credentials, log });
+  }
+  if (providerConfig.format === "xai-video") {
+    return handleXaiVideoGeneration({ model, provider, providerConfig, body, credentials, log });
+  }
+  if (providerConfig.format === "adobe-firefly-video") {
+    return handleAdobeFireflyVideoGeneration({
+      model,
+      provider,
+      providerConfig,
+      body,
+      credentials,
+      log,
+    });
+  }
+  if (resolvedProvider) {
+    // Custom provider with no matching built-in format — use OpenAI-compatible fallback
+    return handleOpenAIVideoGeneration({ model, provider, providerConfig, body, credentials, log });
+  }
   return {
     success: false,
     status: 400,
     error: `Unsupported video format: ${providerConfig.format}`,
   };
-}
-
-/**
- * Alibaba (DashScope) Wan video generation: create async task → poll → MP4.
- * Targets wan2.7-t2v on the DashScope intl region. Reuses the stored alibaba
- * provider Bearer apiKey — no separate credential flow.
- */
-async function handleDashscopeVideoGeneration({
-  model,
-  provider,
-  providerConfig,
-  body,
-  credentials,
-  log,
-}: {
-  model: string;
-  provider: string;
-  providerConfig: { baseUrl: string; statusUrl?: string };
-  body: Record<string, unknown> & {
-    prompt?: unknown;
-    negative_prompt?: unknown;
-    size?: unknown;
-    aspect_ratio?: unknown;
-    duration?: unknown;
-    timeout_ms?: unknown;
-    poll_interval_ms?: unknown;
-  };
-  credentials?: { apiKey?: string; accessToken?: string } | null;
-  log?: {
-    info: (scope: string, message: string) => void;
-    error: (scope: string, message: string) => void;
-  } | null;
-}) {
-  const startTime = Date.now();
-  const timeoutMs = Number(body.timeout_ms) > 0 ? Number(body.timeout_ms) : 300000;
-  const pollIntervalMs = Number(body.poll_interval_ms) > 0 ? Number(body.poll_interval_ms) : 2500;
-  const token = credentials?.apiKey || credentials?.accessToken;
-  const baseUrl = providerConfig.baseUrl.replace(/\/$/, "");
-  const statusUrl = (providerConfig.statusUrl || `${baseUrl}/tasks`).replace(/\/$/, "");
-  const prompt = typeof body.prompt === "string" ? body.prompt : String(body.prompt ?? "");
-
-  if (!token) {
-    return { success: false, status: 401, error: "Alibaba DashScope API key is required" };
-  }
-
-  const sizeParam = normalizeDashscopeSize(body.size, body.aspect_ratio);
-  const parameters: Record<string, unknown> = {};
-  if (sizeParam) parameters.size = sizeParam;
-  if (body.duration != null) parameters.duration = Number(body.duration);
-
-  const payload = {
-    model,
-    input: {
-      prompt,
-      ...(typeof body.negative_prompt === "string"
-        ? { negative_prompt: body.negative_prompt }
-        : {}),
-    },
-    parameters,
-  };
-
-  if (log) {
-    log.info(
-      "VIDEO",
-      `${provider}/${model} (dashscope-video) | prompt: "${prompt.slice(0, 60)}..."`
-    );
-  }
-
-  try {
-    // Step 1: create async task (X-DashScope-Async: enable)
-    const createRes = await fetch(`${baseUrl}/services/aigc/video-generation/video-synthesis`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        "X-DashScope-Async": "enable",
-      },
-      body: JSON.stringify(payload),
-    });
-    const createData = await createRes.json().catch(() => ({}));
-    const taskId = createData?.output?.task_id;
-    if (!taskId) {
-      const errorMessage =
-        createData?.message ||
-        createData?.errors?.[0]?.message ||
-        "DashScope video generation did not return task_id";
-      if (log) {
-        log.error("VIDEO", `DashScope createTask failed: ${JSON.stringify(createData)}`);
-      }
-      return { success: false, status: 502, error: String(errorMessage) };
-    }
-
-    // Step 2: poll statusUrl/{task_id} until terminal
-    const deadline = startTime + timeoutMs;
-    let lastStatus = "PENDING";
-    while (Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-      const pollRes = await fetch(`${statusUrl}/${taskId}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const pollData = await pollRes.json().catch(() => ({}));
-      lastStatus = pollData?.output?.task_status || "PENDING";
-
-      if (lastStatus === "SUCCEEDED") {
-        const videoUrl = pollData?.output?.video_url;
-        if (!videoUrl) {
-          return {
-            success: false,
-            status: 502,
-            error: "DashScope task SUCCEEDED but no video_url",
-          };
-        }
-        saveCallLog({
-          method: "POST",
-          path: "/v1/videos/generations",
-          status: 200,
-          model: `${provider}/${model}`,
-          provider,
-          duration: Date.now() - startTime,
-          responseBody: { videos_count: 1 },
-        }).catch(() => {});
-        return {
-          success: true,
-          data: {
-            created: Math.floor(Date.now() / 1000),
-            data: [{ url: videoUrl, format: "mp4" }],
-          },
-        };
-      }
-
-      if (lastStatus === "FAILED" || lastStatus === "UNKNOWN_ERROR") {
-        const errorMessage =
-          pollData?.output?.message ||
-          pollData?.output?.errors?.[0]?.message ||
-          "DashScope video task FAILED";
-        return { success: false, status: 502, error: String(errorMessage) };
-      }
-      // PENDING / RUNNING → keep polling
-    }
-
-    return {
-      success: false,
-      status: 504,
-      error: `DashScope task ${taskId} timed out (status: ${lastStatus})`,
-    };
-  } catch (err: unknown) {
-    return {
-      success: false,
-      status: isJsonObject(err) && Number.isFinite(Number(err.status)) ? Number(err.status) : 502,
-      error: sanitizeErrorMessage(err) || "Video provider error",
-    };
-  }
-}
-
-// Map OmniRoute size/aspect_ratio → Alibaba DashScope "WxH" (1280*720).
-// Accepts "1280*720", "1280x720", or a ratio "16:9". Returns undefined if unparseable
-// (then omitted from the payload so DashScope applies its own default).
-function normalizeDashscopeSize(size: unknown, aspectRatio: unknown): string | undefined {
-  if (typeof size === "string") {
-    if (/^\d+\*\d+$/.test(size)) return size;
-    if (/^\d+x\d+$/.test(size)) return size.replace("x", "*");
-  }
-  if (typeof aspectRatio === "string") {
-    const ratioMap: Record<string, string> = {
-      "16:9": "1280*720",
-      "9:16": "720*1280",
-      "1:1": "960*960",
-    };
-    return ratioMap[aspectRatio];
-  }
-  return undefined;
 }
 
 /**
@@ -377,9 +409,34 @@ async function handleVeoAiFreeVideoGeneration({ model, provider, body, credentia
     };
   }
 
+  const payload = await upstreamResponse.json().catch(() => null);
+  const item = Array.isArray(payload?.data) ? payload.data[0] : null;
+  if (
+    !payload ||
+    !Array.isArray(payload.data) ||
+    payload.data.length !== 1 ||
+    !item ||
+    typeof item.b64_json !== "string" ||
+    item.b64_json.trim().length === 0 ||
+    item.format !== "mp4" ||
+    typeof item.url === "string"
+  ) {
+    return {
+      success: false,
+      status: 502,
+      error: {
+        error: {
+          message: "Veo AI Free did not return a valid MP4 artifact",
+          type: "upstream_error",
+          code: "VIDEO_ARTIFACT_UNAVAILABLE",
+        },
+      },
+    };
+  }
+
   return {
     success: true,
-    data: await upstreamResponse.json(),
+    data: payload,
   };
 }
 
@@ -664,7 +721,7 @@ async function handleKieVideoGeneration({
 
   try {
     const createData = await kieExecutor.createTask({ baseUrl, token, payload });
-    const taskId = createData?.data?.taskId || createData?.taskId;
+    const taskId = getKieTaskId(createData);
     if (!taskId) {
       const errorMessage =
         createData?.msg ||
@@ -754,11 +811,11 @@ async function handleRunwayVideoGeneration({
   );
   const headers = buildRunwayHeaders(token);
 
-  const upstreamBody = {
+  // prettier-ignore
+  const upstreamBody: { model: typeof model; promptText: typeof body.prompt; ratio: typeof ratio; duration: typeof duration; promptImage?: typeof promptImage; seed?: number } = {
     model,
     promptText: body.prompt,
-    ratio,
-    duration,
+    ratio, duration,
   };
 
   if (useImageToVideo) upstreamBody.promptImage = promptImage;
@@ -931,148 +988,6 @@ const RUNWAY_TERMINAL_FAILURE_STATUSES = new Set([
   "DELETED",
 ]);
 
-function resolveRunwayPromptImage(body) {
-  const directCandidates = [
-    body.promptImage,
-    body.prompt_image,
-    body.image,
-    body.image_url,
-    body.imageUrl,
-    body.provider_options?.promptImage,
-    body.provider_options?.prompt_image,
-  ];
-
-  for (const candidate of directCandidates) {
-    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
-    if (candidate && typeof candidate === "object") return candidate;
-    if (Array.isArray(candidate) && candidate.length > 0) return candidate;
-  }
-
-  const arrayCandidates = [
-    body.imageUrls,
-    body.image_urls,
-    body.provider_options?.imageUrls,
-    body.provider_options?.image_urls,
-  ];
-  for (const candidate of arrayCandidates) {
-    if (Array.isArray(candidate) && candidate.length > 0) return candidate;
-  }
-
-  return null;
-}
-
-function resolveRunwayRatio(body) {
-  const aspectRatio = typeof body.aspect_ratio === "string" ? body.aspect_ratio : body.aspectRatio;
-  if (aspectRatio === "1280:720" || aspectRatio === "720:1280") return aspectRatio;
-  if (aspectRatio === "16:9") return "1280:720";
-  if (aspectRatio === "9:16") return "720:1280";
-
-  const size = typeof body.size === "string" ? body.size : "";
-  const [widthRaw, heightRaw] = size.split("x");
-  const width = Number(widthRaw);
-  const height = Number(heightRaw);
-  if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
-    return width >= height ? "1280:720" : "720:1280";
-  }
-
-  return "1280:720";
-}
-
-function resolveRunwayDuration(body) {
-  if (Number.isFinite(body.duration)) {
-    return clampRunwayDuration(body.duration);
-  }
-
-  if (Number.isFinite(body.frames) && Number.isFinite(body.fps) && Number(body.fps) > 0) {
-    return clampRunwayDuration(Number(body.frames) / Number(body.fps));
-  }
-
-  return 5;
-}
-
-function clampRunwayDuration(value) {
-  const duration = Math.round(Number(value));
-  if (!Number.isFinite(duration)) return 5;
-  return Math.min(10, Math.max(2, duration));
-}
-
-function resolvePositiveInteger(value, fallback) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric <= 0) return fallback;
-  return Math.floor(numeric);
-}
-
-function extractRunwayOutputUrls(task) {
-  const rawOutput = Array.isArray(task?.output)
-    ? task.output
-    : Array.isArray(task?.result)
-      ? task.result
-      : [];
-
-  return rawOutput
-    .map((entry) => {
-      if (typeof entry === "string") return entry;
-      if (!entry || typeof entry !== "object") return null;
-      return entry.url || entry.uri || entry.videoUrl || entry.video_url || null;
-    })
-    .filter((value) => typeof value === "string" && value.length > 0);
-}
-
-function extractRunwayFailureMessage(task) {
-  const directCandidates = [
-    task?.failure,
-    task?.failureReason,
-    task?.error,
-    task?.errorMessage,
-    task?.message,
-  ];
-  for (const candidate of directCandidates) {
-    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
-  }
-
-  if (task?.failure && typeof task.failure === "object") {
-    const nestedCandidates = [
-      task.failure.message,
-      task.failure.reason,
-      task.failure.error,
-      task.failure.code,
-    ];
-    for (const candidate of nestedCandidates) {
-      if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
-    }
-  }
-
-  return null;
-}
-
-async function normalizeRunwayVideoResult(task, body) {
-  const urls = extractRunwayOutputUrls(task);
-  if (urls.length === 0) {
-    throw new Error(
-      `Runway task completed without output URLs: ${JSON.stringify(task).slice(0, 400)}`
-    );
-  }
-
-  if (body.response_format === "url") {
-    return urls.map((url) => ({ url, format: "mp4" }));
-  }
-
-  const videos = [];
-  for (const url of urls) {
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(`Runway output fetch failed (${response.status})`);
-    }
-    const arrayBuffer = await response.arrayBuffer();
-    videos.push({
-      b64_json: Buffer.from(arrayBuffer).toString("base64"),
-      format: "mp4",
-    });
-  }
-
-  return videos;
-}
-
 async function handleHaiperVideoGeneration({
   model,
   provider,
@@ -1154,109 +1069,6 @@ async function handleHaiperVideoGeneration({
     error: "Haiper video generation timed out",
   }).catch(() => {});
   return { success: false, status: 504, error: "Haiper video generation timed out" };
-}
-
-async function handleLeonardoVideoGeneration({
-  model,
-  provider,
-  providerConfig,
-  body,
-  credentials,
-  log,
-}) {
-  const startTime = Date.now();
-  const token = credentials?.apiKey || "";
-  const res = await fetch(providerConfig.baseUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify({
-      modelId: "phoenix",
-      prompt: body.prompt,
-      width: 1024,
-      height: 576,
-      num_frames: 24,
-    }),
-  });
-  if (!res.ok) {
-    const errorText = await res.text();
-    saveCallLog({
-      method: "POST",
-      path: "/v1/videos/generations",
-      status: res.status,
-      model: `${provider}/${model}`,
-      provider,
-      duration: Date.now() - startTime,
-      error: errorText.slice(0, 500),
-    }).catch(() => {});
-    return { success: false, status: res.status, error: errorText };
-  }
-  const { sdGenerationJob } = await res.json();
-  const genId = sdGenerationJob?.generationId;
-  if (!genId) {
-    saveCallLog({
-      method: "POST",
-      path: "/v1/videos/generations",
-      status: 502,
-      model: `${provider}/${model}`,
-      provider,
-      duration: Date.now() - startTime,
-      error: "No generation ID returned",
-    }).catch(() => {});
-    return { success: false, status: 502, error: "No generation ID returned" };
-  }
-  const deadline = Date.now() + 300000;
-  while (Date.now() < deadline) {
-    await sleep(5000);
-    const statusRes = await fetch(`${providerConfig.baseUrl}/${genId}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    const status = await statusRes.json();
-    const gen = status.generations_by_pk || status;
-    if (gen.status === "COMPLETE") {
-      const imgUrl = gen.generated_images?.[0]?.url;
-      if (imgUrl) {
-        const videoRes = await fetch(imgUrl);
-        const buf = await videoRes.arrayBuffer();
-        saveCallLog({
-          method: "POST",
-          path: "/v1/videos/generations",
-          status: 200,
-          model: `${provider}/${model}`,
-          provider,
-          duration: Date.now() - startTime,
-        }).catch(() => {});
-        return {
-          success: true,
-          data: {
-            created: Math.floor(Date.now() / 1000),
-            data: [{ b64_json: Buffer.from(buf).toString("base64"), format: "mp4" }],
-          },
-        };
-      }
-    }
-    if (gen.status === "FAILED") {
-      saveCallLog({
-        method: "POST",
-        path: "/v1/videos/generations",
-        status: 502,
-        model: `${provider}/${model}`,
-        provider,
-        duration: Date.now() - startTime,
-        error: "Leonardo video generation failed",
-      }).catch(() => {});
-      return { success: false, status: 502, error: "Leonardo video generation failed" };
-    }
-  }
-  saveCallLog({
-    method: "POST",
-    path: "/v1/videos/generations",
-    status: 504,
-    model: `${provider}/${model}`,
-    provider,
-    duration: Date.now() - startTime,
-    error: "Leonardo video generation timed out",
-  }).catch(() => {});
-  return { success: false, status: 504, error: "Leonardo video generation timed out" };
 }
 
 function sleep(ms) {

@@ -73,8 +73,11 @@ async function main() {
     [
       "./node_modules/vitest/vitest.mjs",
       "run",
-      "--environment",
-      "node",
+      // Without --config, Vitest loads vitest.config.ts, whose exclude list drops
+      // this file — the run then dies with "No test files found". The config also
+      // sets environment: node, so the flag is no longer needed here.
+      "--config",
+      "vitest.e2e-live.config.ts",
       "tests/e2e/protocol-clients.test.ts",
     ],
     {

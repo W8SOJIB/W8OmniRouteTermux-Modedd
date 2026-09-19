@@ -25,7 +25,7 @@ test("getCurrentVersion resolves the real version from a foreign cwd (#3295)", a
     assert.equal(version, REAL_VERSION);
   } finally {
     process.chdir(originalCwd);
-    rmSync(foreignCwd, { recursive: true, force: true });
+    rmSync(foreignCwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -59,7 +59,7 @@ test("createBackup resolves bin/ from a foreign cwd and copies cli/ recursively 
     process.chdir(originalCwd);
     if (originalHome === undefined) delete process.env.HOME;
     else process.env.HOME = originalHome;
-    rmSync(foreignCwd, { recursive: true, force: true });
-    rmSync(fakeHome, { recursive: true, force: true });
+    rmSync(foreignCwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    rmSync(fakeHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });

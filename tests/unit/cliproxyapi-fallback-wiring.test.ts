@@ -53,14 +53,14 @@ before(async () => {
 afterEach(() => {
   // Reset DB singleton so each test starts from a clean schema state.
   coreDb.resetDbInstance();
-  fs.rmSync(testDataDir, { recursive: true, force: true });
+  fs.rmSync(testDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(testDataDir, { recursive: true });
 });
 
 after(() => {
   coreDb.resetDbInstance();
   if (fs.existsSync(testDataDir)) {
-    fs.rmSync(testDataDir, { recursive: true, force: true });
+    fs.rmSync(testDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 

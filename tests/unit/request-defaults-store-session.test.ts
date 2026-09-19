@@ -5,9 +5,30 @@ const {
   buildOpenAIStoreSessionId,
   ensureOpenAIStoreSessionFallback,
   getClaudeCodeCompatibleRequestDefaults,
+  normalizeCodexReasoningEffort,
   normalizeProviderSpecificData,
   sanitizeProviderSpecificDataForResponse,
 } = await import("../../src/lib/providers/requestDefaults.ts");
+
+test("Codex request defaults accept max but leave ultra to the Codex client", () => {
+  assert.equal(normalizeCodexReasoningEffort("max"), "max");
+  assert.equal(normalizeCodexReasoningEffort("ultra"), undefined);
+});
+
+test("normalizeProviderSpecificData keeps only boolean preserveEncryptedReasoning", () => {
+  assert.equal(
+    normalizeProviderSpecificData("codex", { preserveEncryptedReasoning: true })
+      ?.preserveEncryptedReasoning,
+    true
+  );
+  assert.equal(
+    normalizeProviderSpecificData("codex", {
+      preserveEncryptedReasoning: "yes",
+      tag: "primary",
+    })?.preserveEncryptedReasoning,
+    undefined
+  );
+});
 
 test("buildOpenAIStoreSessionId normalizes external and generated session ids", () => {
   assert.equal(
@@ -114,9 +135,13 @@ test("normalizeProviderSpecificData trims OpenRouter preset and clears empty val
   assert.equal(ignored?.tag, "primary");
 });
 
-test("sanitizeProviderSpecificDataForResponse removes quota scraping cookies", () => {
+test("sanitizeProviderSpecificDataForResponse removes credentials and quota scraping cookies", () => {
   const sanitized = sanitizeProviderSpecificDataForResponse({
     opencodeGoWorkspaceId: "workspace-123",
+    accessToken: "access-token",
+    refreshToken: "refresh-token",
+    idToken: "id-token",
+    apiKey: "api-key",
     opencodeGoAuthCookie: "auth-cookie",
     ollamaCloudUsageCookie: "ollama-cookie",
     usageCookie: "fallback-cookie",

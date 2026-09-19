@@ -72,7 +72,7 @@ export function resetRedisClient(): void {
 // Key helpers
 // ---------------------------------------------------------------------------
 
-const KEY_PREFIX = "omniroute:quota";
+const KEY_PREFIX = `${process.env.REDIS_KEY_PREFIX?.trim() || "omniroute:"}quota`;
 
 function bucketKey(apiKeyId: string, dimensionKey: string, bucketIndex: number): string {
   return `${KEY_PREFIX}:${apiKeyId}:${dimensionKey}:${bucketIndex}`;

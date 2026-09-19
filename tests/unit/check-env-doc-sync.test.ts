@@ -179,6 +179,32 @@ test("runEnvDocSync: ignore set skips a code-referenced var", () => {
   assert.equal(result.ok, true);
 });
 
+test("runEnvDocSync: shipped allowlist ignores ad-hoc BOT_TOKEN and BOT_URL", () => {
+  const envExampleText = `JWT_SECRET=secret\n`;
+  const envDocText = "| `JWT_SECRET` | _(none)_ | required |";
+  const codeVars = new Set(["JWT_SECRET", "BOT_TOKEN", "BOT_URL"]);
+
+  const unignored = runEnvDocSync({
+    envExampleText,
+    envDocText,
+    codeVars,
+    ignore: new Set(),
+    docOnlyAllowlist: new Set(),
+    envOnlyAllowlist: new Set(),
+  });
+  assert.equal(unignored.ok, false);
+  assert.deepEqual(unignored.problems.codeMissingEnv, ["BOT_TOKEN", "BOT_URL"]);
+
+  // Omit `ignore` so the checker uses IGNORE_FROM_CODE from check-env-doc-sync.mjs.
+  const shipped = runEnvDocSync({
+    envExampleText,
+    envDocText,
+    codeVars,
+  });
+  assert.equal(shipped.ok, true);
+  assert.deepEqual(shipped.problems.codeMissingEnv, []);
+});
+
 test("repository contract is in sync (live data)", () => {
   // Uses the real .env.example, docs/ENVIRONMENT.md, and the bundled
   // allowlists. This is the same check that runs in pre-commit / CI.

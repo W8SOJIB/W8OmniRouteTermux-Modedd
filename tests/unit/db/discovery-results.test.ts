@@ -21,7 +21,7 @@ before(async () => {
 
 after(() => {
   core.resetDbInstance();
-  if (tmpDataDir) rmSync(tmpDataDir, { recursive: true, force: true });
+  if (tmpDataDir) rmSync(tmpDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 describe("discoveryResults DB module", () => {

@@ -45,6 +45,13 @@ export interface A2ATask {
   createdAt: string;
   updatedAt: string;
   expiresAt: string;
+  /**
+   * GHSA-jcm5-6wpp-wjj8: principal that created the task (hashed API key).
+   * `undefined` = created under the keyless local-first posture — such tasks
+   * stay visible to every caller, matching the pre-owner behavior. Tasks WITH
+   * an owner are only returned/cancelled/listed for the same owner.
+   */
+  owner?: string;
 }
 
 export interface TaskListFilter {
@@ -91,7 +98,7 @@ export class A2ATaskManager {
     }
   }
 
-  createTask(input: TaskInput): A2ATask {
+  createTask(input: TaskInput, owner?: string): A2ATask {
     const now = new Date();
     const task: A2ATask = {
       id: randomUUID(),
@@ -104,19 +111,31 @@ export class A2ATaskManager {
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       expiresAt: new Date(now.getTime() + this.ttlMs).toISOString(),
+      ...(owner !== undefined ? { owner } : {}),
     };
     this.tasks.set(task.id, task);
     return task;
   }
 
-  getTask(taskId: string): A2ATask | undefined {
+  /**
+   * Owner scoping (GHSA-jcm5-6wpp-wjj8): a task carrying an owner is visible
+   * only to that owner. Ownerless tasks (keyless posture, or created before
+   * this field existed) stay visible to everyone — no behavior change there.
+   */
+  private isVisibleTo(task: A2ATask, owner?: string): boolean {
+    return task.owner === undefined || task.owner === owner;
+  }
+
+  getTask(taskId: string, owner?: string): A2ATask | undefined {
     const task = this.tasks.get(taskId);
     if (task && new Date(task.expiresAt) < new Date()) {
       if (task.state === "submitted" || task.state === "working") {
         this.updateTask(taskId, "failed", undefined, "Task expired");
       }
     }
-    return this.tasks.get(taskId);
+    const current = this.tasks.get(taskId);
+    if (!current || !this.isVisibleTo(current, owner)) return undefined;
+    return current;
   }
 
   updateTask(
@@ -142,7 +161,15 @@ export class A2ATaskManager {
     return task;
   }
 
-  cancelTask(taskId: string): A2ATask {
+  cancelTask(taskId: string, owner?: string): A2ATask {
+    // Owner check BEFORE the mutation (GHSA-jcm5-6wpp-wjj8): a caller must not
+    // cancel another principal's task by id. Uses the same not-found error as
+    // a missing task so an IDOR probe cannot distinguish "exists but not
+    // yours" from "does not exist".
+    const task = this.tasks.get(taskId);
+    if (!task || !this.isVisibleTo(task, owner)) {
+      throw new Error(`Task ${taskId} not found`);
+    }
     return this.updateTask(taskId, "cancelled", undefined, "Cancelled by client");
   }
 
@@ -153,8 +180,11 @@ export class A2ATaskManager {
     return tasks.length;
   }
 
-  listTasks(filter?: TaskListFilter): A2ATask[] {
+  listTasks(filter?: TaskListFilter, owner?: string): A2ATask[] {
     let tasks = [...this.tasks.values()];
+    // GHSA-jcm5-6wpp-wjj8: when an owner scope is supplied, owned tasks of
+    // other principals are hidden; ownerless tasks remain visible (posture).
+    if (owner !== undefined) tasks = tasks.filter((t) => this.isVisibleTo(t, owner));
     if (filter?.state) tasks = tasks.filter((t) => t.state === filter.state);
     if (filter?.skill) tasks = tasks.filter((t) => t.skill === filter.skill);
     tasks.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());

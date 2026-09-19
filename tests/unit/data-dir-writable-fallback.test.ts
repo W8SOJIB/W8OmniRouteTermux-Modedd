@@ -44,7 +44,7 @@ async function withTempEnv(
     } catch {
       // ignore
     }
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }
 
@@ -84,6 +84,11 @@ test("resolveWritableDataDir falls back to the default dir when DATA_DIR is not 
 test("resolveWritableDataDir returns the default dir (no probe) when DATA_DIR is unset", async () => {
   await withTempEnv(() => {
     delete process.env.DATA_DIR;
+    // #10428: this asserts the SERVER path. Since the test-context guard now redirects a
+    // DATA_DIR-less test process to a temp dir (so a test can never open the operator's
+    // real DB), opt back in explicitly here — otherwise this test would be asserting the
+    // guard's behavior instead of the server's.
+    process.env.OMNIROUTE_ALLOW_DEFAULT_DATA_DIR = "1";
     const resolved = resolveWritableDataDir();
     assert.equal(resolved, getDefaultDataDir());
     // Matches the pure resolver when no override is present.

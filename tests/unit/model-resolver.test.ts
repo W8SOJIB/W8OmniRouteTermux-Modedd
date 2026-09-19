@@ -38,7 +38,7 @@ test.after(async () => {
   const { invalidateDbCache } = await import("../../src/lib/db/readCache.ts");
   core.resetDbInstance();
   invalidateDbCache();
-  fs.rmSync(modelResolverDataDir, { recursive: true, force: true });
+  fs.rmSync(modelResolverDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   if (previousDataDir === undefined) {
     delete process.env.DATA_DIR;
   } else {

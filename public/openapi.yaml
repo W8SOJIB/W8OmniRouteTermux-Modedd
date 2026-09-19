@@ -5270,12 +5270,18 @@ components:
     BearerAuth:
       type: http
       scheme: bearer
-      description: API key obtained from the OmniRoute dashboard
+      description: >
+        Two bearer families are accepted. Inference API keys (typically `sk-…`)
+        authorize `/v1/*`. Management routes also accept `oma_live_…` Access Tokens
+        (Settings → Access Tokens / `omniroute connect`) and API keys whose metadata
+        includes `manage` or `admin` scope. See docs/guides/MANAGEMENT-AUTH.md.
+        Bearer credentials are accepted on management routes that use this scheme;
+        they are not rejected solely for being Bearer.
     ManagementSessionAuth:
       type: apiKey
       in: cookie
       name: auth_token
-      description: Dashboard management session cookie for protected management routes
+      description: Dashboard management session cookie (auth_token) for protected management routes. Distinct from Bearer Access Tokens and API keys. See docs/guides/MANAGEMENT-AUTH.md.
 
   parameters:
     ResourceId:

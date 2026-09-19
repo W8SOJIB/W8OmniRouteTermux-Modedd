@@ -20,6 +20,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import os from "node:os";
 import { printHeading, printInfo, printSuccess, printError } from "../io.mjs";
+import { guardHostConfigTarget } from "../utils/config-home-guard.mjs";
 import {
   categoriseModel,
   isCodexCompatibleTextModel,
@@ -147,6 +148,14 @@ export async function runSetupClaudeCommand(opts = {}) {
   printHeading("OmniRoute → Claude Code profile generator");
   printInfo(`Connecting to ${baseUrl} …`);
 
+  const guard = await guardHostConfigTarget(profilesRoot, {
+    toolLabel: "Claude Code",
+    hostCommand: "omniroute setup-claude",
+    allowContainerWrite: Boolean(opts.allowContainerWrite ?? opts["allow-container-write"]),
+    dryRun,
+  });
+  if (guard !== 0) return guard;
+
   // ── Fetch model catalog ───────────────────────────────────────────────────
   let models;
   try {
@@ -156,7 +165,16 @@ export async function runSetupClaudeCommand(opts = {}) {
       headers,
       signal: AbortSignal.timeout(10000),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const errorBody = await res.json();
+        const serverMsg =
+          errorBody?.error?.message || errorBody?.error || errorBody?.message || "";
+        if (serverMsg) detail += ` — ${serverMsg}`;
+      } catch {}
+      throw new Error(detail);
+    }
     const body = await res.json();
     models = body.data ?? body.models ?? [];
   } catch (err) {
@@ -212,6 +230,10 @@ export function registerSetupClaude(program) {
       "Comma-separated substrings — only matching model IDs (e.g. glm,kimi)"
     )
     .option("--dry-run", "Print what would be written without touching the filesystem")
+    .option(
+      "--allow-container-write",
+      "Write even when the target is inside a container and not mounted from the host"
+    )
     .action(async (opts) => {
       const exitCode = await runSetupClaudeCommand(opts);
       if (exitCode !== 0) process.exit(exitCode);

@@ -25,7 +25,7 @@ function writeEnvExample(rootDir: string) {
       "MACHINE_ID_SALT=",
       "CLAUDE_OAUTH_CLIENT_ID=claude-default",
       "CODEX_OAUTH_CLIENT_ID=codex-default",
-      'CLAUDE_USER_AGENT="claude-cli/2.1.145 (external, cli)"',
+      'CLAUDE_USER_AGENT="claude-cli/2.1.219 (external, cli)"',
       "# COMMENTED_KEY=skip-me",
       "",
     ].join("\n"),
@@ -72,11 +72,11 @@ test("syncEnv creates .env from .env.example and generates install-time secrets"
     assert.match(envContent, /^MACHINE_ID_SALT=omniroute-/m);
     assert.match(envContent, /^CLAUDE_OAUTH_CLIENT_ID=claude-default$/m);
     assert.match(envContent, /^CODEX_OAUTH_CLIENT_ID=codex-default$/m);
-    assert.match(envContent, /^CLAUDE_USER_AGENT="claude-cli\/2\.1\.145 \(external, cli\)"$/m);
+    assert.match(envContent, /^CLAUDE_USER_AGENT="claude-cli\/2\.1\.219 \(external, cli\)"$/m);
     assert.doesNotMatch(envContent, /^COMMENTED_KEY=/m);
   } finally {
     process.env.DATA_DIR = origDataDir;
-    fs.rmSync(rootDir, { recursive: true, force: true });
+    fs.rmSync(rootDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -107,11 +107,11 @@ test("syncEnv appends only missing keys and preserves existing values", () => {
     assert.match(envContent, /^STORAGE_ENCRYPTION_KEY=$/m);
     assert.match(envContent, /^MACHINE_ID_SALT=omniroute-/m);
     assert.match(envContent, /^CODEX_OAUTH_CLIENT_ID=codex-default$/m);
-    assert.match(envContent, /^CLAUDE_USER_AGENT=claude-cli\/2\.1\.145 \(external, cli\)$/m);
+    assert.match(envContent, /^CLAUDE_USER_AGENT=claude-cli\/2\.1\.219 \(external, cli\)$/m);
     assert.match(envContent, /Auto-added by sync-env/);
   } finally {
     process.env.DATA_DIR = origDataDir;
-    fs.rmSync(rootDir, { recursive: true, force: true });
+    fs.rmSync(rootDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -130,7 +130,7 @@ test("syncEnv treats quoted and unquoted values as equivalent", () => {
         "MACHINE_ID_SALT=machine-salt",
         "CLAUDE_OAUTH_CLIENT_ID=claude-default",
         "CODEX_OAUTH_CLIENT_ID=codex-default",
-        'CLAUDE_USER_AGENT="claude-cli/2.1.145 (external, cli)"',
+        'CLAUDE_USER_AGENT="claude-cli/2.1.219 (external, cli)"',
         "",
       ].join("\n"),
       "utf8"
@@ -142,7 +142,7 @@ test("syncEnv treats quoted and unquoted values as equivalent", () => {
     assert.deepEqual(result, { created: false, added: 0 });
   } finally {
     process.env.DATA_DIR = origDataDir;
-    fs.rmSync(rootDir, { recursive: true, force: true });
+    fs.rmSync(rootDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -163,7 +163,7 @@ test("syncEnv is idempotent when .env is already complete", () => {
     assert.equal(after, before);
   } finally {
     process.env.DATA_DIR = origDataDir;
-    fs.rmSync(rootDir, { recursive: true, force: true });
+    fs.rmSync(rootDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -182,6 +182,6 @@ test("syncEnv oauth scope only copies oauth defaults", () => {
     assert.doesNotMatch(envContent, /^JWT_SECRET=/m);
     assert.doesNotMatch(envContent, /^Provider User-Agent Overrides/m);
   } finally {
-    fs.rmSync(rootDir, { recursive: true, force: true });
+    fs.rmSync(rootDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });

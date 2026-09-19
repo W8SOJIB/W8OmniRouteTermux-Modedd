@@ -10,19 +10,42 @@ import { errorResponse, unavailableResponse } from "@omniroute/open-sse/utils/er
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import * as log from "@/sse/utils/logger";
 import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
-import { getProviderCredentials, clearRecoveredProviderState } from "@/sse/services/auth";
-import { getProviderNodes, getComboByName, getCombos, getDatabaseSettings } from "@/lib/localDb";
+import {
+  getProviderCredentials,
+  clearRecoveredProviderState,
+  markAccountUnavailable,
+} from "@/sse/services/auth";
+import { getCachedProviderNodes } from "@/lib/db/readCache";
+import { getComboByName, getCombos } from "@/lib/db/combos";
+import { getDatabaseSettings } from "@/lib/db/databaseSettings";
 import { resolveProxyForConnection } from "@/lib/db/settings";
 import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
 import { handleComboChat } from "@omniroute/open-sse/services/combo.ts";
 import { resolveBareModelToConnectionDefault } from "@omniroute/open-sse/services/model.ts";
 import { findEmbeddingComboDimensionConflict } from "./familyGuard";
+import {
+  formatMissingEmbeddingCredentialsError,
+  formatUnknownEmbeddingProviderError,
+} from "./errors";
+import { isPrivateHost, isCloudMetadataHost } from "@/shared/network/outboundUrlGuard";
 import { calculateCost } from "@/lib/usage/costCalculator";
 import { attachOmniRouteMetaHeaders } from "@/domain/omnirouteResponseMeta";
 import { generateRequestId } from "@/shared/utils/requestId";
+import { resolveLocalSyncedEndpointRoute } from "@/lib/providerModels/syncedEndpointRouting";
 
 type ValidatedEmbeddingBody = Record<string, unknown> & { model: string };
 type ProviderCredentialsResult = Awaited<ReturnType<typeof getProviderCredentials>>;
+
+// #6925: a private/LAN host (RFC1918 10/8, 192.168/16, 172.16/12, CGNAT 100.64/10,
+// loopback, .local/.internal, ULA/link-local IPv6) is treated as a trusted no-auth
+// local embedding provider — mirrors the outbound-URL guard's private-host
+// classification instead of the old hand-rolled localhost/127.0.0.1/172.16-31-only
+// regex, which excluded common LAN ranges (10.x, 192.168.x) and forced them through
+// the apikey/bearer fallback even when no credentials exist. Cloud-metadata hosts
+// (169.254.169.254 etc.) are never treated as no-auth local providers.
+function isNoAuthLocalEmbeddingHost(hostname: string): boolean {
+  return isPrivateHost(hostname) && !isCloudMetadataHost(hostname);
+}
 
 export interface EmbeddingHandlerOptions {
   clientRawRequest?: {
@@ -33,6 +56,8 @@ export interface EmbeddingHandlerOptions {
   apiKeyId?: string | null;
   apiKeyName?: string | null;
   connectionId?: string | null;
+  resolvedProvider?: EmbeddingProvider | null;
+  resolvedModel?: string | null;
 }
 
 export async function createEmbeddingResponse(
@@ -56,10 +81,7 @@ export async function createEmbeddingResponse(
         // different models are not comparable). The generic combo engine has no
         // notion of embedding families, so reject loudly here before dispatch.
         // See _tasks/features-v3.8.12/01-embeddings-combo-family-guard.plan.md.
-        const dimConflict = findEmbeddingComboDimensionConflict(
-          combo as any,
-          allCombos as any
-        );
+        const dimConflict = findEmbeddingComboDimensionConflict(combo as any, allCombos as any);
         if (dimConflict.conflict) {
           return errorResponse(
             HTTP_STATUS.BAD_REQUEST,
@@ -112,18 +134,14 @@ export async function createEmbeddingResponse(
   }
   let dynamicProviders: ReturnType<typeof buildDynamicEmbeddingProvider>[] = [];
   try {
-    const nodes = (await getProviderNodes()) as unknown as EmbeddingProviderNodeRow[];
+    const nodes = (await getCachedProviderNodes()) as unknown as EmbeddingProviderNodeRow[];
     dynamicProviders = (Array.isArray(nodes) ? nodes : [])
       .filter((n) => {
         const validTypes = ["chat", "responses", "embeddings"];
         if (!validTypes.includes(n.apiType || "")) return false;
         try {
           const hostname = new URL(n.baseUrl).hostname;
-          return (
-            hostname === "localhost" ||
-            hostname === "127.0.0.1" ||
-            /^172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(hostname)
-          );
+          return isNoAuthLocalEmbeddingHost(hostname);
         } catch {
           return false;
         }
@@ -141,7 +159,23 @@ export async function createEmbeddingResponse(
     log.error("EMBED", `Failed to load provider_nodes for embeddings: ${err}`);
   }
 
-  const { provider, model: resolvedModel } = parseEmbeddingModel(body.model, dynamicProviders);
+  const parsedModel = options.resolvedProvider
+    ? {
+        provider: options.resolvedProvider.id,
+        model: options.resolvedModel ?? body.model,
+      }
+    : parseEmbeddingModel(body.model, dynamicProviders);
+  let { provider, model: resolvedModel } = parsedModel;
+  // #11088: a bare local-model request routes through the connection that
+  // advertises the requested endpoint — only when no explicit resolvedProvider
+  // already won above (explicit resolution takes precedence).
+  const syncedEndpointRoute = options.resolvedProvider
+    ? null
+    : await resolveLocalSyncedEndpointRoute(body.model, "embeddings");
+  if (syncedEndpointRoute) {
+    provider = syncedEndpointRoute.provider;
+    resolvedModel = syncedEndpointRoute.model;
+  }
   if (!provider) {
     return errorResponse(
       HTTP_STATUS.BAD_REQUEST,
@@ -149,13 +183,59 @@ export async function createEmbeddingResponse(
     );
   }
 
+  let credentials: ProviderCredentialsResult | null = null;
   let providerConfig: EmbeddingProvider | null =
-    dynamicProviders.find((dp) => dp.id === provider) || getEmbeddingProvider(provider) || null;
+    options.resolvedProvider ||
+    dynamicProviders.find((dp) => dp.id === provider) ||
+    getEmbeddingProvider(provider) ||
+    null;
   let credentialsProviderId = provider;
+
+  if (syncedEndpointRoute) {
+    credentials = await getProviderCredentials(
+      provider,
+      null,
+      syncedEndpointRoute.connectionIds,
+      syncedEndpointRoute.model
+    );
+    if (!credentials) {
+      return errorResponse(
+        HTTP_STATUS.BAD_REQUEST,
+        `No credentials for embedding provider: ${provider}`
+      );
+    }
+    if ("allRateLimited" in credentials && credentials.allRateLimited) {
+      return unavailableResponse(
+        HTTP_STATUS.RATE_LIMITED,
+        `[${provider}] All accounts rate limited`,
+        credentials.retryAfter,
+        credentials.retryAfterHuman
+      );
+    }
+
+    const providerSpecificData = (credentials as { providerSpecificData?: Record<string, unknown> })
+      .providerSpecificData;
+    const configuredBaseUrl = providerSpecificData?.baseUrl;
+    if (typeof configuredBaseUrl !== "string" || configuredBaseUrl.trim().length === 0) {
+      return errorResponse(
+        HTTP_STATUS.BAD_REQUEST,
+        `No base URL configured for embedding provider: ${provider}`
+      );
+    }
+    let baseUrl = configuredBaseUrl.trim();
+    while (baseUrl.endsWith("/")) baseUrl = baseUrl.slice(0, -1);
+    providerConfig = {
+      id: provider,
+      baseUrl: baseUrl.endsWith("/embeddings") ? baseUrl : `${baseUrl}/embeddings`,
+      authType: "apikey",
+      authHeader: "bearer",
+      models: [],
+    };
+  }
 
   if (!providerConfig) {
     try {
-      const allNodes = (await getProviderNodes()) as unknown as EmbeddingProviderNodeRow[];
+      const allNodes = (await getCachedProviderNodes()) as unknown as EmbeddingProviderNodeRow[];
       const matchingNode = (Array.isArray(allNodes) ? allNodes : []).find(
         (n) =>
           n.prefix === provider &&
@@ -164,11 +244,22 @@ export async function createEmbeddingResponse(
       );
       if (matchingNode) {
         const baseUrl = String(matchingNode.baseUrl).replace(/\/+$/, "");
+        // #6925: a private/LAN node reaching this fallback (e.g. a matching
+        // prefix that skipped the dynamicProviders pass above) must never be
+        // forced through bearer-auth — only a non-private host falls back to
+        // apikey/bearer credential resolution.
+        let nodeHostname = "";
+        try {
+          nodeHostname = new URL(matchingNode.baseUrl).hostname;
+        } catch {
+          nodeHostname = "";
+        }
+        const isNoAuthLocal = nodeHostname !== "" && isNoAuthLocalEmbeddingHost(nodeHostname);
         providerConfig = {
           id: matchingNode.prefix,
           baseUrl: `${baseUrl}/embeddings`,
-          authType: "apikey",
-          authHeader: "bearer",
+          authType: isNoAuthLocal ? "none" : "apikey",
+          authHeader: isNoAuthLocal ? "none" : "bearer",
           models: [],
         };
         credentialsProviderId = matchingNode.id || provider;
@@ -185,17 +276,16 @@ export async function createEmbeddingResponse(
   if (!providerConfig) {
     return errorResponse(
       HTTP_STATUS.BAD_REQUEST,
-      `Unknown embedding provider: ${provider}. No matching hardcoded or local provider found.`
+      formatUnknownEmbeddingProviderError(provider, resolvedModel)
     );
   }
 
-  let credentials: ProviderCredentialsResult | null = null;
-  if (providerConfig.authType !== "none") {
+  if (!credentials && providerConfig.authType !== "none") {
     credentials = await getProviderCredentials(credentialsProviderId);
     if (!credentials) {
       return errorResponse(
         HTTP_STATUS.BAD_REQUEST,
-        `No credentials for embedding provider: ${provider}`
+        formatMissingEmbeddingCredentialsError(provider)
       );
     }
     if ("allRateLimited" in credentials && credentials.allRateLimited) {
@@ -205,6 +295,28 @@ export async function createEmbeddingResponse(
         credentials.retryAfter,
         credentials.retryAfterHuman
       );
+    }
+    if ("allExpired" in credentials && credentials.allExpired) {
+      return errorResponse(
+        HTTP_STATUS.UNAUTHORIZED,
+        `[${provider}] All ${credentials.expiredCount || 1} connection(s) authentication expired — please reconnect in the dashboard`
+      );
+    }
+  } else if (provider === "ollama-local" || provider === "lmstudio") {
+    // Ollama and LM Studio are keyless, but a configured connection can still
+    // provide a custom local host. Hydrate that optional connection without
+    // imposing an authentication requirement, then keep the static localhost
+    // default when no connection exists. getProviderCredentials("lmstudio")
+    // resolves the dashboard's hyphenated "lm-studio" connection via the
+    // provider search pool/alias (#11233); a selection or rate-limit failure
+    // must not break the flow — proceed without credentials.
+    const localCredentials = await getProviderCredentials(credentialsProviderId);
+    if (
+      localCredentials &&
+      !("allRateLimited" in localCredentials) &&
+      !("allExpired" in localCredentials)
+    ) {
+      credentials = localCredentials;
     }
   }
 
@@ -240,18 +352,30 @@ export async function createEmbeddingResponse(
   const runEmbedding = () =>
     handleEmbedding({
       body:
-        effectiveModel !== resolvedModel ? { ...body, model: `${provider}/${effectiveModel}` } : body,
+        effectiveModel !== resolvedModel
+          ? { ...body, model: `${provider}/${effectiveModel}` }
+          : body,
       // getProviderCredentials returns a richer connection object; handleEmbedding
-      // only reads apiKey/accessToken, both present at runtime. Bridge the wider
+      // reads auth plus the optional local baseUrl override. Bridge the wider
       // selection type to the handler's narrow credential shape.
-      credentials: credentials as { apiKey?: string; accessToken?: string } | null,
+      credentials: credentials as {
+        apiKey?: string;
+        accessToken?: string;
+        providerSpecificData?: Record<string, unknown> | null;
+      } | null,
       log,
       resolvedProvider: providerConfig,
       resolvedModel: effectiveModel,
       clientRawRequest: options.clientRawRequest || null,
       apiKeyId: options.apiKeyId || null,
       apiKeyName: options.apiKeyName || null,
-      connectionId: options.connectionId || null,
+      // #10347 — thread the selected connection id so handleEmbedding can cool the
+      // account on a hard upstream failure (previously always null on /v1/embeddings).
+      connectionId:
+        (credentials as { connectionId?: string } | null)?.connectionId ||
+        options.connectionId ||
+        connectionIdForProxy ||
+        null,
     });
 
   const result = connectionIdForProxy
@@ -261,7 +385,7 @@ export async function createEmbeddingResponse(
   const responseHeaders = new Headers(result.headers);
 
   if (result.success) {
-    if (credentials) await clearRecoveredProviderState(credentials);
+    if (credentials) await clearRecoveredProviderState(credentials as Record<string, unknown>);
     responseHeaders.set("Content-Type", "application/json");
     const usage = (result.data as { usage?: Record<string, number> })?.usage ?? null;
     const costUsd = usage ? await calculateCost(provider, effectiveModel ?? "", usage) : 0;
@@ -276,6 +400,33 @@ export async function createEmbeddingResponse(
     return new Response(JSON.stringify(result.data), {
       status: result.status,
       headers: responseHeaders,
+    });
+  }
+
+  // #10347: cool down the account on hard errors (402 subscription expired,
+  // 401 revoked, 403 forbidden, 404 model gone, 429 rate limit, 5xx server
+  // errors) so the next embedding request skips this account. Mirrors chat.ts
+  // behavior.
+  // Skip for 400 (bad request) — the account is fine, the request was wrong.
+  // Best-effort: don't block the error response on the DB write.
+  const HARD_ERROR_STATUSES = new Set([401, 402, 403, 404, 429, 500, 502, 503, 504]);
+  if (
+    credentials &&
+    "connectionId" in credentials &&
+    typeof credentials.connectionId === "string" &&
+    HARD_ERROR_STATUSES.has(result.status)
+  ) {
+    markAccountUnavailable(
+      credentials.connectionId,
+      result.status,
+      result.error || "Embedding provider error",
+      provider,
+      resolvedModel || null
+    ).catch((err) => {
+      log.debug(
+        "EMBED",
+        `Cooldown write failed for ${provider}/${credentials.connectionId?.slice(0, 8)}: ${err}`
+      );
     });
   }
 

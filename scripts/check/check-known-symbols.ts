@@ -9,13 +9,17 @@
 //       não resolve para um executor válido é um símbolo morto (roteia para fallback
 //       silencioso em vez de falhar).
 //
-//   (2) COMBO STRATEGIES — a cadeia de despacho `strategy === "..."` em
-//       open-sse/services/combo.ts DEVE tratar exatamente o conjunto canônico de
-//       ROUTING_STRATEGY_VALUES (src/shared/constants/routingStrategies.ts), exceto
-//       as estratégias-default implícitas documentadas em IMPLICIT_DEFAULT_STRATEGIES
-//       (estratégias canônicas sem NENHUMA referência `strategy === "..."`; caem no
-//       ordenamento padrão). Adicionar um valor canônico sem fiá-lo no despacho, ou
-//       fiar uma string de estratégia que não é canônica (inventada), falha aqui.
+//   (2) COMBO STRATEGIES — o despacho DEVE tratar exatamente o conjunto canônico de
+//       ROUTING_STRATEGY_VALUES ∪ INTERNAL_ROUTING_STRATEGY_VALUES
+//       (src/shared/constants/routingStrategies.ts), exceto as estratégias-default
+//       implícitas documentadas em IMPLICIT_DEFAULT_STRATEGIES (estratégias canônicas
+//       sem ramo de despacho próprio; caem no ordenamento padrão). Em vez de casar
+//       literais `strategy === "..."` por regex sobre a fonte, o conjunto tratado
+//       (handled) vem de uma enumeração em runtime importada de
+//       open-sse/services/combo/strategyDispatch.ts — o módulo que importa as funções
+//       reais de ordenação/despacho e lista quais estratégias elas implementam. Adicionar
+//       um valor canônico sem fiá-lo no despacho/e na enumeração, ou fiar uma string de
+//       estratégia que não é canônica (inventada), falha aqui.
 //
 //   (3) TRANSLATOR PAIRS — os pares from:to registrados em runtime no registry de
 //       tradutores (após bootstrap) são congelados em KNOWN_TRANSLATOR_PAIRS. Catraca:
@@ -78,10 +82,20 @@ const REPO_ROOT = resolvePath(HERE, "..", "..");
  */
 export const IMPLICIT_DEFAULT_STRATEGIES: Record<string, string> = {};
 
-/** Extrai todas as strings literais de `strategy === "..."` da fonte do combo. */
+/**
+ * Extrai todas as strings literais de `strategy === "..."` / `strategy !== "..."`
+ * da fonte do combo.
+ *
+ * Ambas as formas contam como despacho fiado. A decomposição do god-file (#3501)
+ * troca `if (strategy === "X") { ...corpo... }` por uma leaf `tryXDispatch()` cujo
+ * guard de saída antecipada é `if (strategy !== "X") return null;` — mesma branch,
+ * forma invertida. Reconhecer só `===` faria o gate acusar `canonicalNotHandled`
+ * para uma estratégia que continua perfeitamente fiada, e pressionaria o código a
+ * se contorcer para agradar a regex.
+ */
 export function extractHandledStrategies(comboSource: string): Set<string> {
   const handled = new Set<string>();
-  const re = /strategy\s*===\s*"([a-z0-9-]+)"/g;
+  const re = /strategy\s*[!=]==\s*"([a-z0-9-]+)"/g;
   let match: RegExpExecArray | null;
   while ((match = re.exec(comboSource)) !== null) {
     handled.add(match[1]);
@@ -249,7 +263,7 @@ export function findNewMcpTools(frozen: readonly string[], live: Set<string>): s
  * the reason in the commit message.
  *
  * Sources:
- *   - MCP_TOOLS (33 base tools: omniroute_* + compression + agent_skills)
+ *   - MCP_TOOLS (34 base tools: omniroute_* + compression + agent_skills)
  *   - memoryTools (3): omniroute_memory_*
  *   - skillTools (4): omniroute_skills_*
  *   - gamificationTools (8): gamification_*
@@ -259,7 +273,7 @@ export function findNewMcpTools(frozen: readonly string[], live: Set<string>): s
  * agentSkillTools and compressionTools are included in MCP_TOOLS (deduped by RESERVED_MCP_NAMES).
  */
 export const KNOWN_MCP_TOOL_NAMES: readonly string[] = [
-  // MCP_TOOLS base (33)
+  // MCP_TOOLS base (34)
   "omniroute_get_health",
   "omniroute_list_combos",
   "omniroute_get_combo_metrics",
@@ -269,6 +283,7 @@ export const KNOWN_MCP_TOOL_NAMES: readonly string[] = [
   "omniroute_cost_report",
   "omniroute_list_models_catalog",
   "omniroute_web_search",
+  "omniroute_x_search",
   "omniroute_simulate_route",
   "omniroute_set_budget_guard",
   "omniroute_set_routing_strategy",
@@ -473,17 +488,15 @@ async function main(): Promise<void> {
     ...(strategiesMod.ROUTING_STRATEGY_VALUES as readonly string[]),
     ...(strategiesMod.INTERNAL_ROUTING_STRATEGY_VALUES as readonly string[]),
   ];
-  // The combo dispatch was decomposed (Block J): the `strategy === "..."` branches
-  // now live across combo.ts + its strategy-ordering leaves, so scan all of them.
-  const comboDispatchFiles = [
-    "open-sse/services/combo.ts",
-    "open-sse/services/combo/applyStrategyOrdering.ts",
-    "open-sse/services/combo/resolveAutoStrategy.ts",
-  ];
-  const comboSource = comboDispatchFiles
-    .map((rel) => readFileSync(resolvePath(REPO_ROOT, rel), "utf8"))
-    .join("\n");
-  const handled = extractHandledStrategies(comboSource);
+  // G1: the handled set comes from a runtime-imported dispatch registry that imports the
+  // actual strategy-ordering functions and enumerates which strategies they implement —
+  // NOT from regex-scanning `strategy === "..."` literals in source. The old regex broke
+  // when the dispatch was decomposed (Block J / #3501) and will break again when R0.3
+  // converts it to a registry; enumerating at runtime keeps the gate correct either way.
+  // Each entry in HANDLED_COMBO_STRATEGIES must stay in sync with a real dispatch branch.
+  const strategyDispatchMod =
+    await import("@omniroute/open-sse/services/combo/strategyDispatch.ts");
+  const handled = new Set(strategyDispatchMod.HANDLED_COMBO_STRATEGIES as readonly string[]);
 
   // Stale-enforcement (6A.3): IMPLICIT_DEFAULT_STRATEGIES is a suppression allowlist —
   // each entry exists ONLY to suppress a `canonicalNotHandled` violation (a canonical

@@ -3,6 +3,32 @@
  * Pure data literal; re-exported by the providers.ts barrel. No behavior change.
  */
 export const LOCAL_PROVIDERS = {
+  "mlx-gemma": {
+    id: "mlx-gemma",
+    alias: "mlx-gemma",
+    name: "MLX Gemma 26B",
+    icon: "memory",
+    color: "#8B5CF6",
+    textIcon: "MG",
+    website: "https://github.com/ml-explore/mlx",
+    authHint:
+      "No API key required. Runs mlx-lm server locally on port 11435. Requires uv and mlx-lm installed. Model: mlx-community/gemma-4-26B-A4B-it-qat-q4_0-mlx-aligned (~15.9GB peak memory).",
+    localDefault: "http://localhost:11435/v1",
+    passthroughModels: false,
+  },
+  "mlx-qwen": {
+    id: "mlx-qwen",
+    alias: "mlx-qwen",
+    name: "MLX Qwen 3.8 27B",
+    icon: "memory",
+    color: "#EC4899",
+    textIcon: "MQ",
+    website: "https://github.com/ml-explore/mlx",
+    authHint:
+      "No API key required. Runs mlx-lm server locally on port 11436. Requires uv and mlx-lm installed. Model: maglun/Qwen3.8-27B-MLX-Mixed-3.80bpw (~13.1GB peak memory).",
+    localDefault: "http://localhost:11436/v1",
+    passthroughModels: false,
+  },
   "ollama-local": {
     id: "ollama-local",
     alias: "ollama",

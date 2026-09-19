@@ -72,7 +72,7 @@ before(async () => {
 
 after(() => {
   coreDb.resetDbInstance();
-  fs.rmSync(testDataDir, { recursive: true, force: true });
+  fs.rmSync(testDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("persists a call log row with the mapped fields (default cacheSource=upstream)", async () => {

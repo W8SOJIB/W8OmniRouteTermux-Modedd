@@ -21,16 +21,47 @@ const TOOL_RENAME_MAP: Record<string, string> = {
   glob: "Glob",
   grep: "Grep",
   task: "Task",
+  agent: "Agent",
   webfetch: "WebFetch",
   websearch: "WebSearch",
   todowrite: "TodoWrite",
   todoread: "TodoRead",
   question: "Question",
+  askuserquestion: "AskUserQuestion",
   skill: "Skill",
+  slashcommand: "SlashCommand",
   multiedit: "MultiEdit",
   notebook: "Notebook",
+  notebookedit: "NotebookEdit",
+  notebookread: "NotebookRead",
   lsp: "Lsp",
   apply_patch: "ApplyPatch",
+  applypatch: "ApplyPatch",
+  bashoutput: "BashOutput",
+  killshell: "KillShell",
+  killbash: "KillBash",
+  enterplanmode: "EnterPlanMode",
+  exitplanmode: "ExitPlanMode",
+  enterworktree: "EnterWorktree",
+  exitworktree: "ExitWorktree",
+  artifact: "Artifact",
+  designsync: "DesignSync",
+  monitor: "Monitor",
+  sendmessage: "SendMessage",
+  listagents: "ListAgents",
+  pushnotification: "PushNotification",
+  reportfindings: "ReportFindings",
+  schedulewakeup: "ScheduleWakeup",
+  croncreate: "CronCreate",
+  crondelete: "CronDelete",
+  cronlist: "CronList",
+  taskoutput: "TaskOutput",
+  taskstop: "TaskStop",
+  taskcreate: "TaskCreate",
+  taskupdate: "TaskUpdate",
+  tasklist: "TaskList",
+  taskget: "TaskGet",
+  workflow: "Workflow",
 };
 
 const REVERSE_MAP: Record<string, string> = {};
@@ -57,14 +88,41 @@ function trackToolName(
   getRequestToolNameMap(body).set(titleCaseName, originalName);
 }
 
+/**
+ * Names of Anthropic server-side tools declared in this request's tools[].
+ * A server tool's `name` is a reserved literal validated against its `type`
+ * (web_search_20250305 ⇒ "web_search", bash_20250124 ⇒ "bash", …), so every
+ * rewrite below must leave both the declaration AND any history/tool_choice
+ * reference to it untouched — renaming only one side produces
+ * `Tool 'WebSearch' not found in provided tools` (history renamed, tools[]
+ * preserved) or `tools.N.<type>.name: Input should be '<literal>'` (tools[]
+ * renamed).
+ */
+function collectServerToolNames(tools: unknown): Set<string> {
+  const names = new Set<string>();
+  if (!Array.isArray(tools)) return names;
+  for (const tool of tools) {
+    const t = tool as Record<string, unknown> | null;
+    if (t && isAnthropicServerToolType(t.type) && typeof t.name === "string") {
+      names.add(t.name);
+    }
+  }
+  return names;
+}
+
 export function remapToolNamesInRequest(body: Record<string, unknown>): boolean {
   let hasLowercase = false;
   let hasTitleCase = false;
+  const serverToolNames = collectServerToolNames(body.tools);
 
   // Remap tool definitions
   const tools = body.tools as Array<Record<string, unknown>> | undefined;
   if (Array.isArray(tools)) {
     for (const tool of tools) {
+      if (!tool) continue;
+      // Server tools (bash_20250124 / web_search_20250305 / …) keep their
+      // type-bound literal name.
+      if (isAnthropicServerToolType(tool.type)) continue;
       const name = String(tool.name || "");
       if (TOOL_RENAME_MAP[name]) {
         const mapped = TOOL_RENAME_MAP[name];
@@ -85,6 +143,7 @@ export function remapToolNamesInRequest(body: Record<string, unknown>): boolean 
       if (!Array.isArray(content)) continue;
       for (const block of content) {
         if (block.type === "tool_use" && typeof block.name === "string") {
+          if (serverToolNames.has(block.name)) continue;
           const mapped = TOOL_RENAME_MAP[block.name];
           if (mapped) {
             const originalName = block.name;
@@ -101,7 +160,11 @@ export function remapToolNamesInRequest(body: Record<string, unknown>): boolean 
 
   // Remap tool_choice
   const toolChoice = body.tool_choice as Record<string, unknown> | undefined;
-  if (toolChoice?.type === "tool" && typeof toolChoice.name === "string") {
+  if (
+    toolChoice?.type === "tool" &&
+    typeof toolChoice.name === "string" &&
+    !serverToolNames.has(toolChoice.name)
+  ) {
     const mapped = TOOL_RENAME_MAP[toolChoice.name];
     if (mapped) {
       const originalName = toolChoice.name;
@@ -128,7 +191,6 @@ export function remapToolNamesInResponse(
 ): string {
   if (!forceLowercase) return text;
 
-  // Replace TitleCase tool names back to lowercase in SSE chunks
   if (toolNameMap?.size) {
     for (const [mapped, original] of toolNameMap.entries()) {
       text = text.replaceAll(`"name":"${mapped}"`, `"name":"${original}"`);
@@ -141,6 +203,79 @@ export function remapToolNamesInResponse(
     text = text.replaceAll(`"name": "${titleCase}"`, `"name": "${lower}"`);
   }
   return text;
+}
+
+/**
+ * Restore a tool name for Claude-format clients (#9008).
+ *
+ * Preference order:
+ * 1. Exact `_toolNameMap` hit where the value differs from the key
+ *    (sanitized → original request-side alias)
+ * 2. Canonical casing upgrade for known Claude Code tools
+ *    (`croncreate` → `CronCreate`, `bash` → `Bash`, …)
+ * 3. Case-insensitive non-identity match against map keys/values
+ *    (Gemini/Antigravity may echo a lowercased name for a PascalCase
+ *    Claude Code tool)
+ * 4. Identity echo kept ONLY when no canonical upgrade exists
+ * 5. No-map fallbacks: REVERSE_MAP TitleCase → lowercase (#7926 XML /
+ *    OpenCode-style lowercase tools), then the static table
+ *
+ * Identity entries (key === value) never pin a known tool below its
+ * canonical casing. Some upstream gateways echo the very lowercase name
+ * they emitted into the alias channel; honouring that echo is what let a
+ * literal `croncreate` reach Claude Code as an unknown tool even though
+ * the request declared `CronCreate`.
+ */
+export function restoreClaudeToolName(
+  rawName: string,
+  toolNameMap?: Map<string, string> | null
+): string {
+  if (!rawName) return rawName;
+
+  // Undefined when rawName already IS the canonical form — an input that
+  // maps to itself must keep flowing to the #7926 legacy paths below.
+  const lower = rawName.toLowerCase();
+  const canonicalRaw = TOOL_RENAME_MAP[lower];
+  const canonical = canonicalRaw && canonicalRaw !== rawName ? canonicalRaw : undefined;
+
+  if (toolNameMap?.size) {
+    const exact = toolNameMap.get(rawName);
+    if (typeof exact === "string" && (exact !== rawName || !canonical)) {
+      return exact;
+    }
+
+    let identityMatch: string | undefined;
+    for (const [sanitized, original] of toolNameMap.entries()) {
+      if (sanitized.toLowerCase() !== lower && original.toLowerCase() !== lower) {
+        continue;
+      }
+      if (original !== rawName) {
+        return original;
+      }
+      identityMatch = original;
+    }
+    if (identityMatch !== undefined && !canonical) {
+      return identityMatch;
+    }
+  }
+
+  // Canonical echo is terminal: when the upstream echoes back the exact
+  // canonical form the request declared, keep it verbatim. The #7926
+  // REVERSE_MAP fallbacks below would otherwise downcase it for routes that
+  // carry no _toolNameMap (Claude Code → OpenAI-style upstreams), which is
+  // what let a literal `croncreate` reach Claude Code even though the client
+  // declared `CronCreate` (live repro, PR #11085).
+  if (canonicalRaw === rawName) return rawName;
+
+  if (canonical) return canonical;
+
+  // When no request toolNameMap is provided (e.g. non-Claude client):
+  // If rawName is already TitleCase, apply REVERSE_MAP for #7926 backward compatibility (Bash → bash).
+  if (!toolNameMap && REVERSE_MAP[rawName]) {
+    return REVERSE_MAP[rawName];
+  }
+
+  return REVERSE_MAP[rawName] ?? rawName;
 }
 
 export { TOOL_RENAME_MAP, REVERSE_MAP };
@@ -248,6 +383,11 @@ export function cloakThirdPartyToolNames(
   const shouldCloak = (name: string): boolean =>
     needsThirdPartyCloak(name) && !(options?.skip ? options.skip(name) : false);
   const tools = body.tools as Array<Record<string, unknown>> | undefined;
+  // Reserved literal names of declared server tools — never cloaked, neither
+  // in tools[] (guarded below) nor in message-history / tool_choice references
+  // (renaming only the reference yields "Tool 'WebSearch' not found in
+  // provided tools").
+  const serverToolNames = collectServerToolNames(tools);
 
   const used = new Set<string>();
   if (Array.isArray(tools)) {
@@ -274,7 +414,9 @@ export function cloakThirdPartyToolNames(
     // subagents->SubDispatch, session_status->CheckStatus, webfetch->WebFetch, …
     // Then harness-canonical (read_file->Read), then a generic PascalCase.
     const base =
-      TOOL_RENAME_MAP[original] ?? HARNESS_CANONICAL_MAP[original] ?? toPascalCaseToolName(original);
+      TOOL_RENAME_MAP[original] ??
+      HARNESS_CANONICAL_MAP[original] ??
+      toPascalCaseToolName(original);
     let alias = base;
     let suffix = 2;
     while (alias !== original && used.has(alias)) {
@@ -315,6 +457,7 @@ export function cloakThirdPartyToolNames(
         if (
           block?.type === "tool_use" &&
           typeof block.name === "string" &&
+          !serverToolNames.has(block.name) &&
           shouldCloak(block.name)
         ) {
           changed = true;
@@ -330,6 +473,7 @@ export function cloakThirdPartyToolNames(
   if (
     toolChoice?.type === "tool" &&
     typeof toolChoice.name === "string" &&
+    !serverToolNames.has(toolChoice.name) &&
     shouldCloak(toolChoice.name)
   ) {
     body.tool_choice = { ...toolChoice, name: aliasFor(toolChoice.name) };

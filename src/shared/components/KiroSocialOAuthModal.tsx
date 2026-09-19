@@ -1,9 +1,11 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
+import { useTranslations } from "next-intl";
 import Modal from "./Modal";
 import Button from "./Button";
 import { copyToClipboard } from "@/shared/utils/clipboard";
+import { getNextKiroSocialPollInterval } from "@/lib/oauth/kiroSocialPoll";
 
 type KiroSocialOAuthModalProps = {
   isOpen: boolean;
@@ -22,14 +24,33 @@ export default function KiroSocialOAuthModal({
   onSuccess,
   onClose,
 }: KiroSocialOAuthModalProps) {
+  const t = useTranslations("kiroSocialOAuthModal");
   const [step, setStep] = useState<"loading" | "polling" | "success" | "error">("loading");
   const [error, setError] = useState<string | null>(null);
   const [userCode, setUserCode] = useState("");
   const [authUrl, setAuthUrl] = useState("");
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onSuccessRef = useRef(onSuccess);
+
+  useEffect(() => {
+    onSuccessRef.current = onSuccess;
+  }, [onSuccess]);
 
   useEffect(() => {
     if (!isOpen || !provider) return;
+    let cancelled = false;
+
+    const stopPolling = () => {
+      if (pollRef.current) clearTimeout(pollRef.current);
+      pollRef.current = null;
+    };
+
+    const fail = (message: string) => {
+      stopPolling();
+      if (cancelled) return;
+      setError(message);
+      setStep("error");
+    };
 
     const initAuth = async () => {
       try {
@@ -38,17 +59,33 @@ export default function KiroSocialOAuthModal({
 
         const res = await fetch(`/api/oauth/kiro/social-authorize?provider=${provider}`);
         const data = await res.json();
+        if (cancelled) return;
 
         if (!res.ok) {
-          throw new Error(data.error || "Failed to start authorization");
+          throw new Error(data.error || t("errorStartAuthorization"));
         }
 
         setUserCode(data.userCode || "");
         setAuthUrl(data.authUrl || "");
         setStep("polling");
 
-        const interval = (data.interval || 5) * 1000;
-        pollRef.current = setInterval(async () => {
+        const baseIntervalMs = Math.max(1, Number(data.interval) || 5) * 1000;
+        let currentIntervalMs = baseIntervalMs;
+        const expiresAt = Date.now() + Math.max(1, Number(data.expiresIn) || 300) * 1000;
+
+        const schedule = (delayMs: number) => {
+          if (cancelled) return;
+          pollRef.current = setTimeout(poll, delayMs);
+        };
+
+        const poll = async () => {
+          pollRef.current = null;
+          if (cancelled) return;
+          if (Date.now() >= expiresAt) {
+            fail(t("errorAuthorizationExpired"));
+            return;
+          }
+
           try {
             const pollRes = await fetch("/api/oauth/kiro/social-exchange", {
               method: "POST",
@@ -56,36 +93,44 @@ export default function KiroSocialOAuthModal({
               body: JSON.stringify({ deviceCode: data.deviceCode, provider, targetProvider }),
             });
             const pollData = await pollRes.json();
+            if (cancelled) return;
 
             if (pollData.success) {
-              if (pollRef.current) clearInterval(pollRef.current);
-              pollRef.current = null;
+              stopPolling();
               setStep("success");
-              onSuccess?.();
+              onSuccessRef.current?.();
+              return;
             }
+
+            if (!pollData.pending) {
+              fail(pollData.error || t("errorAuthorizationFailed"));
+              return;
+            }
+
+            currentIntervalMs = getNextKiroSocialPollInterval(currentIntervalMs, pollData.error);
+            schedule(currentIntervalMs);
           } catch {
-            // Network error, keep polling
+            schedule(currentIntervalMs);
           }
-        }, interval);
+        };
+
+        schedule(baseIntervalMs);
       } catch (err: any) {
-        setError(err.message);
-        setStep("error");
+        fail(err.message);
       }
     };
 
     initAuth();
 
     return () => {
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
+      cancelled = true;
+      stopPolling();
     };
-  }, [isOpen, provider]);
+  }, [isOpen, provider, targetProvider, t]);
 
   const handleClose = () => {
     if (pollRef.current) {
-      clearInterval(pollRef.current);
+      clearTimeout(pollRef.current);
       pollRef.current = null;
     }
     onClose();
@@ -96,7 +141,7 @@ export default function KiroSocialOAuthModal({
   return (
     <Modal
       isOpen={isOpen}
-      title={`Connect ${providerLabel} via ${providerName}`}
+      title={t("title", { providerLabel, providerName })}
       onClose={handleClose}
       size="lg"
     >
@@ -108,8 +153,8 @@ export default function KiroSocialOAuthModal({
                 progress_activity
               </span>
             </div>
-            <h3 className="text-lg font-semibold mb-2">Initializing...</h3>
-            <p className="text-sm text-text-muted">Setting up {providerName} authentication</p>
+            <h3 className="text-lg font-semibold mb-2">{t("initializing")}</h3>
+            <p className="text-sm text-text-muted">{t("settingUp", { providerName })}</p>
           </div>
         )}
 
@@ -120,10 +165,8 @@ export default function KiroSocialOAuthModal({
                 open_in_browser
               </span>
             </div>
-            <h3 className="text-lg font-semibold mb-2">Open this link in an Incognito window</h3>
-            <p className="text-sm text-text-muted mb-3">
-              Use an Incognito/Private window to avoid session conflicts with existing accounts.
-            </p>
+            <h3 className="text-lg font-semibold mb-2">{t("openIncognito")}</h3>
+            <p className="text-sm text-text-muted mb-3">{t("incognitoDescription")}</p>
             {authUrl && (
               <div className="mb-4">
                 <div className="flex items-center gap-2 justify-center">
@@ -138,7 +181,7 @@ export default function KiroSocialOAuthModal({
                   <button
                     onClick={() => copyToClipboard(authUrl)}
                     className="shrink-0 p-1 rounded hover:bg-sidebar"
-                    title="Copy link"
+                    title={t("copyLink")}
                   >
                     <span className="material-symbols-outlined text-base">content_copy</span>
                   </button>
@@ -147,7 +190,7 @@ export default function KiroSocialOAuthModal({
             )}
             {userCode && (
               <div className="mb-4">
-                <p className="text-xs text-text-muted mb-1">Verification code</p>
+                <p className="text-xs text-text-muted mb-1">{t("verificationCode")}</p>
                 <p className="font-mono text-2xl font-bold tracking-widest">{userCode}</p>
               </div>
             )}
@@ -155,11 +198,11 @@ export default function KiroSocialOAuthModal({
               <span className="material-symbols-outlined text-base animate-spin">
                 progress_activity
               </span>
-              Waiting for authorization...
+              {t("waiting")}
             </div>
             <div className="mt-6">
               <Button onClick={handleClose} variant="ghost" fullWidth>
-                Cancel
+                {t("cancel")}
               </Button>
             </div>
           </div>
@@ -172,12 +215,12 @@ export default function KiroSocialOAuthModal({
                 check_circle
               </span>
             </div>
-            <h3 className="text-lg font-semibold mb-2">Connected Successfully!</h3>
+            <h3 className="text-lg font-semibold mb-2">{t("successTitle")}</h3>
             <p className="text-sm text-text-muted mb-4">
-              Your {providerLabel} account via {providerName} has been connected.
+              {t("successMessage", { providerLabel, providerName })}
             </p>
             <Button onClick={handleClose} fullWidth>
-              Done
+              {t("done")}
             </Button>
           </div>
         )}
@@ -187,11 +230,11 @@ export default function KiroSocialOAuthModal({
             <div className="size-16 mx-auto mb-4 rounded-full bg-red-100 dark:bg-red-900/30 flex items-center justify-center">
               <span className="material-symbols-outlined text-3xl text-red-600">error</span>
             </div>
-            <h3 className="text-lg font-semibold mb-2">Connection Failed</h3>
+            <h3 className="text-lg font-semibold mb-2">{t("errorTitle")}</h3>
             <p className="text-sm text-red-600 mb-4">{error}</p>
             <div className="flex gap-2">
               <Button onClick={handleClose} variant="ghost" fullWidth>
-                Close
+                {t("close")}
               </Button>
             </div>
           </div>

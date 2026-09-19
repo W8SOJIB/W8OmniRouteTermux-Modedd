@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+export const dynamic = "force-dynamic";
+import { getProviderById } from "@/shared/constants/providers";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { getApiKeys } from "@/lib/db/apiKeys";
 import { getUserDatabaseSettings } from "@/lib/db/databaseSettings";
@@ -20,7 +22,9 @@ import {
   getWeeklyPatternRows,
   getPresetCostModelRows,
 } from "@/lib/db/usageAnalytics";
-import { getFallbackStats } from "@/lib/db/callLogStats";
+import { getFallbackStats, getErrorTypeBreakdown } from "@/lib/db/callLogStats";
+import { buildByProviderRows } from "@/lib/usage/providerDisplayNames";
+import { toNumber } from "@/shared/utils/numeric";
 
 function getRangeStartIso(range: string): string | null {
   const end = new Date();
@@ -39,6 +43,12 @@ function getRangeStartIso(range: string): string | null {
     case "90d":
       start.setDate(start.getDate() - 90);
       break;
+    case "180d":
+      start.setDate(start.getDate() - 180);
+      break;
+    case "365d":
+      start.setDate(start.getDate() - 365);
+      break;
     case "ytd":
       start.setMonth(0, 1);
       start.setHours(0, 0, 0, 0);
@@ -54,6 +64,7 @@ function getRangeStartIso(range: string): string | null {
 const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 type PricingByProvider = Record<string, Record<string, Record<string, unknown>>>;
+type UsageRows = Array<Record<string, unknown>>;
 type ComputeCostFromPricing = (
   pricing: Record<string, unknown> | null | undefined,
   tokens: Record<string, number | undefined> | null | undefined,
@@ -64,15 +75,6 @@ type GetCodexFastCostMultiplier = (
   model: string | null | undefined,
   serviceTier: string | null | undefined
 ) => number;
-
-function toNumber(value: unknown): number {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim().length > 0) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-  return 0;
-}
 
 function toStringValue(value: unknown, fallback = ""): string {
   return typeof value === "string" && value.trim().length > 0 ? value : fallback;
@@ -215,7 +217,12 @@ function resolveModelPricing(
     }
   }
 
-  // Last resort fallback for historical usage (e.g. "gpt-4" missing, matches "gpt-4.1" or first available)
+  // Short-circuit :free models to $0 (they have no pricing entry → should not fall back to arbitrary rates)
+  if (!pricing && model.endsWith(":free")) {
+    return null;
+  }
+
+  // Last resort fallback for historical usage (e.g. "gpt-4" missing, matches "gpt-4.1")
   if (!pricing && providerPricing && typeof providerPricing === "object") {
     for (const [key, val] of Object.entries(providerPricing as Record<string, unknown>)) {
       const lm = model.toLowerCase();
@@ -223,10 +230,6 @@ function resolveModelPricing(
         pricing = val;
         break;
       }
-    }
-    if (!pricing) {
-      const keys = Object.keys(providerPricing as Record<string, unknown>);
-      if (keys.length > 0) pricing = (providerPricing as Record<string, unknown>)[keys[0]];
     }
   }
 
@@ -346,10 +349,10 @@ export async function GET(request: Request) {
       }
     }
 
-    // Compute the raw-data cutoff: rows older than this may have been rolled up to
-    // daily_usage_summary and deleted from usage_history.
+    // Raw-data cutoff: must match cleanupUsageHistory's rollup/delete boundary —
+    // retention.usageHistory (src/lib/db/cleanup.ts), NOT aggregation.rawDataRetentionDays.
     const dbSettings = getUserDatabaseSettings();
-    const rawRetentionDays = dbSettings.aggregation?.rawDataRetentionDays ?? 30;
+    const rawRetentionDays = dbSettings.retention?.usageHistory ?? 30;
     const rawCutoff = new Date();
     rawCutoff.setDate(rawCutoff.getDate() - rawRetentionDays);
     const rawCutoffIso = rawCutoff.toISOString();
@@ -413,9 +416,8 @@ export async function GET(request: Request) {
 
     const summaryRow = getUsageSummary(unifiedSource, unifiedParams) as Record<string, unknown>;
 
-    const dailyRows = getDailyUsage(unifiedSource, unifiedParams) as Array<Record<string, unknown>>;
-
-    const dailyCostRows = getDailyCostRows(unifiedSource, unifiedParams) as Array<Record<string, unknown>>;
+    const dailyRows = getDailyUsage(unifiedSource, unifiedParams) as UsageRows;
+    const dailyCostRows = getDailyCostRows(unifiedSource, unifiedParams) as UsageRows;
 
     const heatmapStart = new Date();
     heatmapStart.setUTCDate(heatmapStart.getUTCDate() - 364);
@@ -437,30 +439,30 @@ export async function GET(request: Request) {
       });
     }
 
-    const heatmapRows = getHeatmapRows(heatmapConditions, heatmapParams) as Array<Record<string, unknown>>;
+    const heatmapRows = getHeatmapRows(heatmapConditions, heatmapParams) as UsageRows;
 
-    const modelRows = getModelUsageRows(unifiedSource, unifiedParams) as Array<Record<string, unknown>>;
+    const modelRows = getModelUsageRows(unifiedSource, unifiedParams) as UsageRows;
 
-    const providerCostRows = getProviderCostRows(unifiedSource, unifiedParams) as Array<Record<string, unknown>>;
+    const providerCostRows = getProviderCostRows(unifiedSource, unifiedParams) as UsageRows;
 
-    const providerRows = getProviderUsageRows(unifiedSource, unifiedParams) as Array<Record<string, unknown>>;
+    const providerRows = getProviderUsageRows(unifiedSource, unifiedParams) as UsageRows;
 
     const accountCostWhereClause = whereClause
       .replace(/timestamp/g, "usage_history.timestamp")
       .replace(/api_key_/g, "usage_history.api_key_");
-    const accountCostRows = getAccountCostRows(accountCostWhereClause, params) as Array<Record<string, unknown>>;
+    const accountCostRows = getAccountCostRows(accountCostWhereClause, params) as UsageRows;
 
-    const accountRows = getAccountUsageRows(accountCostWhereClause, params) as Array<Record<string, unknown>>;
+    const accountRows = getAccountUsageRows(accountCostWhereClause, params) as UsageRows;
 
     const apiKeyWhereClause = appendWhereCondition(
       whereClause,
       "(api_key_id IS NOT NULL AND api_key_id != '') OR (api_key_name IS NOT NULL AND api_key_name != '')"
     );
-    const apiKeyRows = getApiKeyUsageRows(apiKeyWhereClause, params) as Array<Record<string, unknown>>;
+    const apiKeyRows = getApiKeyUsageRows(apiKeyWhereClause, params) as UsageRows;
 
-    const serviceTierRows = getServiceTierUsageRows(unifiedSource, unifiedParams) as Array<Record<string, unknown>>;
+    const serviceTierRows = getServiceTierUsageRows(unifiedSource, unifiedParams) as UsageRows;
 
-    const apiKeyMetadataRows = getApiKeyMetadataRows(apiKeyWhereClause, params) as Array<Record<string, unknown>>;
+    const apiKeyMetadataRows = getApiKeyMetadataRows(apiKeyWhereClause, params) as UsageRows;
 
     const apiKeyMetadata = new Map<string, { latestName: string; aliases: Set<string> }>();
     for (const row of apiKeyMetadataRows) {
@@ -477,9 +479,10 @@ export async function GET(request: Request) {
       apiKeyMetadata.set(groupKey, existing);
     }
 
-    const weeklyRows = getWeeklyPatternRows(unifiedSource, unifiedParams) as Array<Record<string, unknown>>;
+    const weeklyRows = getWeeklyPatternRows(unifiedSource, unifiedParams) as UsageRows;
 
     const fallbackRow = getFallbackStats(whereClause, params) as Record<string, unknown>;
+    const errorBreakdown = getErrorTypeBreakdown(whereClause, params);
 
     const summary = {
       totalRequests: Number(summaryRow?.totalRequests || 0),
@@ -590,7 +593,10 @@ export async function GET(request: Request) {
         normalizeModelName,
         computeCostFromPricing
       );
-      const key = `${provider}::${model}`;
+      // Keyed by model name alone (not provider) — the table renders one row per
+      // model, so the same model served via multiple provider connections/accounts
+      // must be merged here rather than producing duplicate `key={m.model}` rows.
+      const key = short;
       const existing = modelMap.get(key) || {
         model: short,
         provider,
@@ -661,23 +667,11 @@ export async function GET(request: Request) {
       providerCostByProvider.set(provider, (providerCostByProvider.get(provider) || 0) + cost);
     }
 
-    const byProvider = providerRows.map((row) => ({
-      provider: row.provider,
-      requests: Number(row.requests),
-      promptTokens: Number(row.promptTokens),
-      completionTokens: Number(row.completionTokens),
-      totalTokens: Number(row.totalTokens),
-      avgLatencyMs: Math.round(Number(row.avgLatencyMs)),
-      successRatePct:
-        Number(row.requests) > 0
-          ? Number((Number(row.successfulRequests) / Number(row.requests)) * 100).toFixed(2)
-          : 0,
-      cost: roundCost(providerCostByProvider.get(toStringValue(row.provider)) || 0),
-    }));
+    const byProvider = await buildByProviderRows(providerRows, providerCostByProvider);
 
     const accountCostByAccount = new Map<string, number>();
     for (const row of accountCostRows) {
-      const account = toStringValue(row.account, "unknown");
+      const accountKey = toStringValue(row.accountKey, "unknown");
       const cost = computeUsageRowCost(
         row,
         pricingByProvider,
@@ -685,7 +679,7 @@ export async function GET(request: Request) {
         normalizeModelName,
         computeCostFromPricing
       );
-      accountCostByAccount.set(account, (accountCostByAccount.get(account) || 0) + cost);
+      accountCostByAccount.set(accountKey, (accountCostByAccount.get(accountKey) || 0) + cost);
     }
 
     const byAccount = accountRows.map((row) => ({
@@ -696,7 +690,7 @@ export async function GET(request: Request) {
       totalTokens: Number(row.totalTokens),
       avgLatencyMs: Math.round(Number(row.avgLatencyMs)),
       lastUsed: row.lastUsed,
-      cost: roundCost(accountCostByAccount.get(toStringValue(row.account, "unknown")) || 0),
+      cost: roundCost(accountCostByAccount.get(toStringValue(row.accountKey, "unknown")) || 0),
     }));
 
     const apiKeyMap = new Map<
@@ -877,6 +871,7 @@ export async function GET(request: Request) {
       weeklyCounts,
       dailyByModel,
       modelNames,
+      errorBreakdown,
       range,
     } as any;
 
@@ -897,16 +892,15 @@ export async function GET(request: Request) {
         }
 
         const presetSinceIso = getRangeStartIso(presetRange);
-        const { unifiedSource: presetUnifiedSource, unifiedParams: presetParams } =
-          buildPresetUnifiedSource({
-            sinceIso: presetSinceIso ?? null,
-            untilIso: null,
-            rawCutoffDate,
-            apiKeyWhere,
-            apiKeyParams: apiKeyParamEntries,
-          });
+        const { unifiedSource: pSrc, unifiedParams: pParams } = buildPresetUnifiedSource({
+          sinceIso: presetSinceIso ?? null,
+          untilIso: null,
+          rawCutoffDate,
+          apiKeyWhere,
+          apiKeyParams: apiKeyParamEntries,
+        });
 
-        const presetModelRows = getPresetCostModelRows(presetUnifiedSource, presetParams) as Array<Record<string, unknown>>;
+        const presetModelRows = getPresetCostModelRows(pSrc, pParams) as UsageRows;
 
         let presetTotalCost = 0;
         for (const row of presetModelRows) {

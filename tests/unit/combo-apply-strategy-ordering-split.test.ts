@@ -70,3 +70,30 @@ test("random -> same multiset of targets (a permutation)", async () => {
   assert.equal(out.length, 3);
   assert.deepEqual(keys(out), keys(input));
 });
+
+test("cost-optimized manifest routing logs through the canonical strategy path", async () => {
+  const debugCalls: unknown[][] = [];
+  const log = {
+    info() {},
+    warn() {},
+    error() {},
+    debug(...args: unknown[]) {
+      debugCalls.push(args);
+    },
+  } as never;
+  const input = [target("openai", "gpt-4o"), target("anthropic", "claude-3")];
+
+  const out = await applyStrategyOrdering("cost-optimized", input, {
+    ...deps(),
+    config: { manifestRouting: true },
+    body: { messages: [{ role: "user", content: "hello" }] },
+    log,
+  } as never);
+
+  assert.equal(out.length, 2);
+  assert.equal(
+    debugCalls.some((args) => args[1] === "manifest routing applied"),
+    true,
+    "manifest routing must log from applyStrategyOrdering"
+  );
+});

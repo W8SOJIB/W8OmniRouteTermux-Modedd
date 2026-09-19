@@ -12,9 +12,12 @@ import {
   isKeyActive,
   isExpired,
   isRestricted as isKeyRestricted,
+  buildModelAccessSavePayload,
   classifyKeyStatus,
   computeApiKeyCounts,
+  formatProviderModelPermissionSummary,
   formatUsdCost,
+  restoreProviderScopeSelection,
   toLocalDateTimeInputValue,
   toggleKeyVisibility,
 } from "./apiManagerPageUtils";
@@ -25,6 +28,12 @@ import { SELF_ACCOUNT_QUOTA_SCOPE, SELF_USAGE_SCOPE } from "@/shared/constants/s
 import { extractApiErrorMessage } from "@/shared/http/apiErrorMessage";
 import { hasProviderQuotaBypassScope } from "@/shared/constants/apiKeyPolicyScopes";
 import { UsageLimitSettings } from "./components/UsageLimitSettings";
+import { ChaosModeAccessToggle } from "./components/ChaosModeAccessToggle";
+import { BypassProviderQuotaToggle } from "./components/BypassProviderQuotaToggle";
+import { ApiKeyCompressionToggle } from "./components/ApiKeyCompressionToggle";
+import ProviderModelPermissionList from "./components/ProviderModelPermissionList";
+import ReasoningRoutingRules from "@/shared/components/ReasoningRoutingRules";
+import { ALL_COMBOS_ACCESS_RULE } from "@/shared/constants/comboAccess";
 
 // Constants for validation
 const MAX_KEY_NAME_LENGTH = 200;
@@ -108,6 +117,8 @@ interface ApiKey {
   name: string;
   key: string;
   allowedModels: string[] | null;
+  /** Public shape: "all" | "restricted". Absent on legacy keys. */
+  modelAccessMode?: "all" | "restricted" | null;
   blockedModels?: string[] | null;
   allowedCombos: string[] | null;
   allowedConnections: string[] | null;
@@ -123,8 +134,10 @@ interface ApiKey {
   scopes?: string[];
   allowedEndpoints?: string[];
   streamDefaultMode?: StreamDefaultMode;
+  compressionEnabled?: boolean;
   disableNonPublicModels?: boolean;
   allowUsageCommand?: boolean;
+  chaosModeEnabled?: boolean;
   usageLimitEnabled?: boolean;
   dailyUsageLimitUsd?: number | null;
   weeklyUsageLimitUsd?: number | null;
@@ -255,7 +268,7 @@ export default function ApiManagerPageClient() {
     fetchModels();
     fetchCombos();
     fetchConnections();
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps -- initial dashboard load only
 
   useEffect(() => {
     if (!showAddModal || !nameError) return;
@@ -518,7 +531,8 @@ export default function ApiManagerPageClient() {
             const res = await fetch(`/api/keys/${encodeURIComponent(key.id)}/devices`);
             if (!res.ok) return [key.id, 0] as const;
             const data = await res.json();
-            const count = typeof data?.count === "number" && Number.isFinite(data.count) ? data.count : 0;
+            const count =
+              typeof data?.count === "number" && Number.isFinite(data.count) ? data.count : 0;
             return [key.id, count] as const;
           } catch {
             return [key.id, 0] as const;
@@ -557,9 +571,8 @@ export default function ApiManagerPageClient() {
 
     // 4. search query (case-insensitive substring on name and key)
     if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
       list = list.filter(
-        (k) => k.name.toLowerCase().includes(q) || k.key.toLowerCase().includes(q)
+        (k) => matchesSearch(k.name, searchQuery) || matchesSearch(k.key, searchQuery)
       );
     }
 
@@ -786,12 +799,15 @@ export default function ApiManagerPageClient() {
     scopes: string[],
     allowedEndpoints: string[],
     streamDefaultMode: StreamDefaultMode,
+    compressionEnabled: boolean,
     disableNonPublicModels: boolean,
     allowUsageCommand: boolean,
     usageLimitEnabled: boolean,
     dailyUsageLimitUsd: number | null,
     weeklyUsageLimitUsd: number | null,
-    blockedModels: string[]
+    blockedModels: string[],
+    chaosModeEnabled: boolean,
+    modelAccessMode: "all" | "restricted"
   ) => {
     if (!editingKey || !editingKey.id) return;
 
@@ -841,6 +857,7 @@ export default function ApiManagerPageClient() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: sanitizedName,
+          modelAccessMode,
           allowedModels: validModels,
           blockedModels: validBlockedModels,
           allowedCombos: validCombos,
@@ -857,11 +874,13 @@ export default function ApiManagerPageClient() {
           scopes,
           allowedEndpoints,
           streamDefaultMode,
+          compressionEnabled,
           disableNonPublicModels,
           allowUsageCommand,
           usageLimitEnabled,
           dailyUsageLimitUsd,
           weeklyUsageLimitUsd,
+          chaosModeEnabled,
         }),
       });
 
@@ -939,6 +958,44 @@ export default function ApiManagerPageClient() {
           </button>
         </div>
       )}
+
+      <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
+        <div className="flex flex-col gap-3">
+          <div>
+            <h1 className="text-3xl font-bold text-text-main">{t("keyManagement")}</h1>
+            <p className="mt-1 text-text-muted">{t("keyManagementDesc")}</p>
+          </div>
+          <div
+            className="flex flex-wrap items-center gap-2 text-sm text-text-secondary"
+            aria-label={t("requestFlowAria")}
+          >
+            <span className="rounded-control border border-border bg-surface px-3 py-1.5 font-medium">
+              {t("requestFlowYourApp")}
+            </span>
+            <span
+              className="material-symbols-outlined text-base text-text-muted"
+              aria-hidden="true"
+            >
+              arrow_forward
+            </span>
+            <span className="rounded-control border border-border bg-surface px-3 py-1.5 font-medium">
+              {t("requestFlowApiKey")}
+            </span>
+            <span
+              className="material-symbols-outlined text-base text-text-muted"
+              aria-hidden="true"
+            >
+              arrow_forward
+            </span>
+            <span className="rounded-control border border-border bg-surface px-3 py-1.5 font-medium">
+              {t("requestFlowOmniRoute")}
+            </span>
+          </div>
+        </div>
+        <Button onClick={() => setShowAddModal(true)} icon="add" className="shrink-0">
+          {t("createKey")}
+        </Button>
+      </div>
 
       {/* Filter Bar — shown when there are keys */}
       {keys.length > 0 && (
@@ -1028,9 +1085,18 @@ export default function ApiManagerPageClient() {
           (() => {
             const renderKeyRow = (key: ApiKey) => {
               const stats = usageStats[key.id];
-              const isRestricted = Array.isArray(key.allowedModels) && key.allowedModels.length > 0;
+              const isRestricted = isKeyRestricted(key);
+              const isModelRestricted =
+                key.modelAccessMode === "restricted" ||
+                (Array.isArray(key.allowedModels) && key.allowedModels.length > 0);
+              const { providerWildcards, exactModels } = restoreProviderScopeSelection(
+                Array.isArray(key.allowedModels) ? key.allowedModels : []
+              );
+              const providerCount = providerWildcards.length;
+              const modelCount = exactModels.length;
               const hasComboRestrictions =
-                Array.isArray(key.allowedCombos) && key.allowedCombos.length > 0;
+                Array.isArray(key.allowedCombos) &&
+                !key.allowedCombos.includes(ALL_COMBOS_ACCESS_RULE);
               const hasConnectionRestrictions =
                 Array.isArray(key.allowedConnections) && key.allowedConnections.length > 0;
               const noLogEnabled = key.noLog === true;
@@ -1128,13 +1194,13 @@ export default function ApiManagerPageClient() {
                         </span>
                       )}
                       {/* Existing badges */}
-                      {isRestricted ? (
+                      {isModelRestricted ? (
                         <button
                           onClick={() => handleOpenPermissions(key)}
                           className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-amber-500/10 text-amber-600 dark:text-amber-400 text-xs font-medium hover:bg-amber-500/20 transition-colors"
                         >
                           <span className="material-symbols-outlined text-[14px]">lock</span>
-                          {t("modelsCount", { count: key.allowedModels!.length })}
+                          {formatProviderModelPermissionSummary(providerCount, modelCount, t, tc)}
                         </button>
                       ) : (
                         <button
@@ -1640,12 +1706,15 @@ const PermissionsModal = memo(function PermissionsModal({
     scopes: string[],
     allowedEndpoints: string[],
     streamDefaultMode: StreamDefaultMode,
+    compressionEnabled: boolean,
     disableNonPublicModels: boolean,
     allowUsageCommand: boolean,
     usageLimitEnabled: boolean,
     dailyUsageLimitUsd: number | null,
     weeklyUsageLimitUsd: number | null,
-    blockedModels: string[]
+    blockedModels: string[],
+    chaosModeEnabled: boolean,
+    modelAccessMode: "all" | "restricted"
   ) => void;
 }) {
   const t = useTranslations("apiManager");
@@ -1657,7 +1726,9 @@ const PermissionsModal = memo(function PermissionsModal({
     () => (Array.isArray(apiKey?.blockedModels) ? apiKey.blockedModels : []),
     [apiKey?.blockedModels]
   );
-  const initialCombos = Array.isArray(apiKey?.allowedCombos) ? apiKey.allowedCombos : [];
+  const initialCombos = Array.isArray(apiKey?.allowedCombos)
+    ? apiKey.allowedCombos.filter((combo) => combo !== ALL_COMBOS_ACCESS_RULE)
+    : [];
   const initialConnections = Array.isArray(apiKey?.allowedConnections)
     ? apiKey.allowedConnections
     : [];
@@ -1668,8 +1739,14 @@ const PermissionsModal = memo(function PermissionsModal({
   >(() => getBlockedClaudeCodeFamilies(initialBlockedModels));
   const [claudeCodeFamiliesExpanded, setClaudeCodeFamiliesExpanded] = useState(false);
   const [selectedCombos, setSelectedCombos] = useState<string[]>(initialCombos);
-  const [allowAll, setAllowAll] = useState(initialModels.length === 0);
-  const [allowAllCombos, setAllowAllCombos] = useState(initialCombos.length === 0);
+  // Explicit restricted mode reopens in Restrict even with zero selections
+  // (restricted + empty = deny-all); legacy absent mode keeps "empty = allow all".
+  const [allowAll, setAllowAll] = useState(
+    apiKey?.modelAccessMode === "restricted" ? false : initialModels.length === 0
+  );
+  const [allowAllCombos, setAllowAllCombos] = useState(
+    apiKey?.allowedCombos?.includes(ALL_COMBOS_ACCESS_RULE) === true
+  );
   const [noLogEnabled, setNoLogEnabled] = useState(apiKey?.noLog === true);
   const [autoResolveEnabled, setAutoResolveEnabled] = useState(apiKey?.autoResolve === true);
   const [keyIsActive, setKeyIsActive] = useState(apiKey?.isActive !== false);
@@ -1710,6 +1787,9 @@ const PermissionsModal = memo(function PermissionsModal({
   const [streamDefaultMode, setStreamDefaultMode] = useState<StreamDefaultMode>(
     apiKey?.streamDefaultMode === "json" ? "json" : "legacy"
   );
+  const [compressionEnabled, setCompressionEnabled] = useState(
+    apiKey?.compressionEnabled !== false
+  );
   const [nameError, setNameError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [selectedConnections, setSelectedConnections] = useState<string[]>(initialConnections);
@@ -1731,6 +1811,7 @@ const PermissionsModal = memo(function PermissionsModal({
   const [usageCommandEnabled, setUsageCommandEnabled] = useState(
     apiKey?.allowUsageCommand === true
   );
+  const [chaosModeEnabled, setChaosModeEnabled] = useState(apiKey?.chaosModeEnabled === true);
   const [usageLimitEnabled, setUsageLimitEnabled] = useState(apiKey?.usageLimitEnabled === true);
   const [dailyUsageLimitUsd, setDailyUsageLimitUsd] = useState(
     typeof apiKey?.dailyUsageLimitUsd === "number" && apiKey.dailyUsageLimitUsd > 0
@@ -1749,34 +1830,23 @@ const PermissionsModal = memo(function PermissionsModal({
   );
 
   // Memoize callbacks to prevent child re-renders
+  const handleSelectionChange = useCallback((next: string[]) => {
+    setSelectedModels(next);
+  }, []);
+
+  const handleClaudeCodeDefaultDeselected = useCallback(() => {
+    setClaudeCodeFamiliesExpanded(false);
+  }, []);
+
   const handleToggleModel = useCallback(
     (modelId: string) => {
       if (allowAll) return;
-
       setSelectedModels((prev) => {
         if (prev.includes(modelId)) {
-          if (modelId === CLAUDE_CODE_DEFAULT_MODEL_ID) {
-            setClaudeCodeFamiliesExpanded(false);
-          }
+          if (modelId === CLAUDE_CODE_DEFAULT_MODEL_ID) setClaudeCodeFamiliesExpanded(false);
           return prev.filter((m) => m !== modelId);
         }
         return [...prev, modelId];
-      });
-    },
-    [allowAll]
-  );
-
-  const handleToggleProvider = useCallback(
-    (provider: string, models: Model[]) => {
-      if (allowAll) return;
-
-      const modelIds = models.map((m) => m.id);
-      setSelectedModels((prev) => {
-        const allSelected = modelIds.every((id) => prev.includes(id));
-        if (allSelected) {
-          return prev.filter((m) => !modelIds.includes(m));
-        }
-        return [...new Set([...prev, ...modelIds])];
       });
     },
     [allowAll]
@@ -1908,10 +1978,11 @@ const PermissionsModal = memo(function PermissionsModal({
         blockedModels.push(...CLAUDE_CODE_FAMILY_BLOCK_PATTERNS[familyId]);
       }
     }
+    const modelAccess = buildModelAccessSavePayload({ allowAll, selectedModels });
     onSave(
       keyName,
-      allowAll ? [] : selectedModels,
-      allowAllCombos ? [] : selectedCombos,
+      modelAccess.allowedModels,
+      allowAllCombos ? [ALL_COMBOS_ACCESS_RULE] : selectedCombos,
       noLogEnabled,
       allowAllConnections ? [] : selectedConnections,
       autoResolveEnabled,
@@ -1930,12 +2001,15 @@ const PermissionsModal = memo(function PermissionsModal({
       }),
       allowAllEndpoints ? [] : selectedEndpoints,
       streamDefaultMode,
+      compressionEnabled,
       disableNonPublicModels,
       usageCommandEnabled,
       usageLimitEnabled,
       parseUsdLimitInput(dailyUsageLimitUsd),
       parseUsdLimitInput(weeklyUsageLimitUsd),
-      blockedModels
+      blockedModels,
+      chaosModeEnabled,
+      modelAccess.modelAccessMode
     );
   }, [
     onSave,
@@ -1966,6 +2040,7 @@ const PermissionsModal = memo(function PermissionsModal({
     allowAllEndpoints,
     selectedEndpoints,
     streamDefaultMode,
+    compressionEnabled,
     disableNonPublicModels,
     usageCommandEnabled,
     usageLimitEnabled,
@@ -1974,21 +2049,35 @@ const PermissionsModal = memo(function PermissionsModal({
     parseUsdLimitInput,
     blockedClaudeCodeFamilies,
     initialBlockedModels,
+    chaosModeEnabled,
     apiKey?.scopes,
     t,
   ]);
 
+  // Provider wildcards ("ollama-cloud/*") are counted as providers, not models.
+  // Inherited children render selected via the owner lookup inside the list component.
+  const { providerWildcards: selectedProviderScopes, exactModels: selectedExactModels } =
+    restoreProviderScopeSelection(selectedModels);
+  const selectedProviderCount = selectedProviderScopes.length;
+  const selectedModelCount = selectedExactModels.length;
   const selectedCount = selectedModels.length;
+  const selectedPermissionSummary = formatProviderModelPermissionSummary(
+    selectedProviderCount,
+    selectedModelCount,
+    t,
+    tc
+  );
+
   const totalModels = allModels.length;
   const hasClaudeCodeDefaultSelected =
     !allowAll && selectedModels.includes(CLAUDE_CODE_DEFAULT_MODEL_ID);
-  const orderedSelectedModels = useMemo(() => {
-    if (!hasClaudeCodeDefaultSelected) return selectedModels;
+  const orderedSelectedProviderScopes = useMemo(() => {
+    if (!hasClaudeCodeDefaultSelected) return selectedProviderScopes;
     return [
       CLAUDE_CODE_DEFAULT_MODEL_ID,
-      ...selectedModels.filter((modelId) => modelId !== CLAUDE_CODE_DEFAULT_MODEL_ID),
+      ...selectedProviderScopes.filter((scope) => scope !== CLAUDE_CODE_DEFAULT_MODEL_ID),
     ];
-  }, [hasClaudeCodeDefaultSelected, selectedModels]);
+  }, [hasClaudeCodeDefaultSelected, selectedProviderScopes]);
   const visibleClaudeCodeFamilies = useMemo(
     () =>
       CLAUDE_CODE_DEFAULT_FAMILIES.filter(
@@ -2033,6 +2122,8 @@ const PermissionsModal = memo(function PermissionsModal({
             <p className="text-sm text-red-700 dark:text-red-300 flex-1">{saveError}</p>
           </div>
         )}
+
+        {apiKey?.id && <ReasoningRoutingRules apiKeyId={apiKey.id} />}
 
         {/* Access Mode Toggle */}
         <div className="flex gap-2 p-1 bg-surface rounded-lg">
@@ -2084,9 +2175,11 @@ const PermissionsModal = memo(function PermissionsModal({
               ? t("allowAllDesc")
               : !modelsLoaded
                 ? t("restrictLoading")
-                : totalModels === 0
-                  ? t("restrictCatalogUnavailable", { selectedCount })
-                  : t("restrictDesc", { selectedCount, totalModels })}
+                : selectedProviderCount > 0
+                  ? selectedPermissionSummary
+                  : totalModels === 0
+                    ? t("restrictCatalogUnavailable", { selectedCount })
+                    : t("restrictDesc", { selectedCount, totalModels })}
           </p>
         </div>
 
@@ -2118,9 +2211,7 @@ const PermissionsModal = memo(function PermissionsModal({
         <div className="flex items-start justify-between gap-3 p-3 rounded-lg border border-border bg-surface/40">
           <div className="flex flex-col gap-1">
             <p className="text-sm font-medium text-text-main">{t("maxActiveSessions")}</p>
-            <p className="text-xs text-text-muted">
-              0 = unlimited. Return 429 when this key exceeds concurrent sticky sessions.
-            </p>
+            <p className="text-xs text-text-muted">{t("maxActiveSessionsDescription")}</p>
           </div>
           <div className="w-32">
             <Input
@@ -2139,10 +2230,8 @@ const PermissionsModal = memo(function PermissionsModal({
         {/* Soft Throttle */}
         <div className="flex items-start justify-between gap-3 p-3 rounded-lg border border-border bg-surface/40">
           <div className="flex flex-col gap-1">
-            <p className="text-sm font-medium text-text-main">Throttle Delay</p>
-            <p className="text-xs text-text-muted">
-              Add a fixed delay before requests for this key are routed. 0 = no slowdown.
-            </p>
+            <p className="text-sm font-medium text-text-main">{t("throttleDelay")}</p>
+            <p className="text-xs text-text-muted">{t("throttleDelayDescription")}</p>
           </div>
           <div className="w-36">
             <Input
@@ -2413,6 +2502,11 @@ const PermissionsModal = memo(function PermissionsModal({
           </div>
         </div>
 
+        <ApiKeyCompressionToggle
+          enabled={compressionEnabled}
+          onToggle={() => setCompressionEnabled((prev) => !prev)}
+        />
+
         {/* Ban Toggle (SECURITY) */}
         <div className="flex items-start justify-between gap-3 p-3 rounded-lg border border-red-500/20 bg-red-500/5">
           <div className="flex flex-col gap-1">
@@ -2563,30 +2657,17 @@ const PermissionsModal = memo(function PermissionsModal({
           />
         </div>
 
+        {/* Chaos Mode Access Toggle */}
+        <ChaosModeAccessToggle
+          enabled={chaosModeEnabled}
+          onToggle={() => setChaosModeEnabled((prev) => !prev)}
+        />
+
         {/* Advanced Provider Quota Policy Override */}
-        <div className="flex items-start justify-between gap-3 p-3 rounded-lg border border-amber-500/20 bg-amber-500/5">
-          <div className="flex flex-col gap-1 pr-2">
-            <p className="text-sm font-medium text-text-main">Bypass provider quota cutoffs</p>
-            <p className="text-xs text-text-muted">
-              Allows this key to ignore upstream provider/account cutoff policy during routing. API
-              key USD quotas still apply.
-            </p>
-          </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={bypassProviderQuotaPolicyEnabled}
-            onClick={() => setBypassProviderQuotaPolicyEnabled((prev) => !prev)}
-            className={`inline-flex shrink-0 items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold transition-colors ${
-              bypassProviderQuotaPolicyEnabled
-                ? "bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30"
-                : "bg-black/5 dark:bg-white/5 text-text-muted border border-border"
-            }`}
-          >
-            <span className="material-symbols-outlined text-[14px]">alt_route</span>
-            {bypassProviderQuotaPolicyEnabled ? tc("enabled") : tc("disabled")}
-          </button>
-        </div>
+        <BypassProviderQuotaToggle
+          enabled={bypassProviderQuotaPolicyEnabled}
+          onToggle={() => setBypassProviderQuotaPolicyEnabled((prev) => !prev)}
+        />
 
         {/* Disable Non-Public Models Toggle */}
         <div className="flex items-start justify-between gap-3 p-3 rounded-lg border border-border bg-surface/40">
@@ -2616,9 +2697,7 @@ const PermissionsModal = memo(function PermissionsModal({
         {!allowAll && selectedCount > 0 && (
           <div className="flex flex-col gap-1.5 p-2 bg-primary/5 rounded-lg border border-primary/20">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-primary">
-                {t("selectedCount", { count: selectedCount })}
-              </span>
+              <span className="text-xs font-medium text-primary">{selectedPermissionSummary}</span>
               <div className="flex gap-1">
                 <button
                   onClick={handleSelectAllModels}
@@ -2634,230 +2713,157 @@ const PermissionsModal = memo(function PermissionsModal({
                 </button>
               </div>
             </div>
-            <div className="flex flex-wrap gap-1 max-h-28 overflow-y-auto content-start">
-              {orderedSelectedModels.map((modelId) => {
-                if (modelId === CLAUDE_CODE_DEFAULT_MODEL_ID) {
-                  return (
-                    <div key={modelId} className="flex flex-col gap-1 basis-full">
-                      <span className="inline-flex w-fit items-center gap-0.5 px-1.5 py-0.5 bg-primary/10 text-text-main text-[10px] rounded border border-primary/35">
+            {selectedProviderCount > 0 && (
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-text-muted">
+                  {tc("providers")}
+                </span>
+                <div className="flex flex-wrap gap-1">
+                  {orderedSelectedProviderScopes.map((scope) => {
+                    if (scope === CLAUDE_CODE_DEFAULT_MODEL_ID) {
+                      return (
+                        <div key={scope} className="flex flex-col gap-1 basis-full">
+                          <span className="inline-flex w-fit items-center gap-0.5 px-1.5 py-0.5 bg-primary/10 text-text-main text-[10px] rounded border border-primary/35">
+                            <button
+                              type="button"
+                              onClick={() => setClaudeCodeFamiliesExpanded((prev) => !prev)}
+                              className="inline-flex items-center gap-1 font-mono text-text-main"
+                              title={t("expandClaudeCodeFamilies")}
+                              aria-expanded={claudeCodeFamiliesExpanded}
+                            >
+                              <span className="truncate max-w-[140px]" title={scope}>
+                                {CLAUDE_CODE_DEFAULT_MODEL_NAME}
+                              </span>
+                              <span className="material-symbols-outlined text-[12px] text-primary">
+                                {claudeCodeFamiliesExpanded ? "expand_less" : "expand_more"}
+                              </span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleToggleModel(scope)}
+                              className="text-text-muted hover:text-red-500 transition-colors"
+                              title={t("removeClaudeCodeDefault")}
+                            >
+                              <span className="material-symbols-outlined text-[12px]">close</span>
+                            </button>
+                          </span>
+
+                          {claudeCodeFamiliesExpanded && (
+                            <div className="relative ml-2 flex flex-wrap gap-1 pl-5 animate-in fade-in slide-in-from-top-1 duration-150">
+                              <span
+                                aria-hidden="true"
+                                className="pointer-events-none absolute left-1.5 top-0 bottom-1 w-px bg-primary/25"
+                              />
+                              <span
+                                aria-hidden="true"
+                                className="pointer-events-none absolute left-1.5 top-3 h-px w-3 bg-primary/25"
+                              />
+                              {visibleClaudeCodeFamilies.map((family) => {
+                                const canBlock = family.id !== "other";
+                                return (
+                                  <span
+                                    key={family.id}
+                                    className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] rounded border ${
+                                      canBlock
+                                        ? "bg-white dark:bg-surface text-text-main border-border"
+                                        : "bg-black/5 dark:bg-white/5 text-text-muted border-border"
+                                    }`}
+                                    title={
+                                      canBlock
+                                        ? `Allow ${family.label} family through Claude Code default`
+                                        : "Catch-all for other Claude Code models"
+                                    }
+                                  >
+                                    <span className="font-mono">{family.label}</span>
+                                    {canBlock && (
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          handleBlockClaudeCodeFamily(
+                                            family.id as ClaudeCodeBlockableFamilyId
+                                          )
+                                        }
+                                        className="text-text-muted hover:text-red-500 transition-colors"
+                                        title={`Block ${family.label} family`}
+                                      >
+                                        <span className="material-symbols-outlined text-[12px]">
+                                          close
+                                        </span>
+                                      </button>
+                                    )}
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    }
+
+                    const provider = scope.slice(0, -2);
+                    return (
+                      <span
+                        key={scope}
+                        className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-primary/10 text-text-main text-[10px] rounded border border-primary/35"
+                        title={scope}
+                      >
+                        <span className="font-mono truncate max-w-[120px]">{provider}</span>
                         <button
                           type="button"
-                          onClick={() => setClaudeCodeFamiliesExpanded((prev) => !prev)}
-                          className="inline-flex items-center gap-1 font-mono text-text-main"
-                          title="Expand Claude Code families"
-                          aria-expanded={claudeCodeFamiliesExpanded}
-                        >
-                          <span className="truncate max-w-[140px]" title={modelId}>
-                            {getModelDisplayName(modelId)}
-                          </span>
-                          <span className="material-symbols-outlined text-[12px] text-primary">
-                            {claudeCodeFamiliesExpanded ? "expand_less" : "expand_more"}
-                          </span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleToggleModel(modelId)}
+                          onClick={() => handleToggleModel(scope)}
                           className="text-text-muted hover:text-red-500 transition-colors"
-                          title="Remove Claude Code default"
                         >
                           <span className="material-symbols-outlined text-[12px]">close</span>
                         </button>
                       </span>
-
-                      {claudeCodeFamiliesExpanded && (
-                        <div className="relative ml-2 flex flex-wrap gap-1 pl-5 animate-in fade-in slide-in-from-top-1 duration-150">
-                          <span
-                            aria-hidden="true"
-                            className="pointer-events-none absolute left-1.5 top-0 bottom-1 w-px bg-primary/25"
-                          />
-                          <span
-                            aria-hidden="true"
-                            className="pointer-events-none absolute left-1.5 top-3 h-px w-3 bg-primary/25"
-                          />
-                          {visibleClaudeCodeFamilies.map((family) => {
-                            const canBlock = family.id !== "other";
-                            return (
-                              <span
-                                key={family.id}
-                                className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] rounded border ${
-                                  canBlock
-                                    ? "bg-white dark:bg-surface text-text-main border-border"
-                                    : "bg-black/5 dark:bg-white/5 text-text-muted border-border"
-                                }`}
-                                title={
-                                  canBlock
-                                    ? `Allow ${family.label} family through Claude Code default`
-                                    : "Catch-all for other Claude Code models"
-                                }
-                              >
-                                <span className="font-mono">{family.label}</span>
-                                {canBlock && (
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      handleBlockClaudeCodeFamily(
-                                        family.id as ClaudeCodeBlockableFamilyId
-                                      )
-                                    }
-                                    className="text-text-muted hover:text-red-500 transition-colors"
-                                    title={`Block ${family.label} family`}
-                                  >
-                                    <span className="material-symbols-outlined text-[12px]">
-                                      close
-                                    </span>
-                                  </button>
-                                )}
-                              </span>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  );
-                }
-
-                return (
-                  <span
-                    key={modelId}
-                    className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-white dark:bg-surface text-text-main text-[10px] rounded border border-border"
-                  >
-                    <span className="font-mono truncate max-w-[120px]" title={modelId}>
-                      {getModelDisplayName(modelId)}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => handleToggleModel(modelId)}
-                      className="text-text-muted hover:text-red-500 transition-colors"
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+            {selectedModelCount > 0 && (
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-text-muted">
+                  {tc("models")}
+                </span>
+                <div className="flex flex-wrap gap-1 max-h-28 overflow-y-auto content-start">
+                  {selectedExactModels.map((modelId) => (
+                    <span
+                      key={modelId}
+                      className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-white dark:bg-surface text-text-main text-[10px] rounded border border-border"
                     >
-                      <span className="material-symbols-outlined text-[12px]">close</span>
-                    </button>
-                  </span>
-                );
-              })}
-            </div>
+                      <span className="font-mono truncate max-w-[120px]" title={modelId}>
+                        {getModelDisplayName(modelId)}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleToggleModel(modelId)}
+                        className="text-text-muted hover:text-red-500 transition-colors"
+                      >
+                        <span className="material-symbols-outlined text-[12px]">close</span>
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
         {/* Search and Model Selection (only in restrict mode) */}
         {!allowAll && (
-          <>
-            <div className="relative">
-              <Input
-                value={searchModel}
-                onChange={(e) => onSearchChange(e.target.value)}
-                placeholder={t("searchModels")}
-                icon="search"
-              />
-              {searchModel && (
-                <button
-                  onClick={() => onSearchChange("")}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-main"
-                >
-                  <span className="material-symbols-outlined text-[18px]">close</span>
-                </button>
-              )}
-            </div>
-
-            <div className="max-h-[280px] overflow-y-auto border border-border rounded-lg divide-y divide-border">
-              {modelsByProvider.length === 0 ? (
-                <div className="flex flex-col items-center justify-center py-6 text-text-muted">
-                  <span className="material-symbols-outlined text-2xl mb-1">search_off</span>
-                  <p className="text-xs">{t("noModelsFound")}</p>
-                </div>
-              ) : (
-                modelsByProvider.map(([provider, models]) => {
-                  const selectedInProvider = selectedModels.filter((m) =>
-                    models.some((model) => model.id === m)
-                  ).length;
-                  const allSelected = models.every((m) => selectedModels.includes(m.id));
-                  const someSelected = selectedInProvider > 0 && !allSelected;
-
-                  return (
-                    <div key={provider} className="group">
-                      <button
-                        onClick={() => handleToggleExpand(provider)}
-                        className="w-full flex items-center gap-2 px-3 py-2 hover:bg-surface/50 transition-colors text-left"
-                      >
-                        <span
-                          className={`material-symbols-outlined text-base transition-transform duration-200 ${
-                            expandedProviders.has(provider) ? "rotate-90" : ""
-                          }`}
-                        >
-                          chevron_right
-                        </span>
-                        <div className="flex items-center gap-2 flex-1 min-w-0">
-                          <div
-                            className="relative flex items-center cursor-pointer shrink-0"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleToggleProvider(provider, models);
-                            }}
-                          >
-                            <div
-                              className={`w-4 h-4 rounded border-2 transition-colors flex items-center justify-center ${
-                                allSelected
-                                  ? "bg-primary border-primary"
-                                  : someSelected
-                                    ? "bg-primary/20 border-primary"
-                                    : "border-border hover:border-primary/50"
-                              }`}
-                            >
-                              {allSelected && (
-                                <span className="material-symbols-outlined text-white text-[12px]">
-                                  check
-                                </span>
-                              )}
-                              {someSelected && !allSelected && (
-                                <span className="material-symbols-outlined text-primary text-[12px]">
-                                  remove
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                          <span className="text-xs font-semibold text-text-main truncate">
-                            {provider}
-                          </span>
-                          <span className="text-[10px] text-text-muted bg-surface px-1 py-0.5 rounded shrink-0">
-                            {models.length}
-                          </span>
-                        </div>
-                        {selectedInProvider > 0 && (
-                          <span className="text-[10px] font-medium text-primary bg-primary/10 px-1.5 py-0.5 rounded-full shrink-0">
-                            {selectedInProvider}
-                          </span>
-                        )}
-                      </button>
-
-                      {/* Expandable model list */}
-                      {expandedProviders.has(provider) && (
-                        <div className="px-3 pb-2 pl-9">
-                          <div className="flex flex-wrap gap-1">
-                            {models.map((model) => {
-                              const isSelected = selectedModels.includes(model.id);
-                              return (
-                                <button
-                                  key={model.id}
-                                  onClick={() => handleToggleModel(model.id)}
-                                  className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-mono transition-all ${
-                                    isSelected
-                                      ? "bg-primary text-white"
-                                      : "bg-surface border border-border text-text-muted hover:border-primary/50 hover:text-text-main"
-                                  }`}
-                                  title={model.id}
-                                >
-                                  {getModelDisplayName(model.id)}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })
-              )}
-            </div>
-          </>
+          <ProviderModelPermissionList
+            modelsByProvider={modelsByProvider}
+            allModels={allModels}
+            selectedModels={selectedModels}
+            expandedProviders={expandedProviders}
+            searchModel={searchModel}
+            onSearchChange={onSearchChange}
+            onToggleExpand={handleToggleExpand}
+            onSelectionChange={handleSelectionChange}
+            getModelDisplayName={getModelDisplayName}
+            onClaudeCodeDefaultDeselected={handleClaudeCodeDefaultDeselected}
+          />
         )}
 
         {/* Allowed Connections Section */}
@@ -2939,7 +2945,9 @@ const PermissionsModal = memo(function PermissionsModal({
                               {conn.name || conn.id.slice(0, 8)}
                             </span>
                             {!conn.isActive && (
-                              <span className="text-[9px] text-red-400 shrink-0">inactive</span>
+                              <span className="text-[9px] text-red-400 shrink-0">
+                                {tc("inactive")}
+                              </span>
                             )}
                           </button>
                         );
@@ -2955,7 +2963,7 @@ const PermissionsModal = memo(function PermissionsModal({
         {allCombos.length > 0 && (
           <div className="flex flex-col gap-2 p-3 rounded-lg border border-border bg-surface/40">
             <div className="flex items-center justify-between">
-              <p className="text-sm font-medium text-text-main">Allowed Combos</p>
+              <p className="text-sm font-medium text-text-main">{t("allowedCombos")}</p>
               <div className="flex gap-1 p-0.5 bg-surface rounded-md">
                 <button
                   onClick={() => {
@@ -2968,7 +2976,7 @@ const PermissionsModal = memo(function PermissionsModal({
                       : "text-text-muted hover:bg-black/5 dark:hover:bg-white/5"
                   }`}
                 >
-                  All
+                  {tc("all")}
                 </button>
                 <button
                   onClick={() => setAllowAllCombos(false)}
@@ -2978,14 +2986,14 @@ const PermissionsModal = memo(function PermissionsModal({
                       : "text-text-muted hover:bg-black/5 dark:hover:bg-white/5"
                   }`}
                 >
-                  Restrict
+                  {t("restrict")}
                 </button>
               </div>
             </div>
             <p className="text-xs text-text-muted">
               {allowAllCombos
-                ? "This key can use any combo."
-                : `Restricted to ${selectedCombos.length} combo${selectedCombos.length !== 1 ? "s" : ""}.`}
+                ? t("allCombosAllowed")
+                : t("restrictedComboCount", { count: selectedCombos.length })}
             </p>
             {!allowAllCombos && (
               <div className="flex flex-col gap-1 max-h-40 overflow-y-auto">

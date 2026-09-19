@@ -1,6 +1,7 @@
 "use client";
 
 import { useId } from "react";
+import { useTranslations } from "next-intl";
 import { cn } from "@/shared/utils/cn";
 
 interface SelectOption {
@@ -15,6 +16,8 @@ interface SelectProps extends Omit<React.SelectHTMLAttributes<HTMLSelectElement>
   error?: React.ReactNode;
   hint?: React.ReactNode;
   selectClassName?: string;
+  /** Keep the placeholder selectable after a real value is chosen. */
+  placeholderDisabled?: boolean;
 }
 
 export default function Select({
@@ -22,17 +25,19 @@ export default function Select({
   options = [],
   value,
   onChange,
-  placeholder = "Select an option",
+  placeholder,
   error,
   hint,
   disabled = false,
   required = false,
   className,
   selectClassName,
+  placeholderDisabled = true,
   id: externalId,
   children,
   ...props
 }: SelectProps) {
+  const t = useTranslations("common");
   const generatedId = useId();
   const selectId = externalId || generatedId;
   const errorId = error ? `${selectId}-error` : undefined;
@@ -72,9 +77,9 @@ export default function Select({
           )}
           {...props}
         >
-          {!children && placeholder && (
-            <option value="" disabled className="bg-surface text-text-muted">
-              {placeholder}
+          {!children && (placeholder ?? t("selectOption")) && (
+            <option value="" disabled={placeholderDisabled} className="bg-surface text-text-muted">
+              {placeholder ?? t("selectOption")}
             </option>
           )}
           {!children &&

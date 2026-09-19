@@ -6,11 +6,13 @@ import { getDbInstance } from "./core";
 import { backupDbFile } from "./backup";
 import { PROVIDER_ID_TO_ALIAS } from "@omniroute/open-sse/config/providerModels.ts";
 import { invalidateDbCache } from "./readCache";
+import { encrypt, decrypt } from "./encryption";
 import { getProxyRegistryGeneration, resolveProxyForScopeFromRegistry } from "./proxies";
 import { getComboModelProvider as getComboEntryProvider } from "@/lib/combos/steps";
 import { requestBodyLimitMbFromEnv } from "@/shared/constants/bodySize";
 import { DEFAULT_RESPONSES_PREVIOUS_RESPONSE_ID_MODE } from "@/shared/constants/responsesPreviousResponseId";
 import { type JsonRecord, toRecord } from "./settings/shared";
+import { resolveNoAuthSharedProviderProxy } from "./settings/noAuthProxyFallback";
 
 type ProxyValue = JsonRecord | string | null;
 type ProxyResolutionResult = {
@@ -88,6 +90,54 @@ function withFamilyDefault(value: ProxyValue): ProxyValue {
 
 // ──────────────── Settings ────────────────
 
+/** Internal key_value row — not exposed as a user-facing settings field. */
+export const SETTINGS_REVISION_KEY = "_settingsRevision";
+
+export class SettingsRevisionConflictError extends Error {
+  readonly code = "SETTINGS_REVISION_CONFLICT" as const;
+
+  constructor(public readonly currentRevision: number) {
+    super("Settings revision mismatch");
+    this.name = "SettingsRevisionConflictError";
+  }
+}
+
+function readSettingsRevision(db: ReturnType<typeof getDbInstance>): number {
+  const row = db
+    .prepare("SELECT value FROM key_value WHERE namespace = 'settings' AND key = ?")
+    .get(SETTINGS_REVISION_KEY) as { value?: string } | undefined;
+  if (!row?.value) return 0;
+  try {
+    const parsed = JSON.parse(row.value) as unknown;
+    return typeof parsed === "number" && Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export async function getSettingsRevision(): Promise<number> {
+  return readSettingsRevision(getDbInstance());
+}
+
+/**
+ * #7274: read-fallback for the codexSessionAffinityTtlMs -> sessionAffinityTtlMs
+ * rename. Migration 124 already backfills the new key from any pre-existing
+ * old-key row for the common case, but this covers callers reading settings
+ * before that migration has had a chance to run (or any drift between the
+ * two). Only applies when the generic key was never explicitly persisted —
+ * an operator-set `sessionAffinityTtlMs` (including an explicit 0) always wins.
+ * Extracted to a leaf helper so `getSettings()` stays under the max-lines-per-
+ * function ratchet.
+ */
+function applySessionAffinityLegacyFallback(settings: Record<string, unknown>): void {
+  if (settings.sessionAffinityTtlMs === undefined) {
+    settings.sessionAffinityTtlMs =
+      typeof settings.codexSessionAffinityTtlMs === "number"
+        ? settings.codexSessionAffinityTtlMs
+        : 0;
+  }
+}
+
 export async function getSettings() {
   const db = getDbInstance();
   const rows = db.prepare("SELECT key, value FROM key_value WHERE namespace = 'settings'").all();
@@ -97,10 +147,28 @@ export async function getSettings() {
     tailscaleUrl: "",
     stickyRoundRobinLimit: 3,
     disableSessionStickiness: false,
+    promptCacheAffinityEnabled: true,
+    comboStrategy: "fallback",
+    comboStickyRoundRobinLimit: null, // null = inherit stickyRoundRobinLimit (a literal default here shadows the documented batched-rotation default of 3 — #6678 regression caught by the v3.8.47 release CI)
+    providerStrategies: {},
+    // Per-operator quota row visibility (dashboard usage tab). Keyed by
+    // provider id → { hidden: [<quota visibility key>] }. Independent of the
+    // model catalog's isHidden flag (collectHiddenQuotaModelIds in
+    // ProviderLimits/utils.tsx) — this is a personal view preference, not an
+    // admin model-catalog edit. Ported from upstream decolua/9router#2371.
+    quotaVisibility: {},
     requestRetry: 3,
     maxRetryIntervalSec: 30,
     antigravitySignatureCacheMode: "enabled",
     requireLogin: true,
+    oidcEnabled: false,
+    oidcDisablePasswordLogin: false,
+    oidcIssuer: "",
+    oidcClientId: "",
+    oidcClientSecret: "",
+    oidcScopes: ["openid", "profile", "email"],
+    oidcRedirectPath: "/api/auth/oidc/callback",
+    oidcAllowedSubjects: [], // optional sub or email whitelist
     mcpEnabled: false,
     a2aEnabled: false,
     hiddenSidebarItems: [],
@@ -120,21 +188,34 @@ export async function getSettings() {
     // open-sse/handlers/chatCore/claudeClassifierCompat.ts for the detector + builder.
     claudeClassifierCompat: "off",
     autoRefreshProviderQuota: false,
+    credentialRedactionEnabled: false,
     autoRefreshProviderQuotaInterval: 180,
     comboConfigMode: "guided",
     comboAutoPromoteEnabled: false,
     codexServiceTier: { enabled: false },
     claudeFastMode: {
       enabled: false,
-      supportedModels: ["claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6"],
+      supportedModels: [
+        "claude-fable-5",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+      ],
     },
-    codexSessionAffinityTtlMs: 0,
+    // #7274: renamed from codexSessionAffinityTtlMs — session affinity now
+    // applies to any provider, not just Codex. No default here on purpose:
+    // the read-fallback below only kicks in while `sessionAffinityTtlMs` has
+    // never been explicitly persisted, so it can tell "never configured"
+    // apart from "operator explicitly set 0" on the new key.
     responsesPreviousResponseIdMode: DEFAULT_RESPONSES_PREVIOUS_RESPONSE_ID_MODE,
     alwaysPreserveClientCache: "auto",
     idempotencyWindowMs: 5000,
     wsAuth: false,
     maxBodySizeMb: requestBodyLimitMbFromEnv(process.env.MAX_BODY_SIZE_BYTES),
-    debugMode: true,
+    // #10312: opt-in only — a fresh install (or one missing the persisted key)
+    // must not run in debug mode; installs that persisted `true` keep it.
+    debugMode: false,
     // Opt-in diagnostic: when true, the chat handler emits a `log.debug("TOOLS", …)`
     // line per request summarizing tool count + MCP/hosted/client source breakdown.
     logToolSources: false,
@@ -147,6 +228,7 @@ export async function getSettings() {
     localOnlyManageScopeBypassEnabled: true,
     localOnlyManageScopeBypassPrefixes: ["/api/mcp/"],
     customBannedSignals: [],
+    autoDisableBannedScope: "all",
     proxyEnabled: true,
     perKeyProxyEnabled: false,
     customSystemPromptEnabled: false,
@@ -156,18 +238,43 @@ export async function getSettings() {
     // (`:free` suffix, zero-price pricing, or FREE_MODEL_BUDGETS membership). Default
     // false preserves prior behaviour; opt-in only.
     hidePaidModels: false,
+    // Opt-in, default off: same shape as hidePaidModels above, but requires a
+    // live hard-stop-guaranteed quota check for non-keyless free candidates.
+    // See open-sse/services/autoCombo/strictZeroCostFilter.ts.
+    freeAccessPolicy: "off",
+    excludeTosAvoid: false,
+    // #9418: Opt-in filter that hides auto/* virtual combos from the /v1/models catalog.
+    // User-defined combos are unaffected; routing still works for hidden ids sent explicitly.
+    hideAutoCombos: false,
+    // #9418: Opt-in filter that hides no-think/* gateway variants from the /v1/models catalog.
+    // Routing still works for hidden ids sent explicitly.
+    hideNoThinkVariants: false,
+    // #6977: Opt-in per-connection auto-ping that warms a Codex OAuth connection's
+    // quota window right after it resets, so the first real request doesn't land in
+    // a cold window. `connections` maps connection id -> enabled. Default empty map
+    // (nobody opted in) — the scheduler is a no-op until an operator flips a
+    // connection on, since pinging burns a small amount of real quota (Hard Rule #20
+    // spirit: never mutate/consume on the operator's behalf by default).
+    codexAutoPing: { connections: {} },
+    // #8848: opt-in per-connection Claude proactive warmup (empty = off for everyone).
+    claudeWarmup: { connections: {} },
   };
   for (const row of rows) {
     const record = toRecord(row);
     const key = typeof record.key === "string" ? record.key : null;
     const rawValue = typeof record.value === "string" ? record.value : null;
-    if (!key || rawValue === null) continue;
+    if (!key || rawValue === null || key.startsWith("_")) continue;
     try {
       settings[key] = JSON.parse(rawValue);
     } catch {
       settings[key] = rawValue;
     }
   }
+
+  if (typeof settings.oidcClientSecret === "string") {
+    settings.oidcClientSecret = decrypt(settings.oidcClientSecret) ?? "";
+  }
+  applySessionAffinityLegacyFallback(settings);
 
   // Auto-complete onboarding for pre-configured deployments (Docker/VM)
   // If INITIAL_PASSWORD is set via env, this is a headless deploy — skip the wizard
@@ -185,15 +292,35 @@ export async function getSettings() {
   return settings;
 }
 
-export async function updateSettings(updates: Record<string, unknown>) {
+export async function updateSettings(
+  updates: Record<string, unknown>,
+  options?: { expectedRevision?: number }
+) {
+  // Detect first-time setup completion before we overwrite settings.
+  let setupJustCompleted = false;
+  if (updates.setupComplete === true) {
+    try {
+      const prev = await getSettings();
+      setupJustCompleted = prev.setupComplete !== true;
+    } catch {
+      setupJustCompleted = true;
+    }
+  }
+
   const db = getDbInstance();
   const insert = db.prepare(
     "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('settings', ?, ?)"
   );
   const tx = db.transaction(() => {
-    for (const [key, value] of Object.entries(updates)) {
-      insert.run(key, JSON.stringify(value));
+    const currentRevision = readSettingsRevision(db);
+    if (options?.expectedRevision !== undefined && options.expectedRevision !== currentRevision) {
+      throw new SettingsRevisionConflictError(currentRevision);
     }
+    for (const [key, value] of Object.entries(updates)) {
+      const toStore = key === "oidcClientSecret" ? encrypt(value as string) : value;
+      insert.run(key, JSON.stringify(toStore));
+    }
+    insert.run(SETTINGS_REVISION_KEY, JSON.stringify(currentRevision + 1));
   });
   tx();
   backupDbFile("pre-write");
@@ -215,6 +342,17 @@ export async function updateSettings(updates: Record<string, unknown>) {
       "[HOT_RELOAD] Failed to apply runtime settings after update:",
       error instanceof Error ? error.message : error
     );
+  }
+
+  // Onboarding / setup finished → one-shot Codex catalog revalidation (init case).
+  if (setupJustCompleted) {
+    void import("@/shared/services/codexCatalogRevalidation")
+      .then(({ scheduleCodexCatalogRevalidationAfterInit }) => {
+        scheduleCodexCatalogRevalidationAfterInit();
+      })
+      .catch(() => {
+        // non-fatal
+      });
   }
 
   return nextSettings;
@@ -355,8 +493,16 @@ export async function deleteProxyForLevel(level: string, id: string | null) {
   return setProxyForLevel(level, id, null);
 }
 
-export async function resolveProxyForConnection(connectionId: string, apiKeyId?: string) {
-  const cacheKey = apiKeyId ? `${connectionId}:${apiKeyId}` : connectionId;
+export async function resolveProxyForConnection(
+  connectionId: string,
+  apiKeyId?: string,
+  providerId?: string
+) {
+  const cacheKey = providerId
+    ? `${connectionId}:${apiKeyId || ""}:${providerId}`
+    : apiKeyId
+      ? `${connectionId}:${apiKeyId}`
+      : connectionId;
   const startGeneration = proxyConfigGeneration;
   const startRegistryGeneration = getProxyRegistryGeneration();
   const cached = proxyResolutionCache.get(cacheKey);
@@ -437,8 +583,10 @@ export async function resolveProxyForConnection(connectionId: string, apiKeyId?:
 
   // Step 2: API key-level proxy (only if per-key proxy is enabled globally or per-connection)
   if (apiKeyId) {
-    // Check if per-key proxy is allowed: globally OR per-connection
-    const perKeyEnabled = globalPerKeyProxyEnabled || connectionPerKeyProxyEnabled;
+    // Check if per-key proxy is allowed: the global toggle is a true override —
+    // when it is off, no connection's per-key assignment may apply, regardless
+    // of that connection's own per_key_proxy_enabled flag (#8385).
+    const perKeyEnabled = globalPerKeyProxyEnabled && connectionPerKeyProxyEnabled;
 
     if (perKeyEnabled) {
       try {
@@ -515,33 +663,46 @@ export async function resolveProxyForConnection(connectionId: string, apiKeyId?:
       }
     }
 
-    // Step 7: Legacy combo-level (only if proxy_enabled)
-    if (connectionProxyEnabled && config.combos && Object.keys(config.combos).length > 0) {
+    // Step 7: Combo-level (only if proxy_enabled). For every combo whose model
+    // list references this connection's provider, check the modern registry
+    // (proxy_assignments, scope='combo') first — this is the assignment the
+    // dashboard's Combo "Set Proxy" modal actually writes to (#7149, where the
+    // registry write path and this read path had diverged, leaving combo-level
+    // proxy assignment completely inert). Fall back to the legacy in-memory
+    // combos map for any pre-existing legacy data.
+    if (connectionProvider && connectionProxyEnabled) {
       const combos = db.prepare("SELECT id, data FROM combos").all();
       for (const comboRow of combos) {
         const comboRecord = toRecord(comboRow);
         const comboId = typeof comboRecord.id === "string" ? comboRecord.id : null;
-        if (comboId && config.combos[comboId]) {
-          try {
-            const comboRaw = typeof comboRecord.data === "string" ? comboRecord.data : null;
-            if (!comboRaw) continue;
-            const combo = toRecord(JSON.parse(comboRaw));
-            const comboModels = Array.isArray(combo.models) ? combo.models : [];
-            const usesProvider = comboModels.some(
-              (entry) => getComboModelProvider(entry) === connectionProvider
-            );
-            if (usesProvider) {
-              const result = {
-                proxy: withFamilyDefault(config.combos[comboId]),
-                level: "combo",
-                levelId: comboId,
-              };
-              cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, result);
-              return result;
-            }
-          } catch {
-            // Ignore malformed combo records during proxy resolution.
+        if (!comboId) continue;
+        try {
+          const comboRaw = typeof comboRecord.data === "string" ? comboRecord.data : null;
+          if (!comboRaw) continue;
+          const combo = toRecord(JSON.parse(comboRaw));
+          const comboModels = Array.isArray(combo.models) ? combo.models : [];
+          const usesProvider = comboModels.some(
+            (entry) => getComboModelProvider(entry) === connectionProvider
+          );
+          if (!usesProvider) continue;
+
+          const registryCombo = await resolveProxyForScopeFromRegistry("combo", comboId);
+          if (registryCombo?.proxy) {
+            cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, registryCombo);
+            return registryCombo;
           }
+
+          if (config.combos?.[comboId]) {
+            const result = {
+              proxy: withFamilyDefault(config.combos[comboId]),
+              level: "combo",
+              levelId: comboId,
+            };
+            cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, result);
+            return result;
+          }
+        } catch {
+          // Ignore malformed combo records during proxy resolution.
         }
       }
     }
@@ -555,6 +716,19 @@ export async function resolveProxyForConnection(connectionId: string, apiKeyId?:
       };
       cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, result);
       return result;
+    }
+  }
+
+  // Step 8.5 (#6272): no-auth providers (mimocode, opencode, ...) share a single
+  // synthetic connectionId that never matches a `provider_connections` row, so
+  // `connectionRecord` above is null and Steps 5-8 (which require it) never run for
+  // them — a provider-level proxy assigned to a no-auth provider was silently
+  // ignored. Best-effort fallback: scan the known no-auth provider ids directly.
+  if (!connectionRecord) {
+    const noAuthFallback = await resolveNoAuthSharedProviderProxy(config.providers, providerId);
+    if (noAuthFallback) {
+      cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, noAuthFallback);
+      return noAuthFallback;
     }
   }
 
@@ -650,7 +824,14 @@ export {
   resetAllPricing,
 } from "./settings/pricing";
 
-export { type LKGPRecord, getLKGP, setLKGP, clearAllLKGP } from "./settings/lkgp";
+export {
+  type LKGPRecord,
+  getLKGP,
+  setLKGP,
+  clearAllLKGP,
+  clearLKGP,
+  deleteLKGPByConnectionIds,
+} from "./settings/lkgp";
 
 export {
   type CacheTrendPoint,
@@ -659,3 +840,4 @@ export {
   getCacheTrend,
   resetCacheMetrics,
 } from "./settings/cacheMetrics";
+export { getCachedSettings } from "./readCache";

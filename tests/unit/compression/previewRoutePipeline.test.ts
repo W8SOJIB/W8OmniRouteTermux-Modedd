@@ -15,7 +15,7 @@ function makeReq(body: unknown) {
   });
 }
 test.beforeEach(() => core.resetDbInstance());
-test.after(() => { core.resetDbInstance(); rmSync(TEST_DATA_DIR, { recursive: true, force: true }); });
+test.after(() => { core.resetDbInstance(); rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
 test("pipeline runs the engines in the GIVEN order (reversed vs default rtk→caveman)", async () => {
   const text = "$ pytest\ntests/a.py ....\nbasically what I mean is that you should loop through them one by one";
   const res = await route.POST(makeReq({ messages: [{ role: "user", content: text }], pipeline: ["caveman", "rtk"] }));

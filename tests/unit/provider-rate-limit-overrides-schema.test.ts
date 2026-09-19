@@ -11,9 +11,23 @@ function parse(overrides: unknown) {
 }
 
 test("rateLimitOverrides: valid object with all fields", () => {
-  const r = parse({ rpm: 100, tpm: 50000, tpd: 1000000, minTime: 100, maxConcurrent: 5 });
+  const r = parse({
+    rpm: 100,
+    tpm: 50000,
+    tpd: 1000000,
+    minTime: 100,
+    maxConcurrent: 5,
+    maxWaitMs: 45000,
+  });
   assert.ok(r.success, String(r.error));
-  assert.deepEqual(r.data.rateLimitOverrides, { rpm: 100, tpm: 50000, tpd: 1000000, minTime: 100, maxConcurrent: 5 });
+  assert.deepEqual(r.data.rateLimitOverrides, {
+    rpm: 100,
+    tpm: 50000,
+    tpd: 1000000,
+    minTime: 100,
+    maxConcurrent: 5,
+    maxWaitMs: 45000,
+  });
 });
 
 test("rateLimitOverrides: partial fields", () => {
@@ -69,5 +83,34 @@ test("rateLimitOverrides: empty object is valid", () => {
 
 test("rateLimitOverrides: all zeros is valid", () => {
   const r = parse({ rpm: 0, tpm: 0, tpd: 0, minTime: 0, maxConcurrent: 0 });
+  assert.ok(r.success, String(r.error));
+});
+
+test("rateLimitOverrides: valid maxWaitMs", () => {
+  const r = parse({ maxWaitMs: 45000 });
+  assert.ok(r.success, String(r.error));
+  assert.deepEqual(r.data.rateLimitOverrides, { maxWaitMs: 45000 });
+});
+
+test("rateLimitOverrides: maxWaitMs coerced from string", () => {
+  const r = parse({ maxWaitMs: "30000" });
+  assert.ok(r.success, String(r.error));
+  assert.equal(r.data.rateLimitOverrides.maxWaitMs, 30000);
+});
+
+test("rateLimitOverrides: rejects negative maxWaitMs", () => {
+  assert.equal(parse({ maxWaitMs: -1 }).success, false);
+});
+
+test("rateLimitOverrides: rejects float maxWaitMs", () => {
+  assert.equal(parse({ maxWaitMs: 1.5 }).success, false);
+});
+
+test("rateLimitOverrides: rejects maxWaitMs above 120000 ceiling", () => {
+  assert.equal(parse({ maxWaitMs: 120001 }).success, false);
+});
+
+test("rateLimitOverrides: maxWaitMs of 0 is valid (no override)", () => {
+  const r = parse({ maxWaitMs: 0 });
   assert.ok(r.success, String(r.error));
 });

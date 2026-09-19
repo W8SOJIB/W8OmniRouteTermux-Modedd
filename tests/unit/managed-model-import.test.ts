@@ -11,10 +11,12 @@ const core = await import("../../src/lib/db/core.ts");
 const modelsDb = await import("../../src/lib/db/models.ts");
 const localDb = await import("../../src/lib/localDb.ts");
 const { importManagedModels } = await import("../../src/lib/providerModels/managedModelImport.ts");
+const { mergeProviderModelListing } =
+  await import("../../src/lib/providers/mergeProviderModelListing.ts");
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -24,7 +26,7 @@ test.beforeEach(async () => {
 
 test.after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("sync mode builds aliases from provider-level synced available models", async () => {
@@ -43,6 +45,27 @@ test("sync mode builds aliases from provider-level synced available models", asy
 
   assert.equal(aliases["model-a"], "openrouter/shared/model-a");
   assert.equal(aliases["model-b"], "openrouter/shared/model-b");
+});
+test("Crof managed import persists boolean reasoning effort metadata", async () => {
+  const result = await importManagedModels({
+    providerId: "crof",
+    connectionId: "conn-crof",
+    mode: "sync",
+    fetchedModels: [{ id: "crof-managed-model", reasoning_effort: true }],
+  });
+
+  const synced = await modelsDb.getSyncedAvailableModelsForConnection("crof", "conn-crof");
+  assert.deepEqual(synced[0]?.supportedThinkingEfforts, ["none", "low", "medium", "high", "max"]);
+  assert.equal(synced[0]?.supportsThinking, true);
+
+  assert.deepEqual(result.importedModels[0]?.supportedThinkingEfforts, [
+    "none",
+    "low",
+    "medium",
+    "high",
+    "max",
+  ]);
+  assert.equal(result.importedModels[0]?.supportsThinking, true);
 });
 
 test("merge mode builds aliases from discovered models without pruning missing provider aliases", async () => {
@@ -65,6 +88,78 @@ test("merge mode builds aliases from discovered models without pruning missing p
   assert.equal(aliases["model-b"], "openrouter/shared/model-b");
 });
 
+test("sync keeps a same-id manual model as the user-configurable metadata override", async () => {
+  await modelsDb.addCustomModel(
+    "openrouter",
+    "shared-model",
+    "Operator configuration",
+    "manual",
+    "responses",
+    ["responses"],
+    "claude",
+    {},
+    true
+  );
+
+  await importManagedModels({
+    providerId: "openrouter",
+    connectionId: "openrouter-connection",
+    mode: "sync",
+    fetchedModels: [
+      {
+        id: "shared-model",
+        name: "Upstream name",
+        apiFormat: "chat-completions",
+        supportedEndpoints: ["chat"],
+        description: "Upstream description",
+      },
+    ],
+  });
+
+  const customModels = (await modelsDb.getCustomModels("openrouter")) as Array<{
+    id: string;
+    apiFormat?: string;
+    targetFormat?: string;
+    supportedEndpoints?: string[];
+    supportsVision?: boolean;
+  }>;
+  assert.deepEqual(customModels, [
+    {
+      id: "shared-model",
+      name: "Operator configuration",
+      source: "manual",
+      apiFormat: "responses",
+      supportedEndpoints: ["responses"],
+      targetFormat: "claude",
+      supportsVision: true,
+    },
+  ]);
+
+  const syncedModels = await modelsDb.getSyncedAvailableModels("openrouter");
+  const effectiveModel = mergeProviderModelListing({
+    providerId: "openrouter",
+    registryModels: [],
+    syncedModels,
+    customModels,
+  }).find((model) => model.id === "shared-model");
+  assert.equal(effectiveModel?.apiFormat, "responses");
+  assert.deepEqual(effectiveModel?.supportedEndpoints, ["responses"]);
+  assert.equal(effectiveModel?.targetFormat, "claude");
+  assert.equal(effectiveModel?.supportsVision, true);
+  assert.equal(effectiveModel?.description, "Upstream description");
+
+  assert.equal(await modelsDb.removeCustomModel("openrouter", "shared-model"), true);
+  const resetModel = mergeProviderModelListing({
+    providerId: "openrouter",
+    registryModels: [],
+    syncedModels,
+    customModels: await modelsDb.getCustomModels("openrouter"),
+  }).find((model) => model.id === "shared-model");
+  assert.equal(resetModel?.apiFormat, "chat-completions");
+  assert.deepEqual(resetModel?.supportedEndpoints, ["chat"]);
+  assert.equal(resetModel?.description, "Upstream description");
+});
+
 test("provider-level synced model deletion removes only that provider", async () => {
   await modelsDb.replaceSyncedAvailableModelsForConnection("openrouter", "conn-a", [
     { id: "shared/model-a", name: "Model A", source: "imported" },
@@ -83,6 +178,55 @@ test("provider-level synced model deletion removes only that provider", async ()
   assert.deepEqual(await modelsDb.getSyncedAvailableModels("openai"), [
     { id: "shared/model-c", name: "Model C", source: "imported" },
   ]);
+});
+
+test("OpenAI import excludes deprecated and shutdown models from new selections", async () => {
+  const result = await importManagedModels({
+    providerId: "openai",
+    connectionId: "openai-conn",
+    mode: "sync",
+    fetchedModels: [
+      { id: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+      { id: "gpt-5.2-codex", name: "GPT-5.2 Codex" },
+      { id: "gpt-5.3-chat-latest", name: "GPT-5.3 Chat" },
+    ],
+  });
+
+  assert.deepEqual(
+    result.discoveredModels.map((model) => model.id),
+    ["gpt-5.6-sol"]
+  );
+  assert.deepEqual(
+    (await modelsDb.getSyncedAvailableModels("openai")).map((model) => model.id),
+    ["gpt-5.6-sol"]
+  );
+});
+
+test("OpenAI import excludes image and video generation models from chat selections", async () => {
+  const result = await importManagedModels({
+    providerId: "openai",
+    connectionId: "openai-media-conn",
+    mode: "sync",
+    fetchedModels: [
+      { id: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+      { id: "gpt-image-2", name: "GPT Image 2" },
+      { id: "sora-2-pro", name: "Sora 2 Pro" },
+      {
+        id: "vendor-image-model",
+        name: "Vendor Image Model",
+        supportedEndpoints: ["/v1/images/generations"],
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    result.discoveredModels.map((model) => model.id),
+    ["gpt-5.6-sol"]
+  );
+  assert.deepEqual(
+    (await modelsDb.getSyncedAvailableModels("openai")).map((model) => model.id),
+    ["gpt-5.6-sol"]
+  );
 });
 
 test("pruning stale connection available models during import", async () => {
@@ -135,6 +279,7 @@ test("antigravity sync dynamically builds and saves mitmAlias mappings", async (
     mode: "sync",
     fetchedModels: [
       { id: "gemini-3.5-flash", name: "Gemini 3.5 Flash" },
+      { id: "gemini-3.7-flash-high", name: "Gemini 3.7 Flash High" },
       { id: "custom-antigravity-model", name: "Custom Antigravity Model" },
     ],
   });
@@ -145,8 +290,13 @@ test("antigravity sync dynamically builds and saves mitmAlias mappings", async (
   const mitmMappings = await modelsDb.getMitmAlias("antigravity");
   console.log("MITM MAPPINGS IN TEST:", mitmMappings);
 
-  // Should contain standard mapping
-  assert.equal(mitmMappings["gemini-3.5-flash"], "antigravity/gemini-3.5-flash");
+  // Retired models reported by upstream must not be imported or mapped.
+  assert.equal(mitmMappings["gemini-3.5-flash"], undefined);
+  assert.equal(
+    models.some((model) => model.id === "gemini-3.5-flash"),
+    false
+  );
+  assert.equal(mitmMappings["gemini-3.7-flash-high"], "antigravity/gemini-3.7-flash-high");
   assert.equal(mitmMappings["custom-antigravity-model"], "antigravity/custom-antigravity-model");
 
   // Removed Antigravity 2.0 preview/agent aliases must not be reintroduced.

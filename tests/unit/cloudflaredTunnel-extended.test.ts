@@ -101,7 +101,7 @@ test.afterEach(async () => {
   restoreEnv();
 
   for (const dir of tempDirs) {
-    await fs.rm(dir as any, { recursive: true, force: true });
+    await fs.rm(dir as any, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
   tempDirs.clear();
 });

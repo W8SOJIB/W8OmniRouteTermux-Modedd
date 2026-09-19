@@ -12,7 +12,7 @@ const webhooksDb = await import("../../src/lib/db/webhooks.ts");
 
 async function resetStorage() {
   coreDb.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -22,7 +22,7 @@ test.beforeEach(async () => {
 
 test.after(() => {
   coreDb.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("webhooks create, update, query enabled hooks and delete records", () => {
@@ -33,7 +33,7 @@ test("webhooks create, update, query enabled hooks and delete records", () => {
   });
 
   assert.match(created.secret, /^whsec_/);
-  assert.equal(webhooksDb.getWebhooks().length, 1);
+  assert.equal(webhooksDb.getWebhooks().webhooks.length, 1);
   assert.equal(webhooksDb.getEnabledWebhooks().length, 1);
 
   const updated = webhooksDb.updateWebhook(created.id, {

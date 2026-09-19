@@ -89,7 +89,6 @@ src/
 ├── i18n/                 Locale bundles
 ├── instrumentation.ts    Next.js instrumentation hook
 ├── instrumentation-node.ts
-├── server-init.ts        Process-level bootstrap (env, DB, jobs, sync)
 └── proxy.ts              Top-level proxy bootstrap helper
 ```
 
@@ -293,7 +292,7 @@ table groups the actual directories and notable top-level files.
 | `jobs/`           | Background jobs (`autoUpdate.ts`, …)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `memory/`         | Persistent memory: `store.ts`, `cache.ts`, `retrieval.ts`, `summarization.ts`, `extraction.ts`, `injection.ts`, `qdrant.ts`, `settings.ts`, `verify.ts`, `schemas.ts`, `types.ts`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `monitoring/`     | `observability.ts`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `oauth/`          | OAuth providers (14): `antigravity`, `claude`, `cline`, `codex`, `cursor`, `gemini`, `github`, `gitlab-duo`, `kilocode`, `kimi-coding`, `kiro`, `qoder`, `qwen`, `windsurf` plus `services/`, `utils/{pkce, server, banner, codexAuthFile, ui}`, `constants/oauth.ts`                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `oauth/` | OAuth/import provider modules (22): `agy`, `antigravity`, `claude`, `cline`, `codebuddy-cn`, `codex`, `cursor`, `devin-desktop`, `ghe-copilot`, `github`, `gitlab-duo`, `grok-cli-oauth`, `grok-cli`, `kilocode`, `kimi-coding`, `kiro`, `qoder`, `raycast`, `trae`, `xai-oauth`, `zed-hosted`, `zed`, plus `services/`, `utils/`, and `constants/oauth.ts` |
 | `plugins/`        | Plugin loader (`index.ts`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `promptCache/`    | `prefixAnalyzer.ts`, `index.ts`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `providerModels/` | Managed model lifecycle: `modelDiscovery.ts`, `managedModelImport.ts`, `managedAvailableModels.ts`, `cursorAgent.ts`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
@@ -452,12 +451,12 @@ open-sse/
 ├── types.d.ts
 ├── config/                 Provider registries, header profiles, identity, …
 ├── handlers/               Request handlers (chat, embeddings, audio, image, …)
-├── executors/              75 provider-specific HTTP executors
+├── executors/              107 provider-specific HTTP executors
 ├── translator/             Format conversion (OpenAI ↔ Claude ↔ Gemini ↔ Cursor ↔ Kiro)
 ├── transformer/            Responses API ↔ Chat Completions stream transformer
 ├── services/               80+ service modules (combos, fallback, quotas, identity, …)
 ├── utils/                  Streaming helpers, TLS client, AWS SigV4, proxy fetch, …
-└── mcp-server/             MCP server (3 transports, 30 scopes, 94 tools)
+└── mcp-server/             MCP server (3 transports, 31 scopes, 105 tools)
 ```
 
 ### 4.1 `open-sse/handlers/`
@@ -482,16 +481,16 @@ open-sse/
 
 ### 4.2 `open-sse/executors/`
 
-75 provider executors, each extending `BaseExecutor` (`base.ts`):
+101 provider executors, each extending `BaseExecutor` (`base.ts`):
 
 `antigravity`, `azure-openai`, `blackbox-web`, `chatgpt-web`, `cliproxyapi`,
 `cloudflare-ai`, `codex`, `commandCode`, `cursor`, `default`, `devin-cli`,
 `muse-spark-web`, `nlpcloud`, `opencode`, `perplexity-web`, `petals`,
-`pollinations`, `puter`, `qoder`, `vertex`, `windsurf`, plus `claudeIdentity.ts`
+`pollinations`, `qoder`, `vertex`, `devin-desktop`, plus `claudeIdentity.ts`
 (shared identity helper) and `index.ts` (registry).
 
 > Note: providers not listed here are served by `default.ts` using the generic
-> OpenAI-compatible executor. The full provider catalog (237 entries) lives in
+> OpenAI-compatible executor. The full provider catalog (338 providers) lives in
 > `src/shared/constants/providers.ts`.
 
 ### 4.3 `open-sse/translator/`
@@ -524,10 +523,10 @@ Highlights (full list under `open-sse/services/`):
 
 | Concern              | Files                                                                                                                                                                                                                                             |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Combo routing        | `combo.ts` (17 strategies), `comboConfig.ts`, `comboMetrics.ts`, `comboManifestMetrics.ts`, `comboAgentMiddleware.ts`                                                                                                                             |
+| Combo routing        | `combo.ts` (19 strategies), `comboConfig.ts`, `comboMetrics.ts`, `comboManifestMetrics.ts`, `comboAgentMiddleware.ts`                                                                                                                             |
 | Auto Combo engine    | `autoCombo/` — `engine.ts`, `scoring.ts`, `taskFitness.ts`, `virtualFactory.ts`, `modePacks.ts`, `autoPrefix.ts`, `persistence.ts`, `providerDiversity.ts`, `providerRegistryAccessor.ts`, `routerStrategy.ts`, `selfHealing.ts`, `index.ts`      |
 | Resilience           | `accountFallback.ts` (cooldown + lockout), `errorClassifier.ts`, `emergencyFallback.ts`, `rateLimitManager.ts`, `rateLimitSemaphore.ts`, `accountSemaphore.ts`, `accountSelector.ts`                                                              |
-| Quotas               | `quotaMonitor.ts`, `quotaPreflight.ts`, `bailianQuotaFetcher.ts`, `codexQuotaFetcher.ts`, `deepseekQuotaFetcher.ts`, `crofUsageFetcher.ts`, `antigravityCredits.ts`                                                                               |
+| Quotas               | `quotaMonitor.ts`, `quotaPreflight.ts`, `bailianQuotaFetcher.ts`, `codexQuotaFetcher.ts`, `deepseekQuotaFetcher.ts`, `openrouterQuotaFetcher.ts`, `openrouterFreeWindow.ts`, `crofUsageFetcher.ts`, `antigravityCredits.ts`                       |
 | Caching              | `reasoningCache.ts`, `searchCache.ts`, `signatureCache.ts`, `requestDedup.ts`                                                                                                                                                                     |
 | Routing intelligence | `intentClassifier.ts`, `taskAwareRouter.ts`, `backgroundTaskDetector.ts`, `volumeDetector.ts`, `wildcardRouter.ts`, `workflowFSM.ts`, `specificityDetector.ts`, `specificityRules.ts`, `specificityTypes.ts`                                      |
 | Model handling       | `modelCapabilities.ts`, `modelDeprecation.ts`, `modelFamilyFallback.ts`, `modelStrip.ts`, `model.ts`, `provider.ts`, `providerRequestDefaults.ts`, `providerCostData.ts`, `payloadRules.ts`                                                       |
@@ -544,7 +543,7 @@ Highlights (full list under `open-sse/services/`):
   5 compression tools, 3 memory tools, 4 skills tools, plus advanced tools added
   through `advancedTools.ts`).
 - **3 transports**: stdio, HTTP Streamable, SSE.
-- **13 scopes** declared in `src/shared/constants/mcpScopes.ts`.
+- **31 scopes** declared in `src/shared/constants/mcpScopes.ts`.
 - Audit table: `mcp_tool_audit` (populated by `audit.ts`).
 - Files: `server.ts`, `index.ts`, `httpTransport.ts`, `audit.ts`, `scopeEnforcement.ts`,
   `runtimeHeartbeat.ts`, `descriptionCompressor.ts`, `schemas/{tools, a2a, audit, index}.ts`,
@@ -634,17 +633,17 @@ Two binaries are exposed in `package.json` → `bin`:
 
 ## 7. `tests/`
 
-| Directory                                                                      | Type                                                                                        |
-| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
-| `tests/unit/`                                                                  | Unit tests via Node native test runner (1821 files, plus `api/`, `auth/`, `authz/` subdirs) |
-| `tests/integration/`                                                           | Cross-module + DB-state tests                                                               |
-| `tests/e2e/`                                                                   | Playwright UI tests                                                                         |
-| `tests/protocols-e2e/`                                                         | MCP/A2A protocol e2e                                                                        |
-| `tests/translator/`                                                            | Translator-specific tests                                                                   |
-| `tests/security/`                                                              | Security regressions                                                                        |
-| `tests/load/`                                                                  | Load / stress tests                                                                         |
-| `tests/golden-set/`                                                            | Reference outputs for translator regressions                                                |
-| `tests/helpers/`, `tests/fixtures/`, `tests/manual/`, `tests/scratch_test.mjs` | Support                                                                                     |
+| Directory                                            | Type                                                                                        |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `tests/unit/`                                        | Unit tests via Node native test runner (1821 files, plus `api/`, `auth/`, `authz/` subdirs) |
+| `tests/integration/`                                 | Cross-module + DB-state tests                                                               |
+| `tests/e2e/`                                         | Playwright UI tests                                                                         |
+| `tests/protocols-e2e/`                               | MCP/A2A protocol e2e                                                                        |
+| `tests/translator/`                                  | Translator-specific tests                                                                   |
+| `tests/security/`                                    | Security regressions                                                                        |
+| `tests/load/`                                        | Load / stress tests                                                                         |
+| `tests/golden-set/`                                  | Reference outputs for translator regressions                                                |
+| `tests/helpers/`, `tests/fixtures/`, `tests/manual/` | Support                                                                                     |
 
 Common commands:
 
@@ -793,6 +792,20 @@ See [A2A-SERVER.md § Adding a New Skill](../frameworks/A2A-SERVER.md). Skills l
   inference for cross-module boundaries.
 - **Database**: never write raw SQL in routes or handlers — always go through
   `src/lib/db/` modules. Never add logic to `src/lib/localDb.ts`.
+- **DB-entity typing (#3512)**: a function that writes or reads a DB table's
+  row shape should take/return a named TS interface mirroring that table's
+  columns 1:1, not `any` or an inline anonymous type at the call site. Land
+  the interface next to the function (e.g. `export interface UsageEntry` in
+  `src/lib/usage/usageHistory.ts` above `saveRequestUsage`), keep individual
+  fields optional/nullable when different writers populate the row
+  incrementally, and prefer `unknown` over `any` for a field whose shape
+  varies across callers (documented on the field, e.g. `UsageEntry.tokens`
+  accepts both raw provider-shaped usage and the normalized shape). Once a
+  file's `any` count reaches zero this way, add it to the
+  `check:any-budget:t11` allowlist (`scripts/check/check-t11-any-budget.mjs`,
+  `maxAny: 0`) so it can't regress. This is a first-slice convention — the
+  broader "no anonymous `any`" cleanup is iterative across the rest of the
+  codebase.
 - **Errors**: try/catch with specific error types, log with pino context. Never
   silently swallow errors in SSE streams; use abort signals for cleanup.
 - **Security**: never use `eval()` / `new Function()` / implied eval. Validate

@@ -2,7 +2,7 @@ import { errorResponse, unavailableResponse } from "@omniroute/open-sse/utils/er
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { getRegistryEntry } from "@omniroute/open-sse/config/providerRegistry.ts";
 import {
-  getProviderCredentials,
+  getProviderCredentialsWithQuotaPreflight,
   clearRecoveredProviderState,
   extractApiKey,
   isValidApiKey,
@@ -71,7 +71,7 @@ export async function POST(request, { params }) {
     }
   }
 
-  const credentials = await getProviderCredentials(providerEntry.id);
+  const credentials = await getProviderCredentialsWithQuotaPreflight(providerEntry.id);
   if (!credentials) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, `No credentials for provider: ${rawProvider}`);
   }
@@ -84,7 +84,14 @@ export async function POST(request, { params }) {
     );
   }
 
-  const result = await handleEmbedding({ body, credentials, log });
+  const result = await handleEmbedding({
+    body,
+    credentials,
+    log,
+    // #10347 — thread the selected connection id so a hard upstream failure cools
+    // the account instead of re-hitting it on every request.
+    connectionId: (credentials as { connectionId?: string } | null)?.connectionId ?? null,
+  });
 
   if (result.success) {
     await clearRecoveredProviderState(credentials);

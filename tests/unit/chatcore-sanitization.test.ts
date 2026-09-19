@@ -84,9 +84,9 @@ function ensureLegacyMemoryTable() {
   `);
 }
 
-async function waitForAsyncMemoryFlush() {
-  await new Promise((resolve) => setImmediate(resolve));
-  await new Promise((resolve) => setTimeout(resolve, 10));
+async function flushAsyncSideEffects() {
+  // setImmediate rounds drain the event loop more reliably than setTimeout under CI load.
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
 }
 
 async function invokeChatCore({
@@ -152,7 +152,7 @@ test.after(() => {
     db.close();
   } catch {}
 
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("chatCore sanitization normalizes max_output_tokens into max_tokens", async () => {
@@ -178,7 +178,7 @@ test("chatCore sanitization normalizes max_output_tokens into max_tokens", async
     },
   });
 
-  assert.equal(copied.call.body.max_tokens, 0);
+  assert.equal(copied.call.body.max_tokens, undefined);
   assert.equal("max_output_tokens" in copied.call.body, false);
   assert.equal(preserved.call.body.max_tokens, 7);
   assert.equal("max_output_tokens" in preserved.call.body, false);
@@ -647,7 +647,7 @@ test("chatCore does not share or persist memories when apiKeyInfo is missing", a
     },
   });
 
-  await waitForAsyncMemoryFlush();
+  await flushAsyncSideEffects();
 
   const localMemoriesResult = await listMemories({ apiKeyId: "local" });
   const localMemories = Array.isArray(localMemoriesResult)
@@ -751,7 +751,7 @@ test("chatCore extracts memories from Claude content arrays and Responses output
 
   assert.equal(responsesResult.result.success, true);
 
-  await waitForAsyncMemoryFlush();
+  await flushAsyncSideEffects();
 
   const claudeMemoriesResult = await listMemories({ apiKeyId: claudeKeyId });
   const responsesMemoriesResult = await listMemories({ apiKeyId: responsesKeyId });
@@ -819,7 +819,7 @@ test("chatCore request memory extraction for responses input ignores assistant i
 
   assert.equal(responsesResult.result.success, true);
 
-  await waitForAsyncMemoryFlush();
+  await flushAsyncSideEffects();
 
   const memoriesResult = await listMemories({ apiKeyId: responsesKeyId });
   const memories = Array.isArray(memoriesResult) ? memoriesResult : (memoriesResult.data ?? []);

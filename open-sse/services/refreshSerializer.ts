@@ -27,7 +27,6 @@ const ROTATION_LOCK_GROUP: Record<string, string> = {
   "gitlab-duo": "gitlab-duo",
   kiro: "kiro",
   "kimi-coding": "kimi-coding",
-  qwen: "qwen",
 };
 
 // Protective settle gap (ms) between two consecutive sibling refreshes when the
@@ -113,8 +112,8 @@ export async function serializeRefresh<T>(provider: string, fn: () => Promise<T>
  * and codex-lb's replica race-detection.
  */
 export function wasRefreshTokenRotated(
-  attemptedRefreshToken: string | null | undefined,
-  latestRefreshToken: string | null | undefined
+  attemptedRefreshToken: unknown,
+  latestRefreshToken: unknown
 ): boolean {
   return (
     typeof attemptedRefreshToken === "string" &&

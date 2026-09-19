@@ -1,3 +1,13 @@
+// ENVIRONMENT NOTE (sandbox better-sqlite3 / glibc limitation, not a code defect):
+// This test constructs or exercises a real better-sqlite3-backed SQLite database.
+// better-sqlite3 is a native addon; production and CI load it normally, but some
+// sandboxes/dev boxes ship a system glibc older than the prebuilt binary requires
+// ("GLIBC_2.29 not found"), so the native module fails to dlopen and any test that
+// reaches better-sqlite3 directly (or asserts stdout that the load-failure warning
+// would pollute) fails HERE while passing in CI. This is a known environment
+// limitation, not a defect in the code under test: the OmniRoute runtime itself
+// cascades to node:sqlite/sql.js when better-sqlite3 is unavailable. See
+// tests/unit/_helpers/betterSqlite3Availability.ts for a guard helper.
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -38,7 +48,7 @@ function withTempEnv(fn) {
     for (const [key, value] of Object.entries(originalEnv)) {
       process.env[key] = value;
     }
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }
 
@@ -70,14 +80,14 @@ test("bootstrapEnv strips matching quotes from env values", () => {
     fs.mkdirSync(dataDir, { recursive: true });
     fs.writeFileSync(
       path.join(dataDir, "server.env"),
-      'JWT_SECRET="jwt-from-server-env"\nCLAUDE_USER_AGENT="claude-cli/2.1.145 (external, cli)"\n',
+      'JWT_SECRET="jwt-from-server-env"\nCLAUDE_USER_AGENT="claude-cli/2.1.219 (external, cli)"\n',
       "utf8"
     );
 
     const env = bootstrapEnv({ quiet: true });
 
     assert.equal(env.JWT_SECRET, "jwt-from-server-env");
-    assert.equal(env.CLAUDE_USER_AGENT, "claude-cli/2.1.145 (external, cli)");
+    assert.equal(env.CLAUDE_USER_AGENT, "claude-cli/2.1.219 (external, cli)");
   });
 });
 
@@ -117,6 +127,30 @@ test("bootstrapEnv fails closed when existing database cannot be inspected", () 
     fs.mkdirSync(path.join(dataDir, "storage.sqlite"), { recursive: true });
 
     assert.throws(() => bootstrapEnv({ quiet: true }), /Unable to inspect existing database/);
+  });
+});
+
+test("bootstrapEnv ignores blank process.env values that would override persisted secrets (#6824)", () => {
+  withTempEnv(({ dataDir }) => {
+    process.env.DATA_DIR = dataDir;
+    fs.mkdirSync(dataDir, { recursive: true });
+
+    // Persisted secrets in server.env
+    fs.writeFileSync(
+      path.join(dataDir, "server.env"),
+      "STORAGE_ENCRYPTION_KEY=persisted-key\nJWT_SECRET=persisted-jwt\n",
+      "utf8"
+    );
+
+    // Simulate Docker `-e STORAGE_ENCRYPTION_KEY=` — sets an empty string
+    process.env.STORAGE_ENCRYPTION_KEY = "";
+    process.env.JWT_SECRET = "";
+
+    const env = bootstrapEnv({ quiet: true });
+
+    // Empty process.env values must NOT override persisted secrets
+    assert.equal(env.STORAGE_ENCRYPTION_KEY, "persisted-key");
+    assert.equal(env.JWT_SECRET, "persisted-jwt");
   });
 });
 

@@ -10,6 +10,7 @@ import { bulkWebSessionImportSchema } from "../../src/shared/validation/schemas.
 import {
   requiresWebSessionCredential,
   getWebSessionCredentialRequirement,
+  canUpdateProviderApiKey,
   hasUsableWebSessionCredential,
   resolveWebSessionImportApiKey,
 } from "../../src/shared/providers/webSessionCredentials.ts";
@@ -157,6 +158,27 @@ describe("web-session credential helpers", () => {
   it("hasUsableWebSessionCredential validates token data correctly", () => {
     assert.equal(hasUsableWebSessionCredential("deepseek-web", { token: "my-token" }), true);
     assert.equal(hasUsableWebSessionCredential("deepseek-web", { token: "   " }), false);
+  });
+});
+
+describe("canUpdateProviderApiKey", () => {
+  it("preserves normal API-key credential updates", () => {
+    assert.equal(canUpdateProviderApiKey("apikey", "openai"), true);
+  });
+
+  it("allows token-kind web sessions stored with cookie authType", () => {
+    assert.equal(canUpdateProviderApiKey("cookie", "deepseek-web"), true);
+    assert.equal(canUpdateProviderApiKey("cookie", "zai-web"), true);
+  });
+
+  it("does not allow cookie-kind web sessions to update apiKey", () => {
+    assert.equal(canUpdateProviderApiKey("cookie", "chatgpt-web"), false);
+    assert.equal(canUpdateProviderApiKey("cookie", "claude-web"), false);
+  });
+
+  it("does not broaden non-cookie auth types", () => {
+    assert.equal(canUpdateProviderApiKey("oauth", "deepseek-web"), false);
+    assert.equal(canUpdateProviderApiKey(null, "deepseek-web"), false);
   });
 });
 

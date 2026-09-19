@@ -36,17 +36,11 @@ export const BUILTIN_EVENTS = [
   "onRequest",
   "onResponse",
   "onError",
-  "onModelSelect",
-  "onComboResolve",
-  "onRateLimit",
-  "onQuotaExhaust",
-  "onProviderError",
-  "onStreamStart",
-  "onStreamEnd",
   "onInstall",
   "onActivate",
   "onDeactivate",
   "onUninstall",
+  "onStreamComplete",
 ] as const;
 
 export type BuiltinEvent = (typeof BUILTIN_EVENTS)[number];
@@ -234,6 +228,11 @@ export interface PluginContext {
   model: string;
   provider: string;
   apiKeyInfo?: unknown;
+  /** Client request headers available at the call site. Optional — not all callers
+   *  have access to headers (e.g. internal triggers, retries). Exposed so
+   *  observability/trace-export plugins can read request-scoped context sent by the
+   *  client (trace ids, correlation ids, session markers). */
+  headers?: Record<string, string | string[] | undefined>;
   metadata: Record<string, unknown>;
 }
 
@@ -258,12 +257,73 @@ export interface Plugin {
   onActivate?: (payload: unknown) => Promise<void> | void;
   onDeactivate?: (payload: unknown) => Promise<void> | void;
   onUninstall?: (payload: unknown) => Promise<void> | void;
+  onStreamComplete?: (payload: PluginOnStreamCompletePayload) => Promise<void> | void;
+}
+
+// ── onStreamComplete event types ──
+
+export type PluginOnStreamCompletePayload = {
+  status: number;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    reasoning_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  };
+  timing?: {
+    latencyMs: number;
+    ttft?: number;
+  };
+  model?: string;
+  provider?: string;
+  errorCode?: string;
+};
+
+/**
+ * Run onStreamComplete hooks — fire-and-forget notification with usage/timing data.
+ * Called when an SSE stream is fully consumed and usage/timing data is available.
+ */
+export async function runOnStreamComplete(payload: PluginOnStreamCompletePayload): Promise<void> {
+  await emitHook("onStreamComplete", payload);
+}
+
+/**
+ * Reload plugins left active in the DB, once per process.
+ *
+ * The `hooks` map above is module state and does not survive a restart, while the DB
+ * keeps status='active' — so without this every active plugin silently stops applying
+ * after a reboot while the UI still reports it as active. Hooks are fail-open, so a
+ * plugin that exists to *block* traffic fails open.
+ *
+ * This lives on the request path on purpose. Booting it from instrumentation-node.ts
+ * does not work: Next.js gives instrumentation its own module graph, so its `hooks` map
+ * is a different instance from the one route handlers read. Verified — plugins loaded
+ * there register into a copy nothing consults, and leak an unused child process.
+ *
+ * The import is dynamic because manager.ts imports this module.
+ */
+let pluginBoot: Promise<void> | null = null;
+
+function ensurePluginsLoaded(): Promise<void> {
+  if (!pluginBoot) {
+    pluginBoot = (async () => {
+      const { pluginManager } = await import("./manager");
+      await pluginManager.loadAll();
+    })().catch((err: unknown) => {
+      // Retry on the next request rather than wedging every later call.
+      pluginBoot = null;
+      log.error("hooks.boot_failed", { error: err instanceof Error ? err.message : String(err) });
+    });
+  }
+  return pluginBoot;
 }
 
 /**
  * Run onRequest hooks — blocking. Plugins can modify body/metadata or block with 403.
  */
 export async function runOnRequest(ctx: PluginContext): Promise<PluginResult> {
+  await ensurePluginsLoaded();
   return emitHookBlocking("onRequest", ctx);
 }
 

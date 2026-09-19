@@ -1,7 +1,21 @@
 import { appendToolCallArgumentDelta } from "../utils/toolCallArguments.ts";
 import { shouldParseTextualReasoningTags } from "../handlers/responseSanitizer.ts";
+import { getReadableReasoningValue } from "../utils/reasoningFields.ts";
+import {
+  isInternalReasoningPlaceholder,
+  stripInternalReasoningPlaceholder,
+} from "../utils/reasoningPlaceholder.ts";
 import * as fs from "fs";
 import * as path from "path";
+
+// #10223: threshold for detecting corrupted request_id fields. Normal
+// request IDs are <100 chars. DeepSeek's SSE encoder bug produces 200+
+// char values with response-ID fragments. The 100-char gap between normal
+// (<100) and threshold (200) provides safety margin for providers that
+// use moderately longer IDs. The transformer never reads request_id, so
+// stripping it has no functional impact on the output.
+const CORRUPTED_REQUEST_ID_THRESHOLD = 200;
+
 /**
  * Responses API Transformer
  * Converts OpenAI Chat Completions SSE to Codex Responses API SSE format
@@ -30,6 +44,102 @@ async function getPath() {
     }
   }
   return _path || null;
+}
+
+type UsageRecord = Record<string, unknown>;
+
+function usageRecord(value: unknown): UsageRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as UsageRecord)
+    : {};
+}
+
+function usageNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function usageDetails(record: UsageRecord, ...keys: string[]): UsageRecord {
+  for (const key of keys) {
+    const value = usageRecord(record[key]);
+    if (Object.keys(value).length > 0) return value;
+  }
+  return {};
+}
+
+/** Normalize Chat Completions and Responses usage into the Responses API shape. */
+function normalizeResponsesUsage(previous: unknown, raw: unknown): UsageRecord | null {
+  const source = usageRecord(raw);
+  if (Object.keys(source).length === 0) return usageRecord(previous);
+
+  const before = usageRecord(previous);
+  const beforeInputDetails = usageDetails(before, "input_tokens_details", "prompt_tokens_details");
+  const beforeOutputDetails = usageDetails(
+    before,
+    "output_tokens_details",
+    "completion_tokens_details"
+  );
+  const inputDetails = usageDetails(
+    source,
+    "input_tokens_details",
+    "prompt_tokens_details",
+    "inputTokenDetails",
+    "input_token_details"
+  );
+  const outputDetails = usageDetails(
+    source,
+    "output_tokens_details",
+    "completion_tokens_details",
+    "outputTokenDetails",
+    "output_token_details",
+    "reasoningTokenDetails",
+    "reasoning_token_details"
+  );
+
+  const inputTokens =
+    usageNumber(source.input_tokens) ??
+    usageNumber(source.prompt_tokens) ??
+    usageNumber(source.inputTokens) ??
+    usageNumber(source.promptTokens) ??
+    usageNumber(before.input_tokens) ??
+    usageNumber(before.prompt_tokens) ??
+    0;
+  const cachedTokens =
+    usageNumber(source.cache_read_input_tokens) ??
+    usageNumber(source.cached_input_tokens) ??
+    usageNumber(source.cachedInputTokens) ??
+    usageNumber(source.cached_tokens) ??
+    usageNumber(inputDetails.cached_tokens) ??
+    usageNumber(inputDetails.cachedTokens) ??
+    usageNumber(inputDetails.cacheReadTokens) ??
+    usageNumber(beforeInputDetails.cached_tokens) ??
+    0;
+  const outputTokens =
+    usageNumber(source.output_tokens) ??
+    usageNumber(source.completion_tokens) ??
+    usageNumber(source.outputTokens) ??
+    usageNumber(source.completionTokens) ??
+    usageNumber(before.output_tokens) ??
+    usageNumber(before.completion_tokens) ??
+    0;
+  const reasoningTokens =
+    usageNumber(source.reasoning_tokens) ??
+    usageNumber(source.reasoningTokens) ??
+    usageNumber(outputDetails.reasoning_tokens) ??
+    usageNumber(outputDetails.reasoningTokens) ??
+    usageNumber(beforeOutputDetails.reasoning_tokens) ??
+    0;
+  const totalTokens =
+    usageNumber(source.total_tokens) ??
+    usageNumber(source.totalTokens) ??
+    inputTokens + outputTokens;
+
+  return {
+    input_tokens: inputTokens,
+    input_tokens_details: { cached_tokens: cachedTokens },
+    output_tokens: outputTokens,
+    output_tokens_details: { reasoning_tokens: reasoningTokens },
+    total_tokens: totalTokens,
+  };
 }
 
 // Create log directory for responses (Node.js only)
@@ -75,9 +185,16 @@ export function createResponsesLogger(model, logsDir = null) {
 /**
  * Create TransformStream that converts Chat Completions SSE to Responses API SSE
  * @param {Object} logger - Optional logger instance
+ * @param {number} keepaliveIntervalMs - Keepalive interval in milliseconds
+ * @param {{ customToolNames?: Iterable<string> }} options - Original Responses tool metadata
  * @returns {TransformStream}
  */
-export function createResponsesApiTransformStream(logger = null, keepaliveIntervalMs = 3000) {
+export function createResponsesApiTransformStream(
+  logger = null,
+  keepaliveIntervalMs = 3000,
+  options: { customToolNames?: Iterable<string> } = {}
+) {
+  const customToolNames = new Set(options.customToolNames || []);
   const state = {
     seq: 0,
     responseId: `resp_${Date.now()}`,
@@ -97,8 +214,16 @@ export function createResponsesApiTransformStream(logger = null, keepaliveInterv
     funcArgsBuf: {},
     funcNames: {},
     funcCallIds: {},
+    funcItemAdded: {},
+    funcItemTypes: {},
     funcArgsDone: {},
     funcItemDone: {},
+    // Cached at first computation (see toolCallOutputIndexBase) so every
+    // added/delta/done event for a given tool call — including ones emitted
+    // later from the finish_reason handler or flush(), where the reasoning/
+    // message state used to derive the base is no longer meaningful to
+    // recompute — shares exactly the same output_index.
+    funcOutputIndex: {} as Record<string, number>,
     completedOutputItems: [] as Array<{
       output_index: number;
       item: Record<string, unknown>;
@@ -108,9 +233,18 @@ export function createResponsesApiTransformStream(logger = null, keepaliveInterv
     completedSent: false,
     usage: null,
     keepaliveTimer: null,
+    // #6906: true once a finish_reason chunk closed all output items but deferred
+    // response.completed — a trailing usage-only chunk (choices: [], usage: {...}) may
+    // still arrive for stream_options.include_usage=true upstreams.
+    awaitingTrailingUsage: false,
   };
 
   const encoder = new TextEncoder();
+  // #10223: a stream:false TextDecoder recreated per transform() chunk has no
+  // cross-call state, so a multi-byte UTF-8 character (CJK/emoji) split across
+  // two TCP chunks got truncated to U+FFFD, corrupting the deltas. A single
+  // persistent decoder with { stream: true } carries pending bytes between chunks.
+  const decoder = new TextDecoder();
   const nextSeq = () => ++state.seq;
 
   // Normalize output_index to a non-negative integer (replaces fragile parseInt calls)
@@ -266,46 +400,127 @@ export function createResponsesApiTransformStream(logger = null, keepaliveInterv
     }
   };
 
+  // Tool calls sit after reasoning (if any) AND after a text message (if one
+  // was actually emitted this turn). The provider's own tool_calls[].index is
+  // scoped only to the tool_calls array and legitimately restarts at 0 — using
+  // it directly as the Responses API output_index collides with whatever
+  // reasoning/message item already claimed that slot, and a client that
+  // tracks response items by output_index silently drops the tool call.
+  //
+  // Computed once per tcIdx (from the chunk's own choice index, `chunkIdx`)
+  // and cached in state.funcOutputIndex so every added/delta/done event for
+  // that call — including ones emitted later from the finish_reason handler
+  // or flush(), which have no fresh chunk/reasoning/message state to
+  // recompute from — shares exactly the same output_index.
+  const computeToolCallOutputIndex = (chunkIdx, tcIdx) => {
+    if (state.funcOutputIndex[tcIdx] === undefined) {
+      const msgIdx = state.reasoningId ? state.reasoningIndex + 1 : chunkIdx;
+      const base = state.msgItemAdded[msgIdx] ? msgIdx + 1 : msgIdx;
+      state.funcOutputIndex[tcIdx] = base + normalizeOutputIndex(tcIdx);
+    }
+    return state.funcOutputIndex[tcIdx];
+  };
+
+  const emitToolCallAdded = (controller, idx) => {
+    if (state.funcItemAdded[idx] || !state.funcCallIds[idx]) return false;
+
+    const customTool = customToolNames.has(state.funcNames[idx] || "");
+    const itemType = customTool ? "custom_tool_call" : "function_call";
+    state.funcItemTypes[idx] = itemType;
+    state.funcItemAdded[idx] = true;
+
+    emit(controller, "response.output_item.added", {
+      type: "response.output_item.added",
+      output_index: state.funcOutputIndex[idx],
+      item: {
+        id: `fc_${state.funcCallIds[idx]}`,
+        type: itemType,
+        ...(customTool ? { input: "" } : { arguments: "" }),
+        call_id: state.funcCallIds[idx],
+        name: state.funcNames[idx] || "",
+        ...(customTool ? { status: "in_progress" } : {}),
+      },
+    });
+    return true;
+  };
+
   const closeToolCall = (controller, idx, recordAsCompleted = true) => {
     const callId = state.funcCallIds[idx];
     if (callId && !state.funcItemDone[idx]) {
-      const normalizedIndex = normalizeOutputIndex(idx);
+      const normalizedIndex = state.funcOutputIndex[idx];
       let args = state.funcArgsBuf[idx] || "{}";
+      const toolName = state.funcNames[idx] || "";
+      emitToolCallAdded(controller, idx);
+      const isCustomTool = state.funcItemTypes[idx] === "custom_tool_call";
 
-      // Fix #1674 & #1852: Final cleanup of empty string and empty array placeholders
-      try {
-        const parsed = JSON.parse(args);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          let modified = false;
-          for (const [k, v] of Object.entries(parsed)) {
-            if (v === "" || (Array.isArray(v) && v.length === 0)) {
-              delete parsed[k];
-              modified = true;
+      // Fix #1674 & #1852: Final cleanup of empty string and empty array placeholders.
+      // Custom-tool input is intentionally allowed to be an empty string.
+      if (!isCustomTool) {
+        try {
+          const parsed = JSON.parse(args);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            let modified = false;
+            for (const [k, v] of Object.entries(parsed)) {
+              if (v === "" || (Array.isArray(v) && v.length === 0)) {
+                delete parsed[k];
+                modified = true;
+              }
+            }
+            if (modified) {
+              args = JSON.stringify(parsed);
+              state.funcArgsBuf[idx] = args;
             }
           }
-          if (modified) {
-            args = JSON.stringify(parsed);
-            state.funcArgsBuf[idx] = args;
-          }
+        } catch (e) {
+          // Ignore malformed JSON
         }
-      } catch (e) {
-        // Ignore malformed JSON
       }
 
-      emit(controller, "response.function_call_arguments.done", {
-        type: "response.function_call_arguments.done",
-        item_id: `fc_${callId}`,
-        output_index: normalizedIndex,
-        arguments: args,
-      });
+      let funcItem;
+      if (isCustomTool) {
+        let rawInput = args;
+        try {
+          const parsed = JSON.parse(args);
+          if (parsed && typeof parsed.input === "string") rawInput = parsed.input;
+        } catch {
+          // A non-JSON argument is already the raw custom-tool input.
+        }
 
-      const funcItem = {
-        id: `fc_${callId}`,
-        type: "function_call",
-        arguments: args,
-        call_id: callId,
-        name: state.funcNames[idx] || "",
-      };
+        emit(controller, "response.custom_tool_call_input.delta", {
+          type: "response.custom_tool_call_input.delta",
+          item_id: `fc_${callId}`,
+          output_index: normalizedIndex,
+          delta: rawInput,
+        });
+        emit(controller, "response.custom_tool_call_input.done", {
+          type: "response.custom_tool_call_input.done",
+          item_id: `fc_${callId}`,
+          output_index: normalizedIndex,
+          input: rawInput,
+        });
+        funcItem = {
+          id: `fc_${callId}`,
+          type: "custom_tool_call",
+          input: rawInput,
+          call_id: callId,
+          name: toolName,
+          status: "completed",
+        };
+      } else {
+        emit(controller, "response.function_call_arguments.done", {
+          type: "response.function_call_arguments.done",
+          item_id: `fc_${callId}`,
+          output_index: normalizedIndex,
+          arguments: args,
+        });
+        funcItem = {
+          id: `fc_${callId}`,
+          type: "function_call",
+          arguments: args,
+          call_id: callId,
+          name: toolName,
+        };
+      }
 
       emit(controller, "response.output_item.done", {
         type: "response.output_item.done",
@@ -376,7 +591,7 @@ export function createResponsesApiTransformStream(logger = null, keepaliveInterv
         (state.keepaliveTimer as { unref?: () => void })?.unref?.();
       },
       transform(chunk, controller) {
-        const text = new TextDecoder().decode(chunk);
+        const text = decoder.decode(chunk, { stream: true });
         logger?.logInput(text.trim());
         state.buffer += text;
 
@@ -399,9 +614,30 @@ export function createResponsesApiTransformStream(logger = null, keepaliveInterv
             continue;
           }
 
+          // #10223: strip request_id when it looks corrupted (suspiciously
+          // long — normal request IDs are <100 chars). Some providers
+          // (DeepSeek) have SSE encoder bugs that leak response-ID fragments
+          // into this field, producing 200+ char values. Well-behaved
+          // providers' request_id is preserved.
+          if (
+            typeof parsed.request_id === "string" &&
+            parsed.request_id.length >= CORRUPTED_REQUEST_ID_THRESHOLD
+          ) {
+            logger?.logInput(
+              `[ResponsesTransformer] stripped corrupted request_id (${parsed.request_id.length} chars)`
+            );
+            delete parsed.request_id;
+          }
+
+          if (parsed.usage) {
+            state.usage = normalizeResponsesUsage(state.usage, parsed.usage);
+          }
+
           if (!parsed.choices?.length) {
-            if (parsed.usage) {
-              state.usage = parsed.usage;
+            // #6906: trailing usage-only chunk after finish_reason already deferred
+            // completion — send it now with the usage just captured above.
+            if (state.awaitingTrailingUsage && !state.completedSent) {
+              sendCompleted(controller);
             }
             continue;
           }
@@ -446,101 +682,115 @@ export function createResponsesApiTransformStream(logger = null, keepaliveInterv
             });
           }
 
-          // Handle reasoning_content (OpenAI native format)
-          if (delta.reasoning_content) {
+          // Handle OpenAI-compatible reasoning fields. Some providers use the
+          // standard `reasoning_content` key while others use the string alias
+          // `reasoning`; prefer the standard key when both are present.
+          const reasoning = getReadableReasoningValue(delta);
+          if (reasoning && !isInternalReasoningPlaceholder(reasoning)) {
             startReasoning(controller, idx);
-            emitReasoningDelta(controller, delta.reasoning_content);
+            emitReasoningDelta(controller, reasoning);
           }
 
           // Handle text content. Generic prompt-format tags are visible text;
           // only tag-native models opt into textual reasoning extraction.
+          // Strip the internal reasoning placeholder if the model echoed it
+          // through ordinary content (#8081). Only the text-content emission
+          // is skipped when nothing meaningful remains — this must NOT skip
+          // this message's tool_calls / finish_reason handling below, so we
+          // gate the whole block on strippedContent instead of returning /
+          // continuing out of the msg loop early.
           if (delta.content) {
-            // Close reasoning if it was opened via native reasoning_content
-            // and is still open, before emitting message content. Without this
-            // the reasoning item is never closed and the message reuses the
-            // reasoning output_index, producing a protocol-invalid stream.
-            if (
-              state.reasoningId &&
-              !state.reasoningDone &&
-              (!parseTextualReasoningTags || !state.inThinking)
-            ) {
-              closeReasoning(controller);
-            }
-
-            let content = delta.content;
-
-            if (parseTextualReasoningTags) {
-              if (content.includes("<think>")) {
-                state.inThinking = true;
-                content = content.replaceAll("<think>", "");
-                startReasoning(controller, idx);
-              }
-
-              if (content.includes("</think>")) {
-                const parts = content.split("</think>");
-                const thinkPart = parts[0];
-                const textPart = parts.slice(1).join("</think>");
-
-                if (thinkPart) emitReasoningDelta(controller, thinkPart);
+            const strippedContent = stripInternalReasoningPlaceholder(delta.content);
+            if (strippedContent) {
+              // Close reasoning if it was opened via native reasoning_content
+              // and is still open, before emitting message content. Without this
+              // the reasoning item is never closed and the message reuses the
+              // reasoning output_index, producing a protocol-invalid stream.
+              if (
+                state.reasoningId &&
+                !state.reasoningDone &&
+                (!parseTextualReasoningTags || !state.inThinking)
+              ) {
                 closeReasoning(controller);
-                state.inThinking = false;
-                content = textPart;
               }
 
-              if (state.inThinking && content) {
-                emitReasoningDelta(controller, content);
-                continue;
-              }
-            }
+              let content = strippedContent;
 
-            // Regular text content
-            if (content) {
-              // Use a distinct output_index for the message when reasoning was
-              // emitted, so the message item does not collide with the
-              // reasoning item's output_index.
-              const msgIdx = state.reasoningId ? state.reasoningIndex + 1 : idx;
+              if (parseTextualReasoningTags) {
+                if (content.includes("<think>")) {
+                  state.inThinking = true;
+                  content = content.replaceAll("<think>", "");
+                  startReasoning(controller, idx);
+                }
 
-              // Fix for #1211: Strip leading double-newlines / blank spaces from the very first text chunk
-              if (!state.msgTextBuf[msgIdx]) {
-                content = content.trimStart();
-              }
+                if (content.includes("</think>")) {
+                  const parts = content.split("</think>");
+                  const thinkPart = parts[0];
+                  const textPart = parts.slice(1).join("</think>");
 
-              if (!content) continue;
+                  if (thinkPart) emitReasoningDelta(controller, thinkPart);
+                  closeReasoning(controller);
+                  state.inThinking = false;
+                  content = textPart;
+                }
 
-              if (!state.msgItemAdded[msgIdx]) {
-                state.msgItemAdded[msgIdx] = true;
-                const msgId = `msg_${state.responseId}_${msgIdx}`;
-
-                emit(controller, "response.output_item.added", {
-                  type: "response.output_item.added",
-                  output_index: msgIdx,
-                  item: { id: msgId, type: "message", content: [], role: "assistant" },
-                });
+                if (state.inThinking && content) {
+                  emitReasoningDelta(controller, content);
+                  // Pre-existing behaviour (unrelated to #8081): a still-open
+                  // textual <think> block ends this message's handling early.
+                  continue;
+                }
               }
 
-              if (!state.msgContentAdded[msgIdx]) {
-                state.msgContentAdded[msgIdx] = true;
+              // Regular text content
+              if (content) {
+                // Use a distinct output_index for the message when reasoning was
+                // emitted, so the message item does not collide with the
+                // reasoning item's output_index.
+                const msgIdx = state.reasoningId ? state.reasoningIndex + 1 : idx;
 
-                emit(controller, "response.content_part.added", {
-                  type: "response.content_part.added",
+                // Fix for #1211: Strip leading double-newlines / blank spaces from the very first text chunk
+                if (!state.msgTextBuf[msgIdx]) {
+                  content = content.trimStart();
+                }
+
+                if (!content) continue;
+
+                if (!state.msgItemAdded[msgIdx]) {
+                  state.msgItemAdded[msgIdx] = true;
+                  const msgId = `msg_${state.responseId}_${msgIdx}`;
+
+                  emit(controller, "response.output_item.added", {
+                    type: "response.output_item.added",
+                    output_index: msgIdx,
+                    item: { id: msgId, type: "message", content: [], role: "assistant" },
+                  });
+                }
+
+                if (!state.msgContentAdded[msgIdx]) {
+                  state.msgContentAdded[msgIdx] = true;
+
+                  emit(controller, "response.content_part.added", {
+                    type: "response.content_part.added",
+                    item_id: `msg_${state.responseId}_${msgIdx}`,
+                    output_index: msgIdx,
+                    content_index: 0,
+                    part: { type: "output_text", annotations: [], logprobs: [], text: "" },
+                  });
+                }
+
+                emit(controller, "response.output_text.delta", {
+                  type: "response.output_text.delta",
                   item_id: `msg_${state.responseId}_${msgIdx}`,
                   output_index: msgIdx,
                   content_index: 0,
-                  part: { type: "output_text", annotations: [], logprobs: [], text: "" },
+                  delta: content,
+                  logprobs: [],
                 });
+
+                if (!state.msgTextBuf[msgIdx]) state.msgTextBuf[msgIdx] = "";
+                state.msgTextBuf[msgIdx] += content;
               }
-
-              emit(controller, "response.output_text.delta", {
-                type: "response.output_text.delta",
-                item_id: `msg_${state.responseId}_${msgIdx}`,
-                output_index: msgIdx,
-                content_index: 0,
-                delta: content,
-                logprobs: [],
-              });
-
-              if (!state.msgTextBuf[msgIdx]) state.msgTextBuf[msgIdx] = "";
-              state.msgTextBuf[msgIdx] += content;
             }
           }
 
@@ -556,6 +806,7 @@ export function createResponsesApiTransformStream(logger = null, keepaliveInterv
 
             for (const tc of delta.tool_calls) {
               const tcIdx = tc.index ?? 0;
+              const outputIndex = computeToolCallOutputIndex(idx, tcIdx);
               const newCallId = tc.id;
               const funcName = tc.function?.name;
 
@@ -567,26 +818,39 @@ export function createResponsesApiTransformStream(logger = null, keepaliveInterv
                 delete state.funcCallIds[tcIdx];
                 delete state.funcNames[tcIdx];
                 delete state.funcArgsBuf[tcIdx];
+                delete state.funcItemAdded[tcIdx];
+                delete state.funcItemTypes[tcIdx];
                 delete state.funcArgsDone[tcIdx];
                 delete state.funcItemDone[tcIdx];
+                // Deliberately keep funcOutputIndex[tcIdx]: the replacement call
+                // reuses the same positional slot, so it should keep the same
+                // output_index rather than recomputing (which could drift if
+                // msgItemAdded state shifted mid-turn).
               }
 
               if (funcName) state.funcNames[tcIdx] = funcName;
 
               if (!state.funcCallIds[tcIdx] && newCallId) {
                 state.funcCallIds[tcIdx] = newCallId;
+              }
 
-                emit(controller, "response.output_item.added", {
-                  type: "response.output_item.added",
-                  output_index: tcIdx,
-                  item: {
-                    id: `fc_${newCallId}`,
-                    type: "function_call",
-                    arguments: "",
-                    call_id: newCallId,
-                    name: state.funcNames[tcIdx] || "",
-                  },
-                });
+              // The provider may send the call id before the function name. Defer the
+              // lifecycle item until the name is available so custom calls are not first
+              // announced as function calls.
+              if (state.funcCallIds[tcIdx] && state.funcNames[tcIdx]) {
+                const itemAdded = emitToolCallAdded(controller, tcIdx);
+                if (
+                  itemAdded &&
+                  state.funcItemTypes[tcIdx] !== "custom_tool_call" &&
+                  state.funcArgsBuf[tcIdx]
+                ) {
+                  emit(controller, "response.function_call_arguments.delta", {
+                    type: "response.function_call_arguments.delta",
+                    item_id: `fc_${state.funcCallIds[tcIdx]}`,
+                    output_index: outputIndex,
+                    delta: state.funcArgsBuf[tcIdx],
+                  });
+                }
               }
 
               if (!state.funcArgsBuf[tcIdx]) state.funcArgsBuf[tcIdx] = "";
@@ -613,11 +877,16 @@ export function createResponsesApiTransformStream(logger = null, keepaliveInterv
                 const emittedDelta = nextArgs.slice(existingArgs.length);
                 state.funcArgsBuf[tcIdx] = nextArgs;
 
-                if (refCallId && emittedDelta) {
+                if (
+                  refCallId &&
+                  emittedDelta &&
+                  state.funcItemAdded[tcIdx] &&
+                  state.funcItemTypes[tcIdx] !== "custom_tool_call"
+                ) {
                   emit(controller, "response.function_call_arguments.delta", {
                     type: "response.function_call_arguments.delta",
                     item_id: `fc_${refCallId}`,
-                    output_index: tcIdx,
+                    output_index: outputIndex,
                     delta: emittedDelta,
                   });
                 }
@@ -630,12 +899,28 @@ export function createResponsesApiTransformStream(logger = null, keepaliveInterv
             for (const i in state.msgItemAdded) closeMessage(controller, i);
             closeReasoning(controller);
             for (const i in state.funcCallIds) closeToolCall(controller, i);
-            sendCompleted(controller);
+            if (state.usage) {
+              // Usage already captured — either it arrived in this same chunk, or an
+              // earlier usage-bearing chunk already populated state.usage. Either way
+              // there is nothing left to wait for, so complete right away.
+              sendCompleted(controller);
+            } else {
+              // #6906: defer response.completed — a trailing usage-only chunk may
+              // still arrive (stream_options.include_usage=true). The empty-choices
+              // branch above (or flush() at stream end, as a fallback) actually
+              // calls sendCompleted().
+              state.awaitingTrailingUsage = true;
+            }
           }
         }
       },
 
       flush(controller) {
+        // #10223: stream-end flush — drain any bytes the persistent decoder is
+        // still holding. With { stream:true } complete multi-byte chars are
+        // emitted within transform(), so normally there is nothing left; this
+        // only releases a terminating truncated byte and frees the decoder.
+        state.buffer += decoder.decode();
         // Clear keepalive timer
         if (state.keepaliveTimer) {
           clearInterval(state.keepaliveTimer);

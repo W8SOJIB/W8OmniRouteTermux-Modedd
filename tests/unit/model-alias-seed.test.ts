@@ -15,7 +15,7 @@ const { DEFAULT_MODEL_ALIAS_SEED, seedDefaultModelAliases } =
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -25,7 +25,7 @@ test.beforeEach(async () => {
 
 test.after(async () => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("default model alias seed writes missing aliases and is idempotent", async () => {
@@ -34,17 +34,22 @@ test("default model alias seed writes missing aliases and is idempotent", async 
 
   assert.deepEqual(first.failed, []);
   assert.equal(first.applied.length, Object.keys(DEFAULT_MODEL_ALIAS_SEED).length);
-  assert.equal(aliases["gemini-3-pro-high"], "agy/gemini-3.1-pro-high");
-  assert.equal(aliases["gemini-3-pro-low"], "agy/gemini-3.1-pro-low");
-  assert.equal(aliases["gemini-3-pro-preview"], "agy/gemini-pro-agent");
-  assert.equal(aliases["gemini-3.1-pro-preview"], "agy/gemini-pro-agent");
-  assert.equal(aliases["gemini-3-flash-preview"], "agy/gemini-3.5-flash-medium");
+  assert.equal(aliases["gemini-3.1-pro"], "agy/gemini-pro-agent");
+  assert.equal(aliases["gemini-3-pro-high"], undefined);
+  assert.equal(aliases["gemini-3-pro-low"], undefined);
+  assert.equal(aliases["gemini-3-pro-preview"], undefined);
+  assert.equal(aliases["gemini-3.1-pro-preview"], undefined);
+  assert.equal(aliases["gemini-3-flash-preview"], undefined);
 
-  const routed = await sseModelService.getModelInfo("gemini-3-pro-high");
+  const routed = await sseModelService.getModelInfo("gemini-3.1-pro");
+  // The stored alias target is "agy/gemini-pro-agent", but getModelInfo canonicalizes
+  // the "agy" alias to its provider id "antigravity" (ALIAS_TO_PROVIDER_ID, #8013).
+  // supportsThinking is surfaced from the registry's supportsReasoning flag since #9485.
   assert.deepEqual(routed, {
-    provider: "agy",
-    model: "gemini-3.1-pro-high",
+    provider: "antigravity",
+    model: "gemini-pro-agent",
     extendedContext: false,
+    supportsThinking: true,
   });
 
   const second = await seedDefaultModelAliases();
@@ -54,7 +59,8 @@ test("default model alias seed writes missing aliases and is idempotent", async 
 });
 
 test("default model alias seed preserves existing aliases and skips invalid entries", async () => {
-  await modelsDb.setModelAlias("gemini-3-pro-high", "custom/provider-model");
+  await modelsDb.setModelAlias("gemini-3.1-pro", "custom/canonical-model");
+  await modelsDb.setModelAlias("gemini-3-pro-low", "custom/legacy-model");
 
   const warnings = [];
   const result = await seedDefaultModelAliases({
@@ -68,8 +74,64 @@ test("default model alias seed preserves existing aliases and skips invalid entr
   });
   const aliases = await modelsDb.getModelAliases();
 
-  assert.equal(aliases["gemini-3-pro-high"], "custom/provider-model");
-  assert.ok(result.skipped.includes("gemini-3-pro-high"));
+  assert.equal(aliases["gemini-3.1-pro"], "custom/canonical-model");
+  assert.equal(aliases["gemini-3-pro-low"], "custom/legacy-model");
+  assert.ok(result.skipped.includes("gemini-3.1-pro"));
+  assert.equal(result.removed.includes("gemini-3-pro-low"), false);
   assert.ok(result.failed.includes("broken-entry"));
   assert.ok(warnings.some((message) => message.includes("broken-entry")));
+});
+
+test("default model alias seed replaces superseded Gemini Pro aliases with 3.1 Pro", async () => {
+  await modelsDb.setModelAlias("gemini-3-pro-high", "agy/gemini-3.1-pro-high");
+  await modelsDb.setModelAlias("gemini-3-pro-low", "agy/gemini-3.1-pro-low");
+  await modelsDb.setModelAlias("gemini-3-pro-preview", "agy/gemini-pro-agent");
+  await modelsDb.setModelAlias("gemini-3.1-pro-preview", "agy/gemini-pro-agent");
+
+  const result = await seedDefaultModelAliases();
+  const aliases = await modelsDb.getModelAliases();
+
+  assert.deepEqual(result.removed.sort(), [
+    "gemini-3-pro-high",
+    "gemini-3-pro-low",
+    "gemini-3-pro-preview",
+    "gemini-3.1-pro-preview",
+  ]);
+  assert.ok(result.applied.includes("gemini-3.1-pro"));
+  assert.equal(aliases["gemini-3.1-pro"], "agy/gemini-pro-agent");
+  assert.equal(aliases["gemini-3-pro-high"], undefined);
+  assert.equal(aliases["gemini-3-pro-low"], undefined);
+  assert.equal(aliases["gemini-3-pro-preview"], undefined);
+  assert.equal(aliases["gemini-3.1-pro-preview"], undefined);
+});
+
+test("default model alias seed removes the short-lived Pro High alias", async () => {
+  await modelsDb.setModelAlias("gemini-3-pro-high", "agy/gemini-pro-agent");
+
+  const result = await seedDefaultModelAliases();
+  const aliases = await modelsDb.getModelAliases();
+
+  assert.ok(result.removed.includes("gemini-3-pro-high"));
+  assert.equal(aliases["gemini-3-pro-high"], undefined);
+  assert.equal(aliases["gemini-3.1-pro"], "agy/gemini-pro-agent");
+});
+
+test("default model alias seed removes the retired Gemini Flash default alias", async () => {
+  await modelsDb.setModelAlias("gemini-3-flash-preview", "agy/gemini-3.5-flash-medium");
+
+  const result = await seedDefaultModelAliases();
+  const aliases = await modelsDb.getModelAliases();
+
+  assert.deepEqual(result.removed, ["gemini-3-flash-preview"]);
+  assert.equal(aliases["gemini-3-flash-preview"], undefined);
+});
+
+test("default model alias seed preserves a customized retired alias", async () => {
+  await modelsDb.setModelAlias("gemini-3-flash-preview", "custom/provider-model");
+
+  const result = await seedDefaultModelAliases();
+  const aliases = await modelsDb.getModelAliases();
+
+  assert.deepEqual(result.removed, []);
+  assert.equal(aliases["gemini-3-flash-preview"], "custom/provider-model");
 });

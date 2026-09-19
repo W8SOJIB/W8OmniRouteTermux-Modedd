@@ -1,3 +1,13 @@
+import {
+  CLAUDE_CODE_CLIENT_BILLING_VERSION,
+  CLAUDE_CODE_CLIENT_BUILD_REVISION,
+  CLAUDE_CODE_CLIENT_VERSION,
+  CLAUDE_CODE_RUNTIME_VERSION,
+  CLAUDE_CODE_SDK_PACKAGE_VERSION,
+  getClaudeCodeUserAgent,
+} from "@/shared/constants/claudeCodeClient";
+import { modelSupportsContext1mBeta } from "../config/context1m.ts";
+
 export const ANTHROPIC_VERSION_HEADER = "2023-06-01";
 
 const ANTHROPIC_BETA_BASE = Object.freeze([
@@ -15,6 +25,8 @@ const ANTHROPIC_BETA_BASE = Object.freeze([
   "advisor-tool-2026-03-01",
   "extended-cache-ttl-2025-04-11",
   "cache-diagnosis-2026-04-07",
+  "code-execution-2025-08-25",
+  "skills-2025-10-02",
 ]);
 
 const CLAUDE_OAUTH_EXTRA_BETAS = Object.freeze(["fine-grained-tool-streaming-2025-05-14"]);
@@ -34,9 +46,24 @@ export const ANTHROPIC_BETA_CLAUDE_OAUTH = [
  * claude.ai backend on top of OmniRoute's own set. Kept to betas the backend
  * actually accepts and that OmniRoute does not otherwise emit — so a blind
  * passthrough cannot reintroduce the over-sending fingerprint/rejection bugs
- * (#3415, #2454). Currently: deferred-tool negotiation (#3974).
+ * (#3415, #2454). Currently: deferred-tool negotiation (#3974) and the
+ * client's own `[1m]` long-context negotiation (context-1m). selectBetaFlags
+ * deliberately emits context-1m only for Opus (never FORCE it — long-context
+ * credit gate); forwarding it when the CLIENT negotiated it matches what real
+ * Claude Code sends for `/model <id>[1m]` and is required for >200K-context
+ * requests on models/accounts where the beta is enforced.
  */
-export const FORWARDABLE_CLIENT_BETAS = Object.freeze(["tool-search-tool-2025-10-19"]);
+export const FORWARDABLE_CLIENT_BETAS = Object.freeze([
+  "tool-search-tool-2025-10-19",
+  "context-1m-2025-08-07",
+  "code-execution-2025-08-25",
+  "skills-2025-10-02",
+  // effort-2025-11-24 is a client-negotiated beta (Claude Code sends it on every
+  // request). selectBetaFlags no longer force-adds it as a side-effect of the ATU
+  // gate (#9505), so a client that sent it must keep it through the merge —
+  // otherwise its effort negotiation is silently dropped.
+  "effort-2025-11-24",
+]);
 
 /**
  * Union an `anthropic-beta` comma-list with the allowlisted client-negotiated
@@ -44,11 +71,21 @@ export const FORWARDABLE_CLIENT_BETAS = Object.freeze(["tool-search-tool-2025-10
  * case-insensitive). The client beta is added only if it is on `allow`, so this
  * never forces betas the client did not request nor leaks betas the backend
  * rejects. See #3974 (tool-search-tool dropped on the Claude OAuth path).
+ *
+ * `model` (optional) gate: when a resolved upstream model is supplied and it does
+ * NOT support the long-context beta, `context-1m-2025-08-07` is dropped from the
+ * merged allowlist instead of being forwarded blind. Combo/fallback
+ * can re-route a request whose client negotiated `[1m]` for a more capable sibling
+ * onto a model that does not qualify (e.g. a Haiku) — Anthropic rejects the beta
+ * there with "long context beta is not yet available for this subscription"
+ * (#10119). When no model is supplied (legacy callers without model resolution),
+ * the prior forwarding behavior is preserved.
  */
 export function mergeClientAnthropicBeta(
   base: string,
   clientBeta: string | null | undefined,
-  allow: readonly string[] = FORWARDABLE_CLIENT_BETAS
+  allow: readonly string[] = FORWARDABLE_CLIENT_BETAS,
+  model?: string | null
 ): string {
   const baseList = base
     .split(",")
@@ -56,7 +93,14 @@ export function mergeClientAnthropicBeta(
     .filter(Boolean);
   if (typeof clientBeta !== "string" || !clientBeta.trim()) return baseList.join(",");
   const seen = new Set(baseList.map((s) => s.toLowerCase()));
-  const allowSet = new Set(allow.map((s) => s.toLowerCase()));
+  const allowList = allow
+    .map((s) => s.toLowerCase())
+    .filter((lower) => {
+      if (lower !== "context-1m-2025-08-07") return true;
+      if (model === undefined || model === null || model === "") return true;
+      return modelSupportsContext1mBeta(model);
+    });
+  const allowSet = new Set(allowList);
   for (const token of clientBeta
     .split(",")
     .map((s) => s.trim())
@@ -121,7 +165,9 @@ export function normalizeAnthropicHeaderVariants(headers: Record<string, string>
   }
 }
 
-export const CLAUDE_CLI_VERSION = "2.1.195";
-export const CLAUDE_CLI_USER_AGENT = `claude-cli/${CLAUDE_CLI_VERSION} (external, cli)`;
-export const CLAUDE_CLI_STAINLESS_PACKAGE_VERSION = "0.94.0";
-export const CLAUDE_CLI_STAINLESS_RUNTIME_VERSION = "v24.3.0";
+export const CLAUDE_CLI_VERSION = CLAUDE_CODE_CLIENT_VERSION;
+export const CLAUDE_CLI_BUILD_REVISION = CLAUDE_CODE_CLIENT_BUILD_REVISION;
+export const CLAUDE_CLI_BILLING_VERSION = CLAUDE_CODE_CLIENT_BILLING_VERSION;
+export const CLAUDE_CLI_USER_AGENT = getClaudeCodeUserAgent("cli");
+export const CLAUDE_CLI_STAINLESS_PACKAGE_VERSION = CLAUDE_CODE_SDK_PACKAGE_VERSION;
+export const CLAUDE_CLI_STAINLESS_RUNTIME_VERSION = CLAUDE_CODE_RUNTIME_VERSION;

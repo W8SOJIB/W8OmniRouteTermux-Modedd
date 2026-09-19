@@ -1,86 +1,330 @@
-# CLI Tools Setup Guide — OmniRoute (हिन्दी (IN))
+# CLI-TOOLS (Bahasa Indonesia (Alt))
 
-🌐 **Languages:** 🇺🇸 [English](../../../../docs/CLI-TOOLS.md) · 🇪🇸 [es](../../es/docs/CLI-TOOLS.md) · 🇫🇷 [fr](../../fr/docs/CLI-TOOLS.md) · 🇩🇪 [de](../../de/docs/CLI-TOOLS.md) · 🇮🇹 [it](../../it/docs/CLI-TOOLS.md) · 🇷🇺 [ru](../../ru/docs/CLI-TOOLS.md) · 🇨🇳 [zh-CN](../../zh-CN/docs/CLI-TOOLS.md) · 🇯🇵 [ja](../../ja/docs/CLI-TOOLS.md) · 🇰🇷 [ko](../../ko/docs/CLI-TOOLS.md) · 🇸🇦 [ar](../../ar/docs/CLI-TOOLS.md) · 🇮🇳 [hi](../../hi/docs/CLI-TOOLS.md) · 🇮🇳 [in](../../in/docs/CLI-TOOLS.md) · 🇹🇭 [th](../../th/docs/CLI-TOOLS.md) · 🇻🇳 [vi](../../vi/docs/CLI-TOOLS.md) · 🇮🇩 [id](../../id/docs/CLI-TOOLS.md) · 🇲🇾 [ms](../../ms/docs/CLI-TOOLS.md) · 🇳🇱 [nl](../../nl/docs/CLI-TOOLS.md) · 🇵🇱 [pl](../../pl/docs/CLI-TOOLS.md) · 🇸🇪 [sv](../../sv/docs/CLI-TOOLS.md) · 🇳🇴 [no](../../no/docs/CLI-TOOLS.md) · 🇩🇰 [da](../../da/docs/CLI-TOOLS.md) · 🇫🇮 [fi](../../fi/docs/CLI-TOOLS.md) · 🇵🇹 [pt](../../pt/docs/CLI-TOOLS.md) · 🇷🇴 [ro](../../ro/docs/CLI-TOOLS.md) · 🇭🇺 [hu](../../hu/docs/CLI-TOOLS.md) · 🇧🇬 [bg](../../bg/docs/CLI-TOOLS.md) · 🇸🇰 [sk](../../sk/docs/CLI-TOOLS.md) · 🇺🇦 [uk-UA](../../uk-UA/docs/CLI-TOOLS.md) · 🇮🇱 [he](../../he/docs/CLI-TOOLS.md) · 🇵🇭 [phi](../../phi/docs/CLI-TOOLS.md) · 🇧🇷 [pt-BR](../../pt-BR/docs/CLI-TOOLS.md) · 🇨🇿 [cs](../../cs/docs/CLI-TOOLS.md) · 🇹🇷 [tr](../../tr/docs/CLI-TOOLS.md)
-
----
-
-This guide explains how to install and configure all supported AI coding CLI tools
-to use **OmniRoute** as the unified backend, giving you centralized key management,
-cost tracking, model switching, and request logging across every tool.
+🌐 **Languages:** 🇺🇸 [English](../../../../reference/CLI-TOOLS.md) · 🇸🇦 [ar](../../../ar/docs/reference/CLI-TOOLS.md) · 🇦🇿 [az](../../../az/docs/reference/CLI-TOOLS.md) · 🇧🇬 [bg](../../../bg/docs/reference/CLI-TOOLS.md) · 🇧🇩 [bn](../../../bn/docs/reference/CLI-TOOLS.md) · 🇨🇿 [cs](../../../cs/docs/reference/CLI-TOOLS.md) · 🇩🇰 [da](../../../da/docs/reference/CLI-TOOLS.md) · 🇩🇪 [de](../../../de/docs/reference/CLI-TOOLS.md) · 🇪🇸 [es](../../../es/docs/reference/CLI-TOOLS.md) · 🇮🇷 [fa](../../../fa/docs/reference/CLI-TOOLS.md) · 🇫🇮 [fi](../../../fi/docs/reference/CLI-TOOLS.md) · 🇫🇷 [fr](../../../fr/docs/reference/CLI-TOOLS.md) · 🇮🇳 [gu](../../../gu/docs/reference/CLI-TOOLS.md) · 🇮🇱 [he](../../../he/docs/reference/CLI-TOOLS.md) · 🇮🇳 [hi](../../../hi/docs/reference/CLI-TOOLS.md) · 🇭🇺 [hu](../../../hu/docs/reference/CLI-TOOLS.md) · 🇮🇩 [id](../../../id/docs/reference/CLI-TOOLS.md) · 🇮🇹 [it](../../../it/docs/reference/CLI-TOOLS.md) · 🇯🇵 [ja](../../../ja/docs/reference/CLI-TOOLS.md) · 🇰🇷 [ko](../../../ko/docs/reference/CLI-TOOLS.md) · 🇮🇳 [mr](../../../mr/docs/reference/CLI-TOOLS.md) · 🇲🇾 [ms](../../../ms/docs/reference/CLI-TOOLS.md) · 🇳🇱 [nl](../../../nl/docs/reference/CLI-TOOLS.md) · 🇳🇴 [no](../../../no/docs/reference/CLI-TOOLS.md) · 🇵🇭 [phi](../../../phi/docs/reference/CLI-TOOLS.md) · 🇵🇱 [pl](../../../pl/docs/reference/CLI-TOOLS.md) · 🇵🇹 [pt](../../../pt/docs/reference/CLI-TOOLS.md) · 🇧🇷 [pt-BR](../../../pt-BR/docs/reference/CLI-TOOLS.md) · 🇷🇴 [ro](../../../ro/docs/reference/CLI-TOOLS.md) · 🇷🇺 [ru](../../../ru/docs/reference/CLI-TOOLS.md) · 🇸🇰 [sk](../../../sk/docs/reference/CLI-TOOLS.md) · 🇸🇪 [sv](../../../sv/docs/reference/CLI-TOOLS.md) · 🇰🇪 [sw](../../../sw/docs/reference/CLI-TOOLS.md) · 🇮🇳 [ta](../../../ta/docs/reference/CLI-TOOLS.md) · 🇮🇳 [te](../../../te/docs/reference/CLI-TOOLS.md) · 🇹🇭 [th](../../../th/docs/reference/CLI-TOOLS.md) · 🇹🇷 [tr](../../../tr/docs/reference/CLI-TOOLS.md) · 🇺🇦 [uk-UA](../../../uk-UA/docs/reference/CLI-TOOLS.md) · 🇵🇰 [ur](../../../ur/docs/reference/CLI-TOOLS.md) · 🇻🇳 [vi](../../../vi/docs/reference/CLI-TOOLS.md) · 🇨🇳 [zh-CN](../../../zh-CN/docs/reference/CLI-TOOLS.md) · 🇹🇼 [zh-TW](../../../zh-TW/docs/reference/CLI-TOOLS.md)
 
 ---
 
-## How It Works
+---
+
+title: "Alat CLI — OmniRoute"
+version: 3.8.50
+lastUpdated: 2026-08-18
+---
+
+# Alat CLI — OmniRoute
+
+Terakhir diperbarui: 2026-08-18
+
+OmniRoute terintegrasi dengan tiga kategori alat CLI yang tersebar di tiga halaman dasbor khusus:
+
+| Halaman      | Rute                    | Konsep                                                                              | Jumlah         |
+| ------------ | ----------------------- | ----------------------------------------------------------------------------------- | -------------- |
+| **Kode CLI** | `/dashboard/cli-code`   | Alat pengkodean yang Anda arahkan ke OmniRoute (Klien → CLI → OmniRoute → Penyedia) | 26             |
+| **Agen CLI** | `/dashboard/cli-agents` | Agen otonom yang Anda arahkan ke OmniRoute (alur yang sama, cakupan lebih luas)     | 8              |
+| **Agen ACP** | `/dashboard/acp-agents` | CLI yang diluncurkan OmniRoute sebagai backend melalui stdio/ACP (alur terbalik)    | lihat registri |
+
+Rute warisan mengalihkan melalui 308: `/dashboard/cli-tools` → `/dashboard/cli-code`, `/dashboard/agents` → `/dashboard/acp-agents`.
+
+---
+
+## Cara Kerjanya
 
 ```
-Claude / Codex / OpenCode / Cline / KiloCode / Continue / Kiro / Cursor / Copilot
+Kode CLI / Agen CLI (alur konsumsi):
+Claude / Codex / OpenCode / Cline / KiloCode / Continue / Hermes Agent / Goose / ...
            │
-           ▼  (all point to OmniRoute)
+           ▼  (semua mengarah ke OmniRoute)
     http://YOUR_SERVER:20128/v1
            │
-           ▼  (OmniRoute routes to the right provider)
+           ▼  (OmniRoute mengarahkan ke penyedia yang tepat)
     Anthropic / OpenAI / Gemini / DeepSeek / Groq / Mistral / ...
+
+Agen ACP (alur peluncuran terbalik):
+    Permintaan Klien → OmniRoute → meluncurkan CLI melalui stdio/ACP → respons
 ```
 
-**Benefits:**
+**Manfaat:**
 
-- One API key to manage all tools
-- Cost tracking across all CLIs in the dashboard
-- Model switching without reconfiguring every tool
-- Works locally and on remote servers (VPS)
-
----
-
-## Supported Tools (Dashboard Source of Truth)
-
-The dashboard cards in `/dashboard/cli-tools` are generated from `src/shared/constants/cliTools.ts`.
-Current list (v3.0.0-rc.16):
-
-| Tool               | ID            | Command    | Setup Mode | Install Method |
-| ------------------ | ------------- | ---------- | ---------- | -------------- |
-| **Claude Code**    | `claude`      | `claude`   | env        | npm            |
-| **OpenAI Codex**   | `codex`       | `codex`    | custom     | npm            |
-| **Factory Droid**  | `droid`       | `droid`    | custom     | bundled/CLI    |
-| **OpenClaw**       | `openclaw`    | `openclaw` | custom     | bundled/CLI    |
-| **Cursor**         | `cursor`      | app        | guide      | desktop app    |
-| **Cline**          | `cline`       | `cline`    | custom     | npm            |
-| **Kilo Code**      | `kilo`        | `kilocode` | custom     | npm            |
-| **Continue**       | `continue`    | extension  | guide      | VS Code        |
-| **Antigravity**    | `antigravity` | internal   | mitm       | OmniRoute      |
-| **GitHub Copilot** | `copilot`     | extension  | custom     | VS Code        |
-| **OpenCode**       | `opencode`    | `opencode` | guide      | npm            |
-| **Kiro AI**        | `kiro`        | app/cli    | mitm       | desktop/CLI    |
-| **Qwen Code**      | `qwen`        | `qwen`     | custom     | npm            |
-
-### CLI fingerprint sync (Agents + Settings)
-
-`/dashboard/agents` and `Settings > CLI Fingerprint` use `src/shared/constants/cliCompatProviders.ts`.
-This keeps provider IDs aligned with CLI cards and legacy IDs.
-
-| CLI ID                                                                                               | Fingerprint Provider ID |
-| ---------------------------------------------------------------------------------------------------- | ----------------------- |
-| `kilo`                                                                                               | `kilocode`              |
-| `copilot`                                                                                            | `github`                |
-| `claude` / `codex` / `antigravity` / `kiro` / `cursor` / `cline` / `opencode` / `droid` / `openclaw` | same ID                 |
-
-Legacy IDs still accepted for compatibility: `copilot`, `kimi-coding`, `qwen`.
+- Satu kunci API untuk mengelola semua alat
+- Pelacakan biaya di semua CLI di dasbor
+- Pergantian model tanpa mengonfigurasi ulang setiap alat
+- Bekerja secara lokal dan di server jarak jauh (VPS, Docker, Akamai, Cloudflare Tunnel)
 
 ---
 
-## Step 1 — Get an OmniRoute API Key
+## Konfigurasi otomatis dengan `setup-*`
 
-1. Open the OmniRoute dashboard → **API Manager** (`/dashboard/api-manager`)
-2. Click **Create API Key**
-3. Give it a name (e.g. `cli-tools`) and select all permissions
-4. Copy the key — you'll need it for every CLI below
+Anda tidak perlu menulis konfigurasi setiap alat dengan tangan. OmniRoute menyediakan perintah `setup-*`
+untuk setiap CLI yang didukung yang membaca katalog model **langsung** dari OmniRoute yang berjalan
+(lokal atau jarak jauh) dan menulis konfigurasi alat itu sendiri di mesin Anda:
 
-> Your key looks like: `sk-xxxxxxxxxxxxxxxx-xxxxxxxxx`
+```bash
+omniroute setup-codex        omniroute setup-claude       omniroute setup-opencode
+omniroute setup-cline        omniroute setup-kilo         omniroute setup-continue
+omniroute setup-cursor       omniroute setup-roo          omniroute setup-crush
+omniroute setup-goose        omniroute setup-qwen         omniroute setup-aider
+```
+
+Setiap perintah menerima `--remote <url> --api-key <key>` (mengonfigurasi alat lokal terhadap
+OmniRoute jarak jauh), `--dry-run` (prabaca tanpa menulis), dan `--port`. Alat
+tanpa penemuan model otomatis (Cline, Kilo, Roo, Goose, Aider, Qwen) menggunakan
+`--model <id>` (dan `--yes` untuk eksekusi non-interaktif). Untuk meluncurkan CLI dengan
+lingkungan yang tepat disuntikkan dan tanpa konfigurasi yang ditulis sama sekali, gunakan
+peluncur generik `omniroute run <target>` (claude, codex, aider, goose, opencode, qwen,
+gemini — target dan alias berasal dari `bin/cli/cli-manifest.mjs`); peluncur per-alat warisan
+`omniroute launch` (Claude Code) dan `omniroute launch-codex`
+(Codex) tetap tersedia. CLI Gemini hanya untuk peluncuran: ini adalah target `omniroute run`
+tetapi tidak memiliki resep `setup-*`/`configure`.
+
+> **Referensi lengkap:** tabel master — apa yang ditulis setiap perintah, setiap bendera,
+> lokal vs jarak jauh, dan alat mana yang memerlukan akhiran `/v1` — ada di
+> **[Integrasi CLI](../guides/CLI-INTEGRATIONS.md)**.
+
+### Menjalankan ini di dalam kontainer
+
+Perintah `setup-*` yang dieksekusi di dalam kontainer OmniRoute menulis ke
+rumah kontainer itu sendiri, yang tidak dibaca oleh CLI host dan yang menghilang dengan
+kontainer. OmniRoute mendeteksi hal itu dan keluar dengan `2` dengan instruksi daripada
+menulis. Dua cara yang didukung untuk melanjutkan — instal CLI di host dan
+`omniroute connect` ke kontainer, atau bind-mount direktori konfigurasi dan set
+`CLI_CONFIG_HOME` (profil `host` compose). Setiap perintah `setup-*`, ditambah
+`omniroute configure` dan `omniroute config set`, menerima
+`--allow-container-write` ketika mengonfigurasi CLI kontainer itu sendiri adalah yang sebenarnya Anda maksud; `OMNIROUTE_ALLOW_CONTAINER_CONFIG_WRITE=true` melakukan hal yang sama untuk
+server. Lihat
+[Panduan Docker → Mengonfigurasi alat CLI host](../guides/DOCKER_GUIDE.md#configuring-host-cli-tools-when-omniroute-runs-in-docker).
+
+**Endpoint terapkan** di dasbor (`POST /api/cli-tools/apply`) menerapkan
+penjagaan yang sama: di dalam kontainer, penulisan yang targetnya tidak bind-mounted dari
+host menjawab **`422`** dengan `containerEphemeralTarget: true`, teks kesalahan yang aman
+dan — untuk alat dengan resep host (claude, codex, opencode, cline,
+kilo, continue) — sebuah `hostSetupCommand` (misalnya `omniroute setup-opencode`) untuk dijalankan
+di host sebagai gantinya; tidak ada yang ditulis. `dryRun: true` tetap berfungsi dalam mode
+kontainer dan mengembalikan konten yang dihasilkan + jalur target tanpa menyentuh disk, sehingga
+Anda dapat prabaca dari dasbor dan menerapkan di host. Perilaku ini
+sengaja dan dilindungi regresi oleh
+`tests/unit/api/cli-tools/apply-container-guard.test.ts` — jangan pernah "memperbaiki" 422
+dengan menghapus penjagaan.
+
+## Sumber Kebenaran
+
+Katalog terpadu berada di `src/shared/constants/cliTools.ts` sebagai `CLI_TOOLS: Record<string, CliCatalogEntry>`.
+
+Setiap entri memiliki bidang-bidang berikut (didefinisikan di `src/shared/schemas/cliCatalog.ts`):
+
+| Bidang                                          | Tipe                                                         | Deskripsi                                                    |
+| ----------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| `category`                                      | `"code" \| "agent"`                                          | Halaman mana alat tersebut muncul                            |
+| `vendor`                                        | `string`                                                     | Asal alat ("Anthropic", "OSS (P. Gauthier)")                 |
+| `acpSpawnable`                                  | `boolean`                                                    | Juga dapat digunakan sebagai ACP Agent (lencana ditampilkan) |
+| `baseUrlSupport`                                | `"full" \| "partial" \| "none"`                              | Tingkat dukungan endpoint kustom. `"none"` = backlog MITM    |
+| `configType`                                    | `"env" \| "custom" \| "guide" \| "custom-builder" \| "mitm"` | Mekanisme konfigurasi                                        |
+| `id`, `name`, `color`, `description`, `docsUrl` | standar                                                      | Bidang tampilan inti                                         |
+
+Entri dengan `baseUrlSupport: "none"` **tidak ditampilkan** di halaman dasbor — mereka terdaftar di backlog MITM untuk rencana 11 (lihat `_tasks/features-v3.8.6/refactorpages/_orchestration/_plan11-mitm-backlog.md`).
+
+### Tingkatan Kapabilitas (tercatalog × terdeteksi × terkonfigurasi × dapat diluncurkan)
+
+Tidak setiap alat yang tercatalog dapat terdeteksi, terkonfigurasi, atau dapat diluncurkan. Setiap tingkatan memiliki satu sumber deklarasi, dan tes drift menjaga mereka tetap selaras:
+
+| Tingkatan        | Arti                                                                    | Dideklarasikan di                                                 |
+| ---------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| **Cataloged**    | Muncul di katalog dasbor (nama, vendor, dokumen, tipe konfigurasi)      | `src/shared/constants/cliTools.ts` (`CLI_TOOLS`)                  |
+| **Detectable**   | Deteksi biner/konfigurasi, pemeriksaan kesehatan, jalur konfigurasi     | `src/shared/services/cliRuntime.ts` (`CLI_TOOLS` runtime catalog) |
+| **Configurable** | Didukung oleh `omniroute configure <cli>` (resep pengaturan ada)        | `bin/cli/cli-manifest.mjs` (`configure: true`)                    |
+| **Launchable**   | Didukung oleh `omniroute run <target>` (injeksi env/args didefinisikan) | `bin/cli/cli-manifest.mjs` (`run: true`)                          |
+
+`bin/cli/cli-manifest.mjs` adalah manifest eksekusi kanonik untuk perintah CLI yang muncul: `run`, `configure` dan generator penyelesaian shell semuanya mengambil daftar target, resolusi alias (misalnya `kilocode`/`kilo-code`/`kilo_cli` → `kilo`) dan pengkabelan flag `--model` darinya. Penjaga drift `tests/unit/cli/cli-manifest-drift.test.ts` memastikan bahwa manifest, katalog runtime, katalog UI, dan setiap permukaan konsumen tetap sinkron — target yang ditambahkan ke satu permukaan tanpa yang lainnya akan gagal dalam suite alih-alih mengalir diam-diam.
+
+## 1. Katalog Kode CLI (26 alat)
+
+Semua alat yang muncul di `/dashboard/cli-code`. Alat yang memiliki `baseUrlSupport: none` terhubung melalui MITM atau panduan manual alih-alih URL dasar kustom:
+
+| id           | nama                       | vendor                         | baseUrlSupport | configType     | acpSpawnable |
+| ------------ | -------------------------- | ------------------------------ | -------------- | -------------- | ------------ |
+| claude       | Claude Code                | Anthropic                      | penuh          | env            | true         |
+| codex        | OpenAI Codex CLI           | OpenAI                         | penuh          | kustom         | true         |
+| zcode        | ZCode (Rencana Koding GLM) | Z.ai                           | tidak ada      | kustom         | false        |
+| cline        | Cline                      | OSS (mantan-Pengembang Claude) | penuh          | kustom         | true         |
+| kilo         | Kilo Code                  | Kilo-Org                       | penuh          | kustom         | false        |
+| roo          | Roo Code                   | Roo (OSS)                      | penuh          | panduan        | false        |
+| continue     | Continue                   | continue.dev                   | penuh          | panduan        | false        |
+| aider        | Aider                      | OSS (P. Gauthier)              | penuh          | panduan        | true         |
+| forge        | ForgeCode                  | Antinomy HQ                    | penuh          | kustom         | true         |
+| jcode        | jcode                      | 1jehuang (OSS)                 | penuh          | kustom         | false        |
+| deepseek-tui | DeepSeek TUI               | Hunter Bown (OSS)              | penuh          | kustom         | false        |
+| codewhale    | CodeWhale                  | Hmbown (OSS)                   | penuh          | kustom         | false        |
+| opencode     | OpenCode                   | Anomaly (mantan-SST)           | penuh          | panduan        | true         |
+| droid        | Factory Droid              | Factory AI                     | sebagian       | panduan        | false        |
+| copilot      | GitHub Copilot CLI         | GitHub/MS                      | penuh          | kustom         | false        |
+| cursor-cli   | Cursor CLI                 | Anysphere                      | sebagian       | panduan        | true         |
+| smelt        | Smelt                      | leonardcser (OSS)              | penuh          | kustom         | false        |
+| pi           | Pi (agen-koding-pi)        | M. Zechner (OSS)               | penuh          | kustom         | false        |
+| grok-build   | Grok Build                 | xAI                            | penuh          | kustom         | false        |
+| crush        | Crush                      | OSS (Charm)                    | penuh          | kustom         | false        |
+| qwen         | Qwen Code                  | Alibaba                        | penuh          | panduan        | true         |
+| cursor       | Cursor                     | Anysphere                      | tidak ada      | panduan        | false        |
+| antigravity  | Antigravity                | Google                         | tidak ada      | mitm           | false        |
+| hermes       | Hermes                     | Nous Research                  | tidak ada      | panduan        | false        |
+| kiro         | Kiro AI                    | Amazon                         | tidak ada      | mitm           | false        |
+| custom       | Custom CLI                 | —                              | penuh          | pembuat-kustom | false        |
+
+Alat dengan `baseUrlSupport: "partial"` menunjukkan lencana "⚠ Base URL parcial" di kartu dasbor.
+
+## 2. Katalog Agen CLI (8 alat)
+
+Agen otonom yang muncul di `/dashboard/cli-agents`:
+
+| id           | nama             | vendor                   | dukunganBaseUrl | dapatDibuatACP |
+| ------------ | ---------------- | ------------------------ | --------------- | -------------- |
+| hermes-agent | Hermes Agent     | Nous Research            | penuh           | false          |
+| openclaw     | OpenClaw         | OSS (P. Steinberger)     | penuh           | true           |
+| goose        | Goose            | Block / Linux Foundation | penuh           | true           |
+| interpreter  | Open Interpreter | OSS                      | penuh           | true           |
+| warp         | Warp AI          | Warp Inc.                | sebagian        | true           |
+| agent-deck   | Agent Deck       | asheshgoplani (OSS)      | penuh           | false          |
+| omp          | Oh My Pi         | OSS                      | penuh           | true           |
+| letta        | Letta CLI        | Letta                    | penuh           | false          |
 
 ---
 
-## Step 2 — Install CLI Tools
+## 3. Agen ACP (/dashboard/acp-agents)
 
-All npm-based tools require Node.js 18+:
+Halaman ini (yang diganti namanya dari `/dashboard/agents`) menunjukkan CLI yang dapat **dibuat** oleh OmniRoute sebagai mesin eksekusi backend melalui protokol stdio/ACP. Katalog ini dikelola secara terpisah di `src/lib/acp/registry.ts` dan **tidak** sama dengan `CLI_TOOLS`.
+
+---
+
+## 4. Daftar Tugas MITM (tidak ditampilkan di dasbor)
+
+CLI berikut tidak mendukung URL dasar kustom secara native dan **tidak terdaftar** di halaman Kode CLI atau Agen CLI. Mereka adalah kandidat untuk intersepsi MITM dalam rencana 11:
+
+| CLI                 | Alasan                                                            |
+| ------------------- | ----------------------------------------------------------------- |
+| windsurf            | BYOK terbatas pada model Claude tertentu + URL/token perusahaan   |
+| amp                 | Ekosistem tertutup (Sourcegraph)                                  |
+| amazon-q / kiro-cli | Autentikasi AWS SSO, tidak ada URL kustom                         |
+| cowork              | Anthropic Desktop, tidak ada titik akhir yang dapat dikonfigurasi |
+
+Lihat `_tasks/features-v3.8.6/refactorpages/_orchestration/_plan11-mitm-backlog.md` untuk referensi silang lengkap.
+
+---
+
+## 5. API Deteksi Batch
+
+Semua deteksi alat digabungkan melalui satu titik akhir:
+
+**`GET /api/cli-tools/all-statuses`**
+
+- Auth: `requireCliToolsAuth(request)` (sama seperti rute `/api/cli-tools/` lainnya)
+- Mengembalikan: `Record<toolId, ToolBatchStatus>` (tipe: `src/shared/types/cliBatchStatus.ts`)
+- Strategi: `Promise.all` untuk semua alat, timeout 5s per alat
+- Cache: dalam memori LRU yang diindeks oleh file konfigurasi `mtime`. Cache tidak valid ketika mtime berubah. Reset saat server di-restart.
+
+Bentuk respons per alat:
+
+```ts
+interface ToolBatchStatus {
+  detection: {
+    installed: boolean;
+    runnable: boolean;
+    version?: string;
+    command?: string;
+    commandPath?: string;
+    reason?: string;
+  };
+  config: {
+    status: "configured" | "not_configured" | "not_installed" | "unknown" | "other";
+    endpoint?: string | null;
+    lastConfiguredAt?: string | null;
+  };
+  error?: string; // disanitasi, tidak ada jejak tumpukan
+}
+```
+
+## 6. Pengatur Pengaturan untuk Alat Baru
+
+Alat baru dengan `configType: "custom"` memiliki rute API pengaturan yang didedikasikan:
+
+| Rute                                        | Alat                                                                  |
+| ------------------------------------------- | --------------------------------------------------------------------- |
+| `POST /api/cli-tools/forge-settings`        | ForgeCode (.forge.toml)                                               |
+| `POST /api/cli-tools/jcode-settings`        | jcode (--base-url flag)                                               |
+| `POST /api/cli-tools/deepseek-tui-settings` | DeepSeek TUI (OPENAI_BASE_URL, legacy)                                |
+| `POST /api/cli-tools/codewhale-settings`    | CodeWhale (OPENAI_BASE_URL, primary + legacy `~/.deepseek` sync)      |
+| `POST /api/cli-tools/smelt-settings`        | Smelt                                                                 |
+| `POST /api/cli-tools/pi-settings`           | Agen pengkodean Pi                                                    |
+| `POST /api/cli-tools/grok-build-settings`   | Grok Build (~/.grok/config.toml, `[model.omniroute]`)                 |
+| `POST /api/cli-tools/qwen-settings`         | Qwen Code (`~/.qwen/settings.json` + kunci `.env` yang didedikasikan) |
+
+Semua rute menggunakan `sanitizeErrorMessage()` untuk respons kesalahan (Aturan Keras #12).
+
+---
+
+## 7. Arsitektur Halaman Dasbor
+
+### Kode CLI (`/dashboard/cli-code`)
+
+- `src/app/(dashboard)/dashboard/cli-code/page.tsx` — komponen server
+- `src/app/(dashboard)/dashboard/cli-code/CliCodePageClient.tsx` — grid klien
+- `src/app/(dashboard)/dashboard/cli-code/[id]/page.tsx` — halaman detail alat
+- `src/app/(dashboard)/dashboard/cli-code/components/` — 12 kartu alat khusus + `ToolDetailClient.tsx`
+
+### Agen CLI (`/dashboard/cli-agents`)
+
+- `src/app/(dashboard)/dashboard/cli-agents/page.tsx` — komponen server
+- `src/app/(dashboard)/dashboard/cli-agents/CliAgentsPageClient.tsx` — grid klien
+- `src/app/(dashboard)/dashboard/cli-agents/[id]/page.tsx` — menggunakan kembali `ToolDetailClient`
+
+### Agen ACP (`/dashboard/acp-agents`)
+
+- `src/app/(dashboard)/dashboard/acp-agents/page.tsx` — komponen server (dipindahkan dari `agents/`)
+
+### Komponen UI Bersama (`src/shared/components/cli/`)
+
+| File                    | Tujuan                                                 |
+| ----------------------- | ------------------------------------------------------ |
+| `CliToolCard.tsx`       | Kartu status pintar (deteksi + konfigurasi + endpoint) |
+| `CliConceptCard.tsx`    | Kartu penjelasan konsep per halaman                    |
+| `CliComparisonCard.tsx` | Perbandingan tiga kolom di berbagai jenis CLI          |
+| `BaseUrlSelect.tsx`     | Dropdown endpoint (Lokal/Awan/Kustom)                  |
+| `ApiKeySelect.tsx`      | Pemilih kunci API                                      |
+| `ManualConfigModal.tsx` | Modal cuplikan konfigurasi yang dapat disalin          |
+
+### Hook Bersama (`src/shared/hooks/cli/`)
+
+| File                      | Tujuan                                                                    |
+| ------------------------- | ------------------------------------------------------------------------- |
+| `useToolBatchStatuses.ts` | Mengambil `/api/cli-tools/all-statuses`, mengelola status loading/refresh |
+
+## 8. i18n
+
+Namespace baru ditambahkan dalam rencana 14 F9:
+
+| Namespace   | Tujuan                                                                              |
+| ----------- | ----------------------------------------------------------------------------------- |
+| `cliCommon` | String yang dibagikan (label kartu, teks konsep/perbandingan, label halaman detail) |
+| `cliCode`   | String halaman CLI Code                                                             |
+| `cliAgents` | String halaman CLI Agents                                                           |
+| `acpAgents` | String halaman ACP Agents                                                           |
+
+Terjemahan lengkap PT-BR dan EN disediakan. 39 lokal lainnya secara otomatis menggunakan EN melalui penggabungan tingkat namespace di `src/i18n/request.ts`.
+
+---
+
+## 9. Memulai dengan Cepat
+
+### Langkah 1 — Dapatkan Kunci API OmniRoute
+
+1. Buka `/dashboard/api-manager` → **Buat Kunci API**
+2. Beri nama (misalnya `cli-tools`) dan pilih semua izin
+3. Salin kunci tersebut — Anda akan membutuhkannya untuk setiap CLI di bawah ini
+
+> Kunci Anda terlihat seperti: `sk-xxxxxxxxxxxxxxxx-xxxxxxxxx`
+
+---
+
+### Langkah 2 — Instal Alat CLI
+
+Semua alat berbasis npm memerlukan Node.js 22.22.2+ atau 24.x:
 
 ```bash
 # Claude Code (Anthropic)
@@ -98,96 +342,135 @@ npm install -g cline
 # KiloCode
 npm install -g kilocode
 
-# Kiro CLI (Amazon — requires curl + unzip)
-apt-get install -y unzip   # on Debian/Ubuntu
-curl -fsSL https://cli.kiro.dev/install | bash
-export PATH="$HOME/.local/bin:$PATH"   # add to ~/.bashrc
-```
+# Qwen Code
+npm install -g @qwen-code/qwen-code
 
-**Verify:**
+# Google Gemini CLI (dapat diluncurkan melalui `omniroute run gemini` → /v1beta surface)
+npm install -g @google/gemini-cli
 
-```bash
-claude --version     # 2.x.x
-codex --version      # 0.x.x
-opencode --version   # x.x.x
-cline --version      # 2.x.x
-kilocode --version   # x.x.x (or: kilo --version)
-kiro-cli --version   # 1.x.x
+# Aider
+pip install aider-chat
+
+# Smelt
+cargo install smelt  # Berbasis Rust
+
+# Agen pemrograman Pi
+# lihat https://github.com/zechnerj/pi-coding-agent untuk instalasi
+
+# jcode
+# lihat https://github.com/1jehuang/jcode untuk instalasi
 ```
 
 ---
 
-## Step 3 — Set Global Environment Variables
+### Langkah 3 — Konfigurasi melalui Dashboard
 
-Add to `~/.bashrc` (or `~/.zshrc`), then run `source ~/.bashrc`:
+1. Pergi ke `http://localhost:20128/dashboard/cli-code`
+2. Temukan alat Anda di grid
+3. Klik kartu untuk membuka halaman detail alat
+4. Pilih kunci API dan URL dasar Anda
+5. Klik **Terapkan Konfigurasi** atau salin potongan konfigurasi manual
+
+---
+
+### Langkah 4 — Atur Variabel Lingkungan Global
 
 ```bash
 # OmniRoute Universal Endpoint
 export OPENAI_BASE_URL="http://localhost:20128/v1"
 export OPENAI_API_KEY="sk-your-omniroute-key"
-export ANTHROPIC_BASE_URL="http://localhost:20128/v1"
-export ANTHROPIC_API_KEY="sk-your-omniroute-key"
-export GEMINI_BASE_URL="http://localhost:20128/v1"
+export ANTHROPIC_BASE_URL="http://localhost:20128"
+export ANTHROPIC_AUTH_TOKEN="sk-your-omniroute-key"
+# Gemini CLI membaca GOOGLE_GEMINI_BASE_URL di ROOT (SDK-nya menambahkan /v1beta/... sendiri)
+export GOOGLE_GEMINI_BASE_URL="http://localhost:20128"
 export GEMINI_API_KEY="sk-your-omniroute-key"
 ```
 
-> For a **remote server** replace `localhost:20128` with the server IP or domain,
-> e.g. `http://192.168.0.15:20128`.
+> Untuk **server jarak jauh** ganti `localhost:20128` dengan IP atau domain server,
+> misalnya `http://<your-server-ip>:20128`.
 
 ---
 
-## Step 4 — Configure Each Tool
+### Langkah 4 — Konfigurasi Setiap Alat
 
-### Claude Code
+#### Claude Code
 
 ```bash
-# Via CLI:
-claude config set --global api-base-url http://localhost:20128/v1
-
-# Or create ~/.claude/settings.json:
+# Buat ~/.claude/settings.json:
 mkdir -p ~/.claude && cat > ~/.claude/settings.json << EOF
 {
-  "apiBaseUrl": "http://localhost:20128/v1",
-  "apiKey": "sk-your-omniroute-key"
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:20128",
+    "ANTHROPIC_AUTH_TOKEN": "sk-your-omniroute-key"
+  }
 }
 EOF
 ```
 
-**Test:** `claude "say hello"`
+Gunakan root gateway Anthropic yang terpadu untuk Claude Code. Jangan tambahkan `/v1` di sini.
+
+**Uji:** `claude "say hello"`
 
 ---
 
-### OpenAI Codex
+#### OpenAI Codex
+
+Codex modern (v0.137+) hanya membaca `~/.codex/config.toml` — `config.yaml` lama milik CLI npm warisan dan diabaikan tanpa suara. Kunci API tetap di variabel lingkungan `OMNIROUTE_API_KEY` (`env_key`), tidak pernah di dalam file:
 
 ```bash
-mkdir -p ~/.codex && cat > ~/.codex/config.yaml << EOF
-model: auto
-apiKey: sk-your-omniroute-key
-apiBaseUrl: http://localhost:20128/v1
+mkdir -p ~/.codex && cat > ~/.codex/config.toml << EOF
+model_provider = "omniroute"
+
+[model_providers.omniroute]
+name                 = "OmniRoute"
+base_url             = "http://localhost:20128/v1"
+env_key              = "OMNIROUTE_API_KEY"
+requires_openai_auth = false
+EOF
+export OMNIROUTE_API_KEY="sk-your-omniroute-key"
+```
+
+Referensi lengkap (profil, `wire_api`, jendela konteks): [CODEX-CLI-CONFIGURATION.md](../guides/CODEX-CLI-CONFIGURATION.md).
+
+**Uji:** `codex "what is 2+2?"`
+
+---
+
+#### OpenCode
+
+```bash
+mkdir -p ~/.config/opencode && cat > ~/.config/opencode/opencode.json << EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "omniroute": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OmniRoute",
+      "options": {
+        "baseURL": "http://localhost:20128/v1",
+        "apiKey": "sk-your-omniroute-key"
+      },
+      "models": {
+        "claude-sonnet-4-5": { "name": "claude-sonnet-4-5" },
+        "claude-sonnet-4-5-thinking": { "name": "claude-sonnet-4-5-thinking" },
+        "gemini-3-flash": { "name": "gemini-3-flash" }
+      }
+    }
+  }
+}
 EOF
 ```
 
-**Test:** `codex "what is 2+2?"`
+**Uji:** `opencode`
+
+> Gunakan `opencode run "your prompt" --model omniroute/claude-sonnet-4-5-thinking --variant high`
+> untuk mengirim varian berpikir.
 
 ---
 
-### OpenCode
+#### Cline (CLI atau VS Code)
 
-```bash
-mkdir -p ~/.config/opencode && cat > ~/.config/opencode/config.toml << EOF
-[provider.openai]
-base_url = "http://localhost:20128/v1"
-api_key = "sk-your-omniroute-key"
-EOF
-```
-
-**Test:** `opencode`
-
----
-
-### Cline (CLI or VS Code)
-
-**CLI mode:**
+**Mode CLI:**
 
 ```bash
 mkdir -p ~/.cline/data && cat > ~/.cline/data/globalState.json << EOF
@@ -199,22 +482,22 @@ mkdir -p ~/.cline/data && cat > ~/.cline/data/globalState.json << EOF
 EOF
 ```
 
-**VS Code mode:**
-Cline extension settings → API Provider: `OpenAI Compatible` → Base URL: `http://localhost:20128/v1`
+**Mode VS Code:**
+Pengaturan ekstensi Cline → Penyedia API: `OpenAI Compatible` → URL Dasar: `http://localhost:20128/v1`
 
-Or use the OmniRoute dashboard → **CLI Tools → Cline → Apply Config**.
+Atau gunakan dashboard OmniRoute → **CLI Tools → Cline → Terapkan Konfigurasi**.
 
 ---
 
-### KiloCode (CLI or VS Code)
+#### KiloCode (CLI atau VS Code)
 
-**CLI mode:**
+**Mode CLI:**
 
 ```bash
 kilocode --api-base http://localhost:20128/v1 --api-key sk-your-omniroute-key
 ```
 
-**VS Code settings:**
+**Pengaturan VS Code:**
 
 ```json
 {
@@ -223,11 +506,11 @@ kilocode --api-base http://localhost:20128/v1 --api-key sk-your-omniroute-key
 }
 ```
 
-Or use the OmniRoute dashboard → **CLI Tools → KiloCode → Apply Config**.
+Atau gunakan dashboard OmniRoute → **CLI Tools → KiloCode → Terapkan Konfigurasi**.
 
 ---
 
-### Continue (VS Code Extension)
+#### Continue (Ekstensi VS Code)
 
 Edit `~/.continue/config.yaml`:
 
@@ -241,158 +524,255 @@ models:
     default: true
 ```
 
-Restart VS Code after editing.
+Mulai ulang VS Code setelah mengedit.
 
 ---
 
-### Kiro CLI (Amazon)
+#### VS Code Insiders (`chatLanguageModels.json`)
+
+Gunakan ini ketika VS Code Insiders dikonfigurasi untuk model endpoint kustom dan Anda ingin OmniRoute berfungsi tanpa bidang header kustom.
+
+**Lokasi yang Disarankan:**
+
+- Linux: `~/.config/Code - Insiders/User/chatLanguageModels.json`
+- Windows: `%APPDATA%/Code - Insiders/User/chatLanguageModels.json`
+
+**Contoh menggunakan alias OmniRoute yang ditokenisasi:**
+
+```json
+[
+  {
+    "vendor": "customendpoint",
+    "id": "auto",
+    "name": "OmniRoute Auto",
+    "family": "gpt-4",
+    "version": "1.0.0",
+    "url": "http://localhost:20128/api/v1/vscode/sk-your-omniroute-key/chat/completions",
+    "modelsUrl": "http://localhost:20128/api/v1/vscode/sk-your-omniroute-key/models",
+    "requestFormat": "openai-chat-completions",
+    "contextWindow": 256000,
+    "maxOutputTokens": 32768,
+    "auth": {
+      "type": "none"
+    }
+  }
+]
+```
+
+**Catatan:**
+
+- Ganti `sk-your-omniroute-key` dengan kunci API yang dibuat di OmniRoute.
+- Bidang `url` harus mengarah ke `/api/v1/vscode/{token}/chat/completions`.
+- Bidang `modelsUrl` harus mengarah ke `/api/v1/vscode/{token}/models`.
+- Utamakan alur normal `/v1` + header Bearer ketika klien mendukung header kustom.
+- Token yang tertanam dalam URL adalah fallback kompatibilitas dan mungkin muncul dalam log editor atau riwayat proxy.
+
+---
+
+#### Kiro CLI (Amazon)
 
 ```bash
-# Login to your AWS/Kiro account:
+# Masuk ke akun AWS/Kiro Anda:
 kiro-cli login
 
-# The CLI uses its own auth — OmniRoute is not needed as backend for Kiro CLI itself.
-# Use kiro-cli alongside OmniRoute for other tools.
+# CLI menggunakan otentikasi sendiri — OmniRoute tidak diperlukan sebagai backend untuk Kiro CLI itu sendiri.
+# Gunakan kiro-cli bersamaan dengan OmniRoute untuk alat lainnya.
 kiro-cli status
 ```
 
+Untuk aplikasi desktop **Kiro IDE**, gunakan endpoint MITM yang diekspos oleh OmniRoute
+di bawah `/dashboard/cli-tools → Kiro`.
+
 ---
 
-### Qwen Code (Alibaba)
+## 10. Internal OmniRoute CLI
 
-Qwen Code supports OpenAI-compatible API endpoints via environment variables or `settings.json`.
-
-**Option 1: Environment variables (`~/.qwen/.env`)**
+Biner `omniroute` menyediakan perintah untuk siklus hidup server, pengaturan, diagnostik, dan manajemen penyedia. Titik masuk: `bin/omniroute.mjs`.
 
 ```bash
-mkdir -p ~/.qwen && cat > ~/.qwen/.env << EOF
-OPENAI_API_KEY="sk-your-omniroute-key"
-OPENAI_BASE_URL="http://localhost:20128/v1"
-OPENAI_MODEL="auto"
-EOF
+omniroute                              # Mulai server (port default 20128)
+omniroute setup                        # Wizard pengaturan interaktif
+omniroute doctor                       # Periksa konfigurasi, DB, port, runtime
+omniroute providers list               # Koneksi penyedia yang dikonfigurasi
+omniroute providers test-all           # Uji setiap koneksi aktif
+omniroute reset-password               # Atur ulang kata sandi admin
+omniroute logs                         # Streaming log permintaan
+omniroute health                       # Kesehatan terperinci (pemutus, cache, memori)
+omniroute --version                    # Cetak versi
+omniroute --help                       # Tampilkan semua perintah
 ```
 
-**Option 2: `settings.json` with model providers**
-
-```json
-// ~/.qwen/settings.json
-{
-  "env": {
-    "OPENAI_API_KEY": "sk-your-omniroute-key",
-    "OPENAI_BASE_URL": "http://localhost:20128/v1"
-  },
-  "modelProviders": {
-    "openai": [
-      {
-        "id": "omniroute-default",
-        "name": "OmniRoute (Auto)",
-        "envKey": "OPENAI_API_KEY",
-        "baseUrl": "http://localhost:20128/v1"
-      }
-    ]
-  }
-}
-```
-
-**Option 3: Inline CLI flags**
+### Pengaturan & Inisialisasi
 
 ```bash
-OPENAI_BASE_URL="http://localhost:20128/v1" \
-OPENAI_API_KEY="sk-your-omniroute-key" \
-OPENAI_MODEL="auto" \
-qwen
+omniroute setup                        # Wizard pengaturan interaktif
+omniroute setup --non-interactive      # Mode CI/automasi (membaca variabel env + flag)
+omniroute setup --password '<value>'   # Atur kata sandi admin langsung
+omniroute setup --add-provider \
+  --provider openai \
+  --api-key '<value>' \
+  --test-provider                      # Tambah dan uji penyedia dalam satu langkah
 ```
 
-> For a **remote server** replace `localhost:20128` with the server IP or domain.
+Variabel lingkungan yang dikenali untuk pengaturan non-interaktif:
 
-**Test:** `qwen "say hello"`
+| Var                 | Tujuan                                                                 |
+| ------------------- | ---------------------------------------------------------------------- |
+| `OMNIROUTE_API_KEY` | Kunci API penyedia (terikat ke `--api-key` melalui Commander `.env()`) |
+| `DATA_DIR`          | Ganti direktori data OmniRoute                                         |
 
-### Cursor (Desktop App)
+Semua input non-interaktif lainnya diteruskan sebagai flag, bukan variabel lingkungan:
+`--password`, `--provider`, `--provider-name`, `--provider-base-url`, `--default-model`
+(lihat opsi `omniroute setup` di atas).
 
-> **Note:** Cursor routes requests through its cloud. For OmniRoute integration,
-> enable **Cloud Endpoint** in OmniRoute Settings and use your public domain URL.
-
-Via GUI: **Settings → Models → OpenAI API Key**
-
-- Base URL: `https://your-domain.com/v1`
-- API Key: your OmniRoute key
-
----
-
-## Dashboard Auto-Configuration
-
-The OmniRoute dashboard automates configuration for most tools:
-
-1. Go to `http://localhost:20128/dashboard/cli-tools`
-2. Expand any tool card
-3. Select your API key from the dropdown
-4. Click **Apply Config** (if tool is detected as installed)
-5. Or copy the generated config snippet manually
-
----
-
-## Built-in Agents: Droid & OpenClaw
-
-**Droid** and **OpenClaw** are AI agents built directly into OmniRoute — no installation needed.
-They run as internal routes and use OmniRoute's model routing automatically.
-
-- Access: `http://localhost:20128/dashboard/agents`
-- Configure: same combos and providers as all other tools
-- No API key or CLI install required
-
----
-
-## Available API Endpoints
-
-| Endpoint                   | Description                   | Use For                     |
-| -------------------------- | ----------------------------- | --------------------------- |
-| `/v1/chat/completions`     | Standard chat (all providers) | All modern tools            |
-| `/v1/responses`            | Responses API (OpenAI format) | Codex, agentic workflows    |
-| `/v1/completions`          | Legacy text completions       | Older tools using `prompt:` |
-| `/v1/embeddings`           | Text embeddings               | RAG, search                 |
-| `/v1/images/generations`   | Image generation              | GPT-Image, Flux, etc.       |
-| `/v1/audio/speech`         | Text-to-speech                | ElevenLabs, OpenAI TTS      |
-| `/v1/audio/transcriptions` | Speech-to-text                | Deepgram, AssemblyAI        |
-
----
-
-## समस्या निवारण
-
-| Error                     | Cause                   | Fix                                        |
-| ------------------------- | ----------------------- | ------------------------------------------ |
-| `Connection refused`      | OmniRoute not running   | `pm2 start omniroute`                      |
-| `401 Unauthorized`        | Wrong API key           | Check in `/dashboard/api-manager`          |
-| `No combo configured`     | No active routing combo | Set up in `/dashboard/combos`              |
-| `invalid model`           | Model not in catalog    | Use `auto` or check `/dashboard/providers` |
-| CLI shows "not installed" | Binary not in PATH      | Check `which <command>`                    |
-| `kiro-cli: not found`     | Not in PATH             | `export PATH="$HOME/.local/bin:$PATH"`     |
-
----
-
-## Quick Setup Script (One Command)
+### Diagnostik
 
 ```bash
-# Install all CLIs and configure for OmniRoute (replace with your key and server URL)
-OMNIROUTE_URL="http://localhost:20128/v1"
-OMNIROUTE_KEY="sk-your-omniroute-key"
-
-npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai cline kilocode @qwen-code/qwen-code
-
-# Kiro CLI
-apt-get install -y unzip 2>/dev/null; curl -fsSL https://cli.kiro.dev/install | bash
-
-# Write configs
-mkdir -p ~/.claude ~/.codex ~/.config/opencode ~/.continue
-
-cat > ~/.claude/settings.json   <<< "{\"apiBaseUrl\":\"$OMNIROUTE_URL\",\"apiKey\":\"$OMNIROUTE_KEY\"}"
-cat > ~/.codex/config.yaml      <<< "model: auto\napiKey: $OMNIROUTE_KEY\napiBaseUrl: $OMNIROUTE_URL"
-cat >> ~/.bashrc << EOF
-export OPENAI_BASE_URL="$OMNIROUTE_URL"
-export OPENAI_API_KEY="$OMNIROUTE_KEY"
-export ANTHROPIC_BASE_URL="$OMNIROUTE_URL"
-export ANTHROPIC_API_KEY="$OMNIROUTE_KEY"
-EOF
-
-source ~/.bashrc
-echo "✅ All CLIs installed and configured for OmniRoute"
+omniroute doctor                       # Periksa konfigurasi, DB, port, runtime, memori, keberlangsungan
+omniroute doctor --json                # JSON yang dapat dibaca mesin
+omniroute doctor --no-liveness         # Lewati probe kesehatan HTTP
+omniroute doctor --host 0.0.0.0        # Ganti host keberlangsungan
+omniroute doctor --liveness-url <url>  # Ganti URL endpoint kesehatan penuh
 ```
+
+Dokter menjalankan pemeriksaan ini: `Konfigurasi`, `Database`, `Penyimpanan/enkripsi`,
+`Ketersediaan Port`, `Runtime Node`, `Biner asli` (better-sqlite3),
+`Memori`, dan `Keberlangsungan Server`. Ia keluar dengan status non-nol jika ada pemeriksaan yang `gagal`.
+
+### Manajemen Penyedia
+
+```bash
+omniroute providers available                       # Katalog penyedia OmniRoute
+omniroute providers available --search openai       # Filter katalog berdasarkan id/nama/alias/kategori
+omniroute providers available --category api-key    # Filter berdasarkan kategori (api-key, oauth, gratis, ...)
+omniroute providers available --json                # JSON yang dapat dibaca mesin
+
+omniroute providers list                            # Koneksi penyedia yang dikonfigurasi
+omniroute providers list --json
+
+omniroute providers test <id|name>                  # Uji satu koneksi yang dikonfigurasi
+omniroute providers test-all                        # Uji setiap koneksi aktif
+omniroute providers validate                        # Validasi struktural lokal saja
+omniroute providers add <provider> --credential-env PROVIDER_KEY
+omniroute providers import ./providers.json --dry-run --json
+omniroute providers auth <provider>                 # Alur OAuth yang ada
+omniroute providers edit <id|name> --default-model <model>
+omniroute providers remove <id|name> --yes
+```
+
+`providers add/import/auth/edit/remove` bersifat API-first dan oleh karena itu bekerja terhadap
+konteks lokal atau jarak jauh yang aktif. Input kredensial harus menggunakan
+`--credential-stdin` atau `--credential-env`; `--dry-run --json` hanya melaporkan
+keberadaan/bentuk yang disunting. `providers available` membaca katalog OmniRoute;
+`providers list/test/test-all/validate` mempertahankan perilaku SQLite lokal mereka dan
+tidak memerlukan server untuk berjalan.
+
+### Pemulihan & Atur Ulang
+
+```bash
+omniroute reset-password                # Atur ulang kata sandi admin (juga: omniroute-reset-password)
+omniroute reset-encrypted-columns       # Tampilkan peringatan + dry-run untuk atur ulang kredensial terenkripsi
+omniroute reset-encrypted-columns --force  # Benar-benar menghapus kredensial terenkripsi di SQLite
+```
+
+### Ekspor Kredensial (⚠ tangani dengan hati-hati)
+
+```bash
+omniroute auth export                                 # Tampilkan peringatan + gerbang konfirmasi — tidak ada akses DB
+omniroute auth export --force                          # Ekspor SEMUA kredensial KONEKSI yang DECRYPTED ke stdout sebagai JSON
+omniroute auth export --force --id <id>                 # Ekspor hanya koneksi yang cocok
+omniroute auth export --force --format env               # Emit OMNIROUTE_<PROVIDER>_<FIELD>=<value> baris
+omniroute auth export --force --out creds.json           # Tulis ke file (dibuat dengan izin 0600)
+```
+
+`auth export` bersifat **lokal saja** (baca SQLite langsung, tidak ada rute HTTP) dan sengaja mencetak/menulis
+nilai **plaintext** `apiKey`/`accessToken`/`refreshToken`/`idToken` — itu adalah fitur, bukan
+bug. Tidak ada yang dibaca dari database, dan tidak ada yang didekripsi, tanpa `--force`. Sebuah banner peringatan stderr
+selalu dicetak sebelum ada plaintext yang dikeluarkan. Memerlukan `STORAGE_ENCRYPTION_KEY` untuk
+diatur. Sebuah field yang gagal didekripsi (kunci kadaluarsa, ciphertext rusak) dilaporkan sebagai
+`<field>DecryptFailed: true` alih-alih menghentikan seluruh ekspor atau membocorkan kesalahan yang mendasarinya.
+
+### Subperintah Lainnya
+
+Ini mengasumsikan server OmniRoute yang berjalan, kecuali dinyatakan sebaliknya:
+
+```bash
+omniroute status                       # Status runtime yang komprehensif
+omniroute logs                         # Streaming log permintaan (--json, --search, --follow)
+omniroute config show                  # Tampilkan konfigurasi saat ini
+
+omniroute provider list                # Daftar penyedia yang tersedia (alias dari providers list)
+omniroute provider add                 # Daftarkan OmniRoute sebagai penyedia di alat
+omniroute keys add | list | remove     # Kelola kunci API
+omniroute models [provider]            # Daftar model (--json, --search)
+omniroute combo list | switch | create | delete
+
+omniroute backup                       # Snapshot konfigurasi + DB
+omniroute restore                      # Pulihkan dari snapshot sebelumnya
+
+omniroute health                       # Kesehatan terperinci (pemutus, cache, memori)
+omniroute quota                        # Penggunaan kuota penyedia
+omniroute cache                        # Status cache
+omniroute cache clear                  # Hapus cache semantik + tanda tangan
+
+omniroute mcp status | restart         # Status server MCP / restart
+omniroute a2a status | card            # Status server A2A / kartu agen
+
+omniroute tunnel list | create | stop  # Kelola terowongan (cloudflare/tailscale/ngrok)
+omniroute env show | get <k> | set <k> <v>  # Periksa / atur variabel env (sementara)
+
+omniroute test                         # Uji konektivitas penyedia
+omniroute update                       # Periksa pembaruan
+omniroute completion                   # Hasilkan penyelesaian shell
+```
+
+### Flag Umum
+
+| Flag                | Deskripsi                                                    |
+| ------------------- | ------------------------------------------------------------ |
+| `--no-open`         | Jangan otomatis membuka browser saat mulai                   |
+| `--port <n>`        | Ganti port API (default 20128)                               |
+| `--mcp`             | Jalankan sebagai server MCP melalui stdio (untuk IDE)        |
+| `--non-interactive` | Mode CI (tanpa prompt; membaca dari env/flags)               |
+| `--json`            | Output JSON yang dapat dibaca mesin (dokter, penyedia, dll.) |
+| `--help`, `-h`      | Tampilkan bantuan spesifik perintah                          |
+| `--version`, `-v`   | Cetak versi yang terinstal                                   |
+
+## Endpoint API yang Tersedia
+
+| Endpoint                   | Deskripsi                        | Digunakan Untuk                      |
+| -------------------------- | -------------------------------- | ------------------------------------ |
+| `/v1/chat/completions`     | Obrolan standar (semua penyedia) | Semua alat modern                    |
+| `/v1/responses`            | API respons (format OpenAI)      | Codex, alur kerja agentik            |
+| `/v1/completions`          | Penyelesaian teks warisan        | Alat lama yang menggunakan `prompt:` |
+| `/v1/embeddings`           | Embedding teks                   | RAG, pencarian                       |
+| `/v1/images/generations`   | Generasi gambar                  | GPT-Image, Flux, dll.                |
+| `/v1/audio/speech`         | Teks-ke-suara                    | ElevenLabs, OpenAI TTS               |
+| `/v1/audio/transcriptions` | Suara-ke-teks                    | Deepgram, AssemblyAI                 |
+
+Contoh siap-tempel dengan URL OmniRoute yang ter-tokenisasi:
+
+```txt
+Token contoh: sk-a3ab3c080beaee3a-69f4a4-070d71af
+
+Basis OpenAI standar: http://localhost:20128/v1
+Model VS Code: http://localhost:20128/api/v1/vscode/sk-a3ab3c080beaee3a-69f4a4-070d71af/models
+Obrolan VS Code: http://localhost:20128/api/v1/vscode/sk-a3ab3c080beaee3a-69f4a4-070d71af/chat/completions
+Respons VS Code: http://localhost:20128/api/v1/vscode/sk-a3ab3c080beaee3a-69f4a4-070d71af/responses
+Tag Ollama: http://localhost:20128/api/v1/vscode/sk-a3ab3c080beaee3a-69f4a4-070d71af/api/tags
+Obrolan Ollama: http://localhost:20128/api/v1/vscode/sk-a3ab3c080beaee3a-69f4a4-070d71af/api/chat
+```
+
+---
+
+## Pemecahan Masalah
+
+| Kesalahan                                              | Penyebab                          | Perbaikan                                           |
+| ------------------------------------------------------ | --------------------------------- | --------------------------------------------------- |
+| `Connection refused`                                   | OmniRoute tidak berjalan          | `omniroute serve`                                   |
+| `401 Unauthorized`                                     | Kunci API salah                   | Periksa di `/dashboard/api-manager`                 |
+| `No combo configured`                                  | Tidak ada kombinasi routing aktif | Atur di `/dashboard/combos`                         |
+| CLI menunjukkan "not installed"                        | Biner tidak ada di PATH           | Periksa `which <command>`                           |
+| Dashboard menunjukkan "not detected" setelah instalasi | Cache usang                       | Klik "⟳ Refresh detection" di dashboard             |
+| Tautan lama `/dashboard/cli-tools`                     | Bookmark sebelum v3.8.6           | Dialihkan otomatis ke `/dashboard/cli-code` (308)   |
+| Tautan lama `/dashboard/agents`                        | Bookmark sebelum v3.8.6           | Dialihkan otomatis ke `/dashboard/acp-agents` (308) |

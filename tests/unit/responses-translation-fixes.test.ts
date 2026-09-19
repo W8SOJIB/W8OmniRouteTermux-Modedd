@@ -1,3 +1,4 @@
+import { translateRequest } from "../../open-sse/translator/index.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -35,6 +36,81 @@ test("convertResponsesApiFormat skips function_call items with empty names", () 
   const result = convertResponsesApiFormat(body);
   const assistantMsgs = (result as any).messages.filter((m) => m.role === "assistant");
   assert.equal(assistantMsgs.length, 0);
+});
+
+test("production Responses conversion preserves Kimi K3 reasoning history", () => {
+  const body = {
+    model: "kimi-k3",
+    input: [
+      { role: "user", content: [{ type: "input_text", text: "Call search." }] },
+      {
+        type: "reasoning",
+        content: [{ type: "reasoning_text", text: "I should search first." }],
+      },
+      {
+        type: "function_call",
+        call_id: "call_1",
+        name: "search",
+        arguments: "{}",
+      },
+      { type: "function_call_output", call_id: "call_1", output: "found" },
+    ],
+  };
+
+  for (const { provider, model } of [
+    { provider: "kimi-coding", model: "k3" },
+    { provider: "kimi-coding-apikey", model: "k3-256k" },
+    { provider: "moonshot", model: "kimi-k3" },
+    { provider: "kimi", model: "kimi-k3" },
+    { provider: "some-other", model: "k3" },
+    { provider: "some-other", model: "k3-256k" },
+    { provider: "some-other", model: "kimi-k3" },
+  ]) {
+    const converted = convertResponsesApiFormat(body, {}, provider, model) as {
+      messages: Array<Record<string, unknown>>;
+    };
+    assert.equal(converted.messages[1].reasoning_content, "I should search first.");
+  }
+
+  for (const provider of ["kimi-coding", "kimi-coding-apikey"]) {
+    const generic = convertResponsesApiFormat(body, {}, provider, "kimi-k2.6") as {
+      messages: Array<Record<string, unknown>>;
+    };
+    assert.equal(Object.hasOwn(generic.messages[1], "reasoning_content"), false, provider);
+  }
+});
+
+test("Responses translation keeps authentic K3 reasoning through OpenAI cleanup", () => {
+  const body = {
+    model: "k3",
+    input: [
+      { role: "user", content: [{ type: "input_text", text: "Call search." }] },
+      {
+        type: "reasoning",
+        content: [{ type: "reasoning_text", text: "I should search first." }],
+      },
+      {
+        type: "function_call",
+        call_id: "call_1",
+        name: "search",
+        arguments: "{}",
+      },
+    ],
+  };
+
+  for (const provider of ["kimi-web", "some-other"]) {
+    const translated = translateRequest(
+      "openai-responses",
+      "openai",
+      "k3",
+      body,
+      false,
+      {},
+      provider
+    ) as { messages: Array<Record<string, unknown>> };
+
+    assert.equal(translated.messages[1].reasoning_content, "I should search first.", provider);
+  }
 });
 
 test("Responses→Chat: input_image converted to image_url with detail", () => {
@@ -124,6 +200,83 @@ test("Codex Responses input: null input normalizes to an empty list (not [null])
   normalizeCodexResponsesInput(body);
 
   assert.deepEqual(body.input, []);
+});
+
+test("Codex Responses input: additional_tools drops unsupported content", () => {
+  const body: Record<string, unknown> = {
+    input: [
+      {
+        type: "additional_tools",
+        role: "developer",
+        content: [{ type: "input_text", text: "unsupported wrapper content" }],
+        tools: [{ type: "function", name: "terminal", parameters: { type: "object" } }],
+      },
+    ],
+  };
+
+  normalizeCodexResponsesInput(body);
+
+  assert.deepEqual(body.input, [
+    {
+      type: "additional_tools",
+      role: "developer",
+      tools: [{ type: "function", name: "terminal", parameters: { type: "object" } }],
+    },
+  ]);
+});
+
+test("Codex Responses input: assistant history normalized to output_text (OpenAI/Codex rejects input_text on assistant turns)", () => {
+  const body: Record<string, unknown> = {
+    input: [
+      {
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "input_text",
+            text: "Previous assistant answer",
+            annotations: [{ type: "url_citation", url: "https://example.com" }],
+            logprobs: [{ token: "Previous" }],
+            obfuscation: "opaque",
+          },
+          { type: "scoped_content", scope: "internal", content: "Preserve me" },
+        ],
+      },
+      {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_image", image_url: "https://example.com/image.png", detail: "high" },
+          { type: "input_file", file_id: "file_123" },
+        ],
+      },
+      { type: "function_call", call_id: "call_123", name: "lookup", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_123", output: "done" },
+    ],
+  };
+
+  normalizeCodexResponsesInput(body);
+
+  assert.deepEqual(body.input, [
+    {
+      type: "message",
+      role: "assistant",
+      content: [
+        { type: "output_text", text: "Previous assistant answer" },
+        { type: "scoped_content", scope: "internal", content: "Preserve me" },
+      ],
+    },
+    {
+      type: "message",
+      role: "user",
+      content: [
+        { type: "input_image", image_url: "https://example.com/image.png", detail: "high" },
+        { type: "input_file", file_id: "file_123" },
+      ],
+    },
+    { type: "function_call", call_id: "call_123", name: "lookup", arguments: "{}" },
+    { type: "function_call_output", call_id: "call_123", output: "done" },
+  ]);
 });
 
 test("Responses→Chat: null input normalizes to an empty list (not [null])", () => {
@@ -458,7 +611,10 @@ test("Chat→Responses streaming: completed event includes accumulated output", 
 
   // Finish
   const finishChunk = { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] };
-  const events = openaiToOpenAIResponsesResponse(finishChunk, state);
+  openaiToOpenAIResponsesResponse(finishChunk, state);
+  // #6906: no usage was ever sent for this stream, so response.completed is deferred
+  // until the stream-end flush (no trailing usage-only chunk will ever arrive).
+  const events = openaiToOpenAIResponsesResponse(null, state);
   const completedEvent = events.find((e) => e.event === "response.completed");
   assert.ok(completedEvent.data.response.output, "completed should have output");
   assert.ok(completedEvent.data.response.output.length > 0, "output should not be empty");
@@ -485,6 +641,50 @@ test("Responses→Chat streaming: reasoning delta emits reasoning_content in Cha
   const result = openaiResponsesToOpenAIResponse(chunk, state);
   assert.ok(result, "should return a chunk");
   assert.equal(result.choices[0].delta.reasoning_content, "thinking step...");
+});
+
+test("Responses→Chat streaming: internal reasoning replay placeholder stays hidden", () => {
+  const state = {
+    started: false,
+    chatId: null,
+    created: null,
+    toolCallIndex: 0,
+    finishReasonSent: false,
+  };
+
+  const result = openaiResponsesToOpenAIResponse(
+    {
+      type: "response.reasoning_summary_text.delta",
+      delta: "(prior reasoning summary unavailable)",
+      item_id: "rs_1",
+      output_index: 0,
+      summary_index: 0,
+    },
+    state
+  );
+
+  assert.equal(result, null);
+});
+
+test("Chat→Responses streaming: internal reasoning replay placeholder stays hidden", () => {
+  const state = initState(FORMATS.OPENAI_RESPONSES);
+  const events = openaiToOpenAIResponsesResponse(
+    {
+      choices: [
+        {
+          index: 0,
+          delta: { reasoning_content: "(prior reasoning summary unavailable)" },
+          finish_reason: null,
+        },
+      ],
+    },
+    state
+  );
+
+  assert.equal(
+    events.some((event) => event.event === "response.reasoning_summary_text.delta"),
+    false
+  );
 });
 
 test("Responses→Chat streaming: Copilot mode emits reasoning_text for summary deltas", () => {
@@ -615,4 +815,49 @@ test("Responses→Chat streaming: flush finalizes stop when no tool call was emi
   const result = openaiResponsesToOpenAIResponse(null, state);
   assert.ok(result, "flush should emit a final chunk");
   assert.equal(result.choices[0].finish_reason, "stop");
+});
+
+test("Chat→Responses streaming: reasoning and a following tool call use distinct output indexes", () => {
+  const state = initState(FORMATS.OPENAI_RESPONSES);
+
+  const reasoningEvents = openaiToOpenAIResponsesResponse(
+    {
+      id: "chatcmpl-grok",
+      choices: [{ index: 0, delta: { reasoning_content: "I should call the tool." } }],
+    },
+    state
+  );
+  const toolEvents = openaiToOpenAIResponsesResponse(
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_grok",
+                type: "function",
+                function: { name: "lookup", arguments: '{"query":"status"}' },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    state
+  );
+
+  const reasoningItem = reasoningEvents.find(
+    (event) => event.event === "response.output_item.added" && event.data.item.type === "reasoning"
+  );
+  const toolItem = toolEvents.find(
+    (event) =>
+      event.event === "response.output_item.added" && event.data.item.type === "function_call"
+  );
+
+  assert.ok(reasoningItem, "should announce the reasoning item");
+  assert.ok(toolItem, "should announce the function call item");
+  assert.equal(reasoningItem.data.output_index, 0);
+  assert.equal(toolItem.data.output_index, 1);
 });

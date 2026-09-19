@@ -20,6 +20,33 @@ export function isIntelligentBuilderStrategy(strategy: unknown): boolean {
   return strategy === "auto" || strategy === "lkgp";
 }
 
+export type ComboEligibleConnectionLike = {
+  isActive?: boolean | null;
+  testStatus?: string | null;
+};
+
+/**
+ * Whether a provider connection should be treated as eligible for the combo
+ * builder's "active providers" list (used to decide which providers get their
+ * models fetched/shown when creating or editing a combo).
+ *
+ * Newly-created connections default `testStatus` to `null` until someone
+ * explicitly runs a connection test (`src/lib/db/providers.ts`). Excluding
+ * those from the combo builder meant a freshly-added custom provider's models
+ * never populated the combo model picker until an operator manually tested
+ * the connection — matching the reported symptom (#2057). "Never tested" is
+ * therefore treated the same as "known good", consistent with
+ * `deriveConnectionStatus` in `src/lib/combos/builderOptions.ts`, which only
+ * flags a connection as an error when `testStatus` explicitly matches
+ * `/error|fail/i`.
+ */
+export function isEligibleActiveConnection(connection: ComboEligibleConnectionLike): boolean {
+  if (connection.isActive === false) return false;
+  const testStatus = connection.testStatus;
+  if (!testStatus) return true;
+  return testStatus === "active" || testStatus === "success" || testStatus === "unknown";
+}
+
 export function getComboBuilderStages(options: ComboBuilderStageOptions = {}): ComboBuilderStage[] {
   if (isIntelligentBuilderStrategy(options.strategy)) {
     return [...COMBO_BUILDER_STAGES];
@@ -183,6 +210,119 @@ export function findNextSuggestedConnectionId(
   return COMBO_BUILDER_AUTO_CONNECTION;
 }
 
+export type ComboBuilderGlobalModelEntry = {
+  providerId: string;
+  providerName: string;
+  modelId: string;
+  modelName: string;
+  connectionCount: number;
+  connections: unknown[];
+  step: ComboModelStep;
+};
+
+type ComboBuilderGlobalProvider = {
+  providerId?: unknown;
+  displayName?: unknown;
+  connectionCount?: unknown;
+  connections?: unknown[];
+  models?: Array<{ id?: unknown; name?: unknown }>;
+};
+
+/**
+ * Flattens the combo builder's provider→model tree into a single searchable
+ * list (one row per provider/model pair), used by the "global model search"
+ * selection mode in the combo builder (#8285). Each entry carries the exact
+ * `ComboModelStep` that would be added if the user picks it, pre-built with
+ * no pinned connection so the combo auto-selects at runtime.
+ */
+export function buildGlobalModelList(
+  providers: ComboBuilderGlobalProvider[] = []
+): ComboBuilderGlobalModelEntry[] {
+  const list: ComboBuilderGlobalModelEntry[] = [];
+
+  (providers || []).forEach((provider) => {
+    const providerId = toTrimmedString(provider?.providerId) || "";
+    if (!providerId) return;
+    const providerName = toTrimmedString(provider?.displayName) || providerId;
+    const connectionCount =
+      typeof provider?.connectionCount === "number" ? provider.connectionCount : 0;
+    const connections = Array.isArray(provider?.connections) ? provider.connections : [];
+
+    (provider?.models || []).forEach((model) => {
+      const modelId = toTrimmedString(model?.id);
+      if (!modelId) return;
+      const modelName = toTrimmedString(model?.name) || modelId;
+      const step = buildPrecisionComboModelStep({
+        providerId,
+        modelId,
+        connectionId: null,
+        connectionLabel: null,
+        allowedConnectionIds: [],
+      });
+      list.push({
+        providerId,
+        providerName,
+        modelId,
+        modelName,
+        connectionCount,
+        connections,
+        step,
+      });
+    });
+  });
+
+  return list;
+}
+
+/**
+ * Case-insensitive substring filter over `buildGlobalModelList()` output,
+ * matching against provider display name, provider id, model name and model
+ * id combined. Empty/whitespace-only query returns the full list unfiltered.
+ */
+export function filterGlobalModelList(
+  entries: ComboBuilderGlobalModelEntry[],
+  query: string
+): ComboBuilderGlobalModelEntry[] {
+  const normalizedQuery = (query || "").trim().toLowerCase();
+  if (!normalizedQuery) return entries;
+  return entries.filter((item) => {
+    const text =
+      `${item.providerName} ${item.providerId} ${item.modelName} ${item.modelId}`.toLowerCase();
+    return text.includes(normalizedQuery);
+  });
+}
+
+/**
+ * Appends a single global-search step to the combo's model list, skipping it
+ * if an exact provider/model/account duplicate is already present. Returns
+ * the original array reference when nothing changed so callers can skip a
+ * state update.
+ */
+export function addGlobalModelStep(entries: unknown[], step: unknown): unknown[] {
+  if (hasExactModelStepDuplicate(entries, step)) return entries;
+  return [...entries, step];
+}
+
+/**
+ * Appends every non-duplicate step from a filtered global-search result set,
+ * de-duplicating against both the existing combo models and steps already
+ * queued earlier in the same batch (so two search matches that resolve to
+ * the same provider/model/account never get added twice). Returns the
+ * original array reference when nothing changed.
+ */
+export function addAllGlobalSearchMatches(
+  entries: unknown[],
+  matches: ComboBuilderGlobalModelEntry[]
+): unknown[] {
+  const newSteps: unknown[] = [];
+  (matches || []).forEach((item) => {
+    if (!hasExactModelStepDuplicate([...entries, ...newSteps], item.step)) {
+      newSteps.push(item.step);
+    }
+  });
+  return newSteps.length > 0 ? [...entries, ...newSteps] : entries;
+}
+
 export function getComboBuilderStageChecks({
   name,
   nameError,
@@ -239,4 +379,106 @@ export function getPreviousComboBuilderStage(
   const stageIndex = stages.indexOf(stage);
   if (stageIndex <= 0) return "basics";
   return stages[stageIndex - 1];
+}
+
+export type ComboBuilderModelCandidate = {
+  value?: unknown;
+  providerId?: unknown;
+};
+
+export type ComboBuilderDraftModelStep = {
+  model: string;
+  providerId?: string;
+  weight: number;
+};
+
+/**
+ * Resolve the providerId for one "Select all" candidate: an exact/alias/prefix
+ * match in `builderProviders` wins, falling back to whatever provider prefix
+ * the qualified model string itself carries. Split out of
+ * `computeBatchAddModelSteps` to keep that loop under the complexity budget.
+ */
+function resolveBatchCandidateProviderId(
+  model: ComboBuilderModelCandidate,
+  parsedModel: { providerId: string; modelId: string } | null,
+  builderProviders: ComboBuilderProviderIdentity[]
+): string | null {
+  return (
+    resolveComboBuilderProviderId(model?.providerId, builderProviders) ||
+    resolveComboBuilderProviderId(parsedModel?.providerId, builderProviders) ||
+    (typeof model?.providerId === "string" && model.providerId.trim()) ||
+    parsedModel?.providerId ||
+    null
+  );
+}
+
+/**
+ * Batch-add handler for ModelSelectModal's "Select all" (`onSelectMany`) in
+ * the combo builder — must apply every candidate against a growing list in
+ * ONE pass. Looping the single-add handler N times would have each call
+ * close over the same stale `models` snapshot and only the last selected
+ * model would survive (#8526).
+ *
+ * This is the real implementation `ComboFormModal::handleAddModels` in
+ * `page.tsx` delegates to, so unit tests exercise actual production logic
+ * instead of a hand-maintained copy that can drift from the component.
+ */
+export function computeBatchAddModelSteps(
+  models: ComboBuilderDraftModelStep[],
+  selected: ComboBuilderModelCandidate[],
+  builderProviders: ComboBuilderProviderIdentity[] = []
+): { next: ComboBuilderDraftModelStep[]; addedAny: boolean } {
+  if (!Array.isArray(selected) || selected.length === 0) {
+    return { next: models, addedAny: false };
+  }
+  const next = [...models];
+  let addedAny = false;
+  for (const model of selected) {
+    const qualifiedModel = typeof model?.value === "string" ? model.value : "";
+    if (!qualifiedModel) continue;
+    const parsedModel = parseQualifiedModel(qualifiedModel);
+    const resolvedProviderId = resolveBatchCandidateProviderId(
+      model,
+      parsedModel,
+      builderProviders
+    );
+    const nextEntry: ComboBuilderDraftModelStep = {
+      model: qualifiedModel,
+      ...(resolvedProviderId ? { providerId: resolvedProviderId } : {}),
+      weight: 0,
+    };
+    if (hasExactModelStepDuplicate(next, nextEntry)) continue;
+    next.push(nextEntry);
+    addedAny = true;
+  }
+  return { next, addedAny };
+}
+
+/**
+ * Batch-remove handler for ModelSelectModal's "Unselect all" (`onDeselectMany`)
+ * in the combo builder — same stale-snapshot reasoning as
+ * `computeBatchAddModelSteps` above. Accepts either `{ value }` candidate
+ * objects (from the modal) or raw qualified-model strings.
+ *
+ * Returns the same `models` reference (no-op) when there is nothing to
+ * remove, so callers can skip the `setModels` call.
+ */
+export function computeBatchDeselectModelSteps(
+  models: ComboBuilderDraftModelStep[],
+  toRemove: Array<{ value?: unknown } | string>
+): ComboBuilderDraftModelStep[] {
+  if (!Array.isArray(toRemove) || toRemove.length === 0) return models;
+  const values = new Set(
+    toRemove
+      .map((model) =>
+        typeof (model as { value?: unknown })?.value === "string"
+          ? (model as { value: string }).value
+          : typeof model === "string"
+            ? model
+            : ""
+      )
+      .filter(Boolean)
+  );
+  if (values.size === 0) return models;
+  return models.filter((m) => !values.has(m.model));
 }

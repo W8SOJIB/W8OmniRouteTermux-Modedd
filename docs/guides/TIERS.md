@@ -21,7 +21,7 @@ it expires.
 | OpenAI Codex (ChatGPT subscription) | Plus/Team includes Codex quota               |
 | GitHub Copilot                      | Per-seat — quota resets monthly              |
 | Cursor IDE                          | Pro plan quota                               |
-| Antigravity / Windsurf              | Built-in quotas                              |
+| Antigravity / Devin Desktop         | Built-in quotas                              |
 
 **Strategy**: route here first for every request that fits the model's
 strengths. Quota tracker monitors approaching reset; combo strategies
@@ -66,7 +66,7 @@ rate limits — circuit breaker recovers them on backoff.
 Dashboard → **Tiers** → assign your providers. Defaults (from `tierDefaults.json`) are
 sensible; edit when you have specific subscriptions to prioritize or providers to exclude.
 
-Auto-Combo's 9-factor scoring also considers tier. See
+Auto-Combo's 13-factor scoring also considers tier. See
 [`docs/routing/AUTO-COMBO.md`](../routing/AUTO-COMBO.md).
 
 ## Telemetry

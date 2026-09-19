@@ -17,7 +17,7 @@ const { resetDbInstance, getDbInstance } = await import("../../src/lib/db/core.t
 
 async function resetStorage() {
   resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
   getDbInstance();
 }
@@ -61,7 +61,7 @@ test.beforeEach(async () => {
 
 test.after(() => {
   resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("POST /sessions/[id]/requests: seq increments 1, 2, 3", async () => {

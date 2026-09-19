@@ -85,6 +85,155 @@ test("Responses -> Chat converts instructions, inputs, function calls, outputs, 
   });
 });
 
+test("Responses -> Chat keeps assistant text, reasoning, and function calls in one turn", () => {
+  const result = openaiResponsesToOpenAIRequest(
+    "gpt-4o",
+    {
+      input: [
+        {
+          type: "reasoning",
+          content: [{ type: "reasoning_text", text: "Inspect first" }],
+        },
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "I will inspect" }],
+        },
+        { type: "function_call", call_id: "call_1", name: "read_file", arguments: "{}" },
+        { type: "function_call", call_id: "call_2", name: "search", arguments: "{}" },
+        { type: "function_call_output", call_id: "call_1", output: "contents" },
+      ],
+    },
+    false,
+    { _preserveReasoningContent: true }
+  ) as { messages: Array<Record<string, unknown>> };
+
+  assert.equal(result.messages.length, 2);
+  assert.deepEqual(result.messages[0], {
+    role: "assistant",
+    content: [{ type: "text", text: "I will inspect" }],
+    reasoning_content: "Inspect first",
+    tool_calls: [
+      {
+        id: "call_1",
+        type: "function",
+        function: { name: "read_file", arguments: "{}" },
+      },
+      {
+        id: "call_2",
+        type: "function",
+        function: { name: "search", arguments: "{}" },
+      },
+    ],
+  });
+  assert.deepEqual(result.messages[1], {
+    role: "tool",
+    tool_call_id: "call_1",
+    content: "contents",
+  });
+});
+
+test("Responses -> Chat replays plaintext reasoning_text instead of a display summary", () => {
+  const result = openaiResponsesToOpenAIRequest(
+    "deepseek-v4-pro",
+    {
+      input: [
+        {
+          type: "reasoning",
+          content: [{ type: "reasoning_text", text: "Use the indexed result" }],
+          summary: [{ type: "summary_text", text: "Display summary" }],
+        },
+        { type: "function_call", call_id: "call_1", name: "search", arguments: "{}" },
+      ],
+    },
+    false,
+    { _preserveReasoningContent: true }
+  ) as { messages: Array<Record<string, unknown>> };
+
+  assert.equal(result.messages[0].reasoning_content, "Use the indexed result");
+});
+
+test("Responses -> Chat keeps summary-only reasoning out of continuation state", () => {
+  const result = openaiResponsesToOpenAIRequest(
+    "deepseek-v4-pro",
+    {
+      input: [
+        {
+          type: "reasoning",
+          summary: [{ type: "summary_text", text: "Display-only summary" }],
+        },
+        { type: "function_call", call_id: "call_1", name: "search", arguments: "{}" },
+      ],
+    },
+    false,
+    { _preserveReasoningContent: true }
+  ) as { messages: Array<Record<string, unknown>> };
+
+  assert.equal(result.messages[0].reasoning_content, undefined);
+});
+
+test("Responses -> Chat replays the plaintext companion of an opaque reasoning item (#10949)", () => {
+  const result = openaiResponsesToOpenAIRequest(
+    "deepseek-v4-pro",
+    {
+      input: [
+        {
+          id: "rs_opaque",
+          type: "reasoning",
+          encrypted_content: "opaque-provider-state",
+          content: [{ type: "reasoning_text", text: "Untrusted plaintext companion" }],
+          summary: [{ type: "summary_text", text: "Display summary" }],
+        },
+        { type: "function_call", call_id: "call_1", name: "search", arguments: "{}" },
+      ],
+    },
+    false,
+    { _preserveReasoningContent: true }
+  ) as { messages: Array<Record<string, unknown>> };
+
+  assert.equal(result.messages[0].reasoning_content, "Untrusted plaintext companion");
+});
+
+test("Responses -> Chat merges assistant text that follows a function call", () => {
+  const result = openaiResponsesToOpenAIRequest(
+    "gpt-4o",
+    {
+      input: [
+        { type: "function_call", call_id: "call_1", name: "read_file", arguments: "{}" },
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "I inspected it" }],
+        },
+        {
+          type: "reasoning",
+          content: [{ type: "reasoning_text", text: "Inspection complete" }],
+        },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "Continue" }] },
+      ],
+    },
+    false,
+    { _preserveReasoningContent: true }
+  ) as { messages: Array<Record<string, unknown>> };
+
+  assert.deepEqual(result.messages[0], {
+    role: "assistant",
+    content: [{ type: "text", text: "I inspected it" }],
+    tool_calls: [
+      {
+        id: "call_1",
+        type: "function",
+        function: { name: "read_file", arguments: "{}" },
+      },
+    ],
+    reasoning_content: "Inspection complete",
+  });
+  assert.deepEqual(result.messages[1], {
+    role: "user",
+    content: [{ type: "text", text: "Continue" }],
+  });
+});
+
 test("Responses -> Chat filters orphan tool outputs and supports role-based message items", () => {
   const result = openaiResponsesToOpenAIRequest(
     "gpt-4o",
@@ -296,6 +445,105 @@ test("Chat -> Responses clamps call_id to 64 chars and keeps the pair matched (p
   );
 });
 
+test("Chat -> Responses defaults unannotated targets to plaintext reasoning", () => {
+  const result = openaiToOpenAIResponsesRequest(
+    "deepseek-v4-flash",
+    {
+      messages: [
+        {
+          role: "assistant",
+          content: null,
+          reasoning_content: "Inspect the repository first",
+          tool_calls: [
+            {
+              id: "call_1",
+              type: "function",
+              function: { name: "search", arguments: "{}" },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "call_1", content: "found" },
+      ],
+    },
+    false,
+    { _provider: "opencode-go" }
+  ) as { input: Array<Record<string, unknown>> };
+
+  assert.deepEqual(result.input, [
+    {
+      type: "reasoning",
+      content: [{ type: "reasoning_text", text: "Inspect the repository first" }],
+      summary: [],
+    },
+    {
+      type: "function_call",
+      call_id: "call_1",
+      name: "search",
+      arguments: "{}",
+      status: "completed",
+    },
+    { type: "function_call_output", call_id: "call_1", output: "found", status: "completed" },
+  ]);
+});
+
+test("Chat -> DeepSeek Responses accepts the plaintext reasoning alias", () => {
+  const result = openaiToOpenAIResponsesRequest(
+    "deepseek-v4-pro",
+    {
+      messages: [
+        {
+          role: "assistant",
+          content: null,
+          reasoning: "Alias plaintext reasoning",
+          tool_calls: [
+            {
+              id: "call_alias",
+              type: "function",
+              function: { name: "search", arguments: "{}" },
+            },
+          ],
+        },
+      ],
+    },
+    false,
+    { _provider: "deepseek" }
+  ) as { input: Array<Record<string, unknown>> };
+
+  assert.deepEqual(result.input[0], {
+    type: "reasoning",
+    content: [{ type: "reasoning_text", text: "Alias plaintext reasoning" }],
+    summary: [],
+  });
+});
+
+test("Chat -> Responses never promotes OmniRoute's internal reasoning placeholder", () => {
+  const result = openaiToOpenAIResponsesRequest(
+    "deepseek-v4-pro",
+    {
+      messages: [
+        {
+          role: "assistant",
+          reasoning_content: "(prior reasoning summary unavailable)",
+          tool_calls: [
+            {
+              id: "call_1",
+              type: "function",
+              function: { name: "search", arguments: "{}" },
+            },
+          ],
+        },
+      ],
+    },
+    false,
+    { _provider: "deepseek" }
+  ) as { input: Array<Record<string, unknown>> };
+
+  assert.equal(
+    result.input.some((item) => item.type === "reasoning"),
+    false
+  );
+});
+
 test("Chat -> Responses converts messages, tool calls, tool outputs, tools and pass-through params", () => {
   const result = openaiToOpenAIResponsesRequest(
     "gpt-4o",
@@ -360,22 +608,26 @@ test("Chat -> Responses converts messages, tool calls, tool outputs, tools and p
         { type: "input_image", image_url: "https://example.com/cat.png", detail: "high" },
         { type: "input_file", file_data: "abc", filename: "doc.txt" },
       ],
+      status: "completed",
     },
     {
       type: "message",
       role: "assistant",
       content: [{ type: "output_text", text: "Done" }],
+      status: "completed",
     },
     {
       type: "function_call",
       call_id: "call_1",
       name: "read_file",
       arguments: '{"path":"/tmp/a"}',
+      status: "completed",
     },
     {
       type: "function_call_output",
       call_id: "call_1",
       output: [{ type: "input_text", text: "ok" }],
+      status: "completed",
     },
   ]);
   assert.deepEqual((result as any).tools, [
@@ -520,6 +772,7 @@ test("Chat -> Responses converts assistant image_url history parts to output_tex
         { type: "output_text", text: "I inspected the screenshot." },
         { type: "output_text", text: "[Image: https://example.com/scope.png]" },
       ],
+      status: "completed",
     },
   ]);
   assert.equal(JSON.stringify(result).includes('"image_url"'), false);
@@ -599,9 +852,32 @@ test("Chat -> Responses maps reasoning_effort into Responses reasoning", () => {
     null
   );
 
-  assert.deepEqual((result as any).reasoning, { effort: "low" });
+  // Effort-only chat requests now default `summary: "auto"` + the encrypted
+  // reasoning include so Responses-API upstreams stream thinking back to the
+  // chat client (previously the summary was empty and no think was visible).
+  assert.deepEqual((result as any).reasoning, { effort: "low", summary: "auto" });
+  assert.deepEqual((result as Record<string, unknown>).include, ["reasoning.encrypted_content"]);
   assert.equal((result as any).reasoning_effort, undefined);
   assert.equal((result as any).store, false);
+});
+
+test("Chat -> Responses does not default a reasoning summary for reasoning_effort none", () => {
+  const result = openaiToOpenAIResponsesRequest(
+    "gpt-5.3-codex-spark",
+    {
+      messages: [{ role: "user", content: "Hello" }],
+      reasoning_effort: "none",
+    },
+    false,
+    null
+  );
+
+  const record = result as Record<string, unknown>;
+  const reasoning = record.reasoning as Record<string, unknown> | undefined;
+  if (reasoning !== undefined) {
+    assert.equal(reasoning.summary, undefined);
+  }
+  assert.equal(record.include, undefined);
 });
 
 test("Chat -> Responses normalizes reasoning_effort max to xhigh", () => {
@@ -615,7 +891,7 @@ test("Chat -> Responses normalizes reasoning_effort max to xhigh", () => {
     null
   );
 
-  assert.deepEqual((result as any).reasoning, { effort: "xhigh" });
+  assert.deepEqual((result as any).reasoning, { effort: "xhigh", summary: "auto" });
   assert.equal((result as any).reasoning_effort, undefined);
 });
 
@@ -887,9 +1163,10 @@ test("Responses -> Chat: tool_search does not throw (issue #2766)", () => {
   );
 });
 
-test("Responses -> Chat: tool_search is stripped from output tools array (issue #2766)", () => {
-  // Codex clients send tool_search alongside function tools. tool_search has no
-  // Chat Completions equivalent and must be dropped; function tools must remain.
+test("Responses -> Chat: tool_search is mapped to a Chat function tool, not dropped (#7532)", () => {
+  // tool_search (execution: "client") is client-resolved, same as local_shell -> shell;
+  // dropping it (#2766) hid the tool and broke Codex's deferred tool-discovery on
+  // downgrade (#7532) — it is now mapped to a Chat function tool instead.
   const result = openaiResponsesToOpenAIRequest(
     "gpt-4o",
     {
@@ -913,11 +1190,13 @@ test("Responses -> Chat: tool_search is stripped from output tools array (issue 
   assert.equal(
     tools.some((t) => t.type === "tool_search"),
     false,
-    "tool_search must be stripped from output"
+    "raw tool_search type must not survive"
   );
-  assert.equal(tools.length, 1, "only the function tool must remain");
-  assert.equal(tools[0].type, "function");
-  assert.equal(tools[0].function.name, "foo");
+  assert.equal(tools.length, 2, "mapped tool_search function + the function tool must remain");
+  const toolSearch = tools.find((t) => t.function?.name === "search");
+  assert.ok(toolSearch, "tool_search must be mapped to a Chat function tool named after it");
+  assert.equal(toolSearch.type, "function");
+  assert.equal(tools.find((t) => t.function?.name === "foo")?.type, "function");
 });
 
 // --- Issue #2950: image_generation built-in should be silently dropped ---

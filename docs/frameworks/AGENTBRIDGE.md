@@ -22,7 +22,7 @@ When an IDE agent (e.g., GitHub Copilot, Cursor, Claude Code) makes an API call,
 
 This means you can:
 
-- **Reroute any agent to any provider**: Copilot talking to OpenAI? Redirect it to Anthropic Claude, Gemini, or any of OmniRoute's 226+ providers.
+- **Reroute any agent to any provider**: Copilot talking to OpenAI? Redirect it to Anthropic Claude, Gemini, or any of OmniRoute's 338 providers.
 - **Apply model mappings**: `gemini-3-flash` → `claude-sonnet-4.7` transparently at the handler level.
 - **Observe all agent traffic**: every intercepted request is published to the [Traffic Inspector](./TRAFFIC_INSPECTOR.md).
 - **Apply OmniRoute resilience**: combo routing, circuit breakers, fallbacks, and cost tracking work for IDE agent traffic too.
@@ -83,6 +83,22 @@ The core MITM server runs as a Node.js CJS child process (to avoid rewriting the
 - Dispatches to the TypeScript handler layer via HTTP to `http://127.0.0.1:20128`
 
 `TARGET_HOSTS` is loaded from `DATA_DIR/mitm/targets.json` (written by `targets/index.ts` at boot), allowing dynamic updates without restarting the CJS server.
+
+> **Root-CA model (#6684).** The per-SNI-cert-signed-by-a-CA description above
+> is the persisted root-CA model added in #6684 (`src/mitm/cert/rootCa.ts` +
+> `src/mitm/_internal/rootCaShim.cjs`, reusing the CA/leaf crypto already
+> proven for TPROXY in `src/mitm/tproxy/dynamicCert.ts`) — it replaces the
+> older single static self-signed leaf (`src/mitm/cert/generate.ts`, still
+> scoped only to the antigravity hosts) that a bare `server.crt`/`server.key`
+> pair on disk indicates. **Migration behavior**: a fresh install (no prior
+> `server.crt`) gets the root-CA model automatically; an install that already
+> trusted the old static leaf keeps using it until the operator sets
+> `MITM_ROOT_CA_ENABLED=true` and restarts the bridge (`src/mitm/cert/migration.ts`
+> is the pure decision function — a trusted MITM CA that can sign a leaf for
+> **any** host is materially more powerful than the old fixed-SAN leaf, so the
+> switch is never silent for an already-trusted install). The CA cert installs
+> into the same `omniroute-mitm.crt` trust-store slot the old leaf used
+> (`cert/install.ts::installCaCert`) — no dual-trust cleanup needed.
 
 ### 2.3 Handler base (`src/mitm/handlers/base.ts`)
 

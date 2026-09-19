@@ -51,7 +51,7 @@ after(() => {
   } catch {
     /* ignore */
   }
-  if (dataDir) rmSync(dataDir, { recursive: true, force: true });
+  if (dataDir) rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 describe("typedDecay — pure predicates", () => {

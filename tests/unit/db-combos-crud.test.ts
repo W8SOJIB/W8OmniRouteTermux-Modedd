@@ -16,7 +16,7 @@ async function resetStorage() {
   for (let attempt = 0; attempt < 10; attempt++) {
     try {
       if (fs.existsSync(TEST_DATA_DIR)) {
-        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
       break;
     } catch (error: any) {
@@ -37,7 +37,7 @@ test.beforeEach(async () => {
 
 test.after(async () => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("createCombo stores default strategy and supports lookup by id and name", async () => {
@@ -60,6 +60,35 @@ test("createCombo stores default strategy and supports lookup by id and name", a
   ]);
   assert.deepEqual(await combosDb.getComboById((combo as any).id), combo);
   assert.deepEqual(await combosDb.getComboByName("Priority Combo"), combo);
+});
+
+test("combo invariants reject invalid creates and updates atomically", async () => {
+  await assert.rejects(
+    combosDb.createCombo({
+      name: "invalid-gpt-family",
+      allowedProviders: ["github", "codex"],
+      allowedModelFamilies: ["gpt"],
+      models: [{ provider: "zai", model: "glm-5" }],
+    }),
+    /target 1 \(zai\/glm-5\) violates its invariant/i
+  );
+  assert.equal(await combosDb.getComboByName("invalid-gpt-family"), null);
+
+  const combo = await combosDb.createCombo({
+    name: "gpt-family",
+    allowedProviders: ["github", "codex"],
+    allowedModelFamilies: ["gpt"],
+    models: [{ provider: "github", model: "gpt-5.4" }],
+  });
+
+  await assert.rejects(
+    combosDb.updateCombo(String(combo.id), {
+      models: [{ provider: "moonshot", model: "kimi-k2" }],
+    }),
+    /target 1 \(moonshot\/kimi-k2\) violates its invariant/i
+  );
+  const persisted = await combosDb.getComboById(String(combo.id));
+  assert.equal((persisted?.models as Array<{ model: string }>)[0]?.model, "github/gpt-5.4");
 });
 
 test("getCombos returns parsed combos in persisted sort order", async () => {

@@ -93,6 +93,14 @@ const ENV_VAR_ALLOWLIST = new Set([
   "DATA_DIR",
   "REQUIRE_API_KEY",
   "OMNIROUTE_BUILD_PROFILE", // build-time only
+  // Docker builder-stage knobs. Both are documented in docs/guides/DOCKER_GUIDE.md
+  // because they are the two levers for a memory-constrained build host, but
+  // neither is read through process.env in this repo: OMNIROUTE_BUILD_WORKERS is
+  // a Dockerfile ARG that only feeds CIRCLE_NODE_TOTAL, and CIRCLE_NODE_TOTAL is
+  // read by Next itself (node_modules) to size the page-data worker pool. Pinned
+  // by tests/unit/docker-build-memory-budget.test.ts.
+  "OMNIROUTE_BUILD_WORKERS",
+  "CIRCLE_NODE_TOTAL",
   "OMNIROUTE_BUILD_SHA",
   "OMNIROUTE_URL", // used by ad-hoc tooling, validated elsewhere
   "OMNIROUTE_KEY", // ditto
@@ -107,6 +115,12 @@ const ENV_VAR_ALLOWLIST = new Set([
   "NINEROUTER_API_KEY", // injected into the 9router subprocess at spawn (EMBEDDED-SERVICES.md)
   "CLAUDE_CODE_MAX_OUTPUT_TOKENS", // Claude Code CLI's own env var (CODEX-CLI-CONFIGURATION.md)
   "CODEX_HOME", // Codex CLI's own config-home env var (CODEX-CLI-CONFIGURATION.md)
+  // Gemini CLI's own auth-routing env vars. `omniroute run gemini` DELETES them
+  // from the spawned child's env (bin/cli/commands/run.mjs) so a stored Vertex /
+  // Code Assist session cannot override the OmniRoute-directed launch — a delete
+  // on a copied env object, never a `process.env.X` read. (CLI-INTEGRATIONS.md)
+  "GOOGLE_GENAI_USE_VERTEXAI",
+  "GOOGLE_GENAI_USE_GCA",
   "OPENAI_API_BASE", // legacy OpenAI base-URL env var some downstream tools (e.g. Aider) read (CLI-INTEGRATIONS.md)
   "PROMPTFOO_PROVIDER_KEY", // promptfoo's own provider-key env var, used by the red-team suite (GUARDRAILS.md)
   "REDIS_PORT", // docker-compose host-port override (DOCKER_GUIDE.md)
@@ -114,6 +128,15 @@ const ENV_VAR_ALLOWLIST = new Set([
   "LINUX_GPG_KEY", // electron AppImage signing key, CI/build only (ELECTRON_GUIDE.md)
   "BRANCH_LOCK_TOKEN", // release branch-protection ops token (QUALITY_GATE_PLAYBOOK.md)
   "NEXT_LOCALE", // next-intl locale cookie name (I18N.md)
+  // Feature flags are resolved by key at runtime — `resolveFeatureFlag()` reads
+  // `process.env[key]` (src/shared/utils/featureFlags.ts), never a literal
+  // `process.env.MODELS_CATALOG_PREFIX_MODE`, so this scan cannot see the read.
+  // The flag is real: defined in featureFlagDefinitions.ts, overridable from the
+  // dashboard or the environment. (API_REFERENCE.md, VSCODE-COPILOT.md)
+  "MODELS_CATALOG_PREFIX_MODE",
+  // Telegram Mini App integration (proposal TELEGRAM-MINIAPP.md, not yet implemented): env vars named in the feasibility analysis but no code reads them yet.
+  "TELEGRAM_WEBHOOK_URL", // proposal-only: Telegram webhook public endpoint (TELEGRAM-MINIAPP.md, future feature)
+  "TELEGRAM_WEBHOOK_SECRET", // proposal-only: Telegram webhook HMAC secret (TELEGRAM-MINIAPP.md, future feature)
 ]);
 
 // Common pluralized / column-header all-caps that aren't env vars
@@ -311,6 +334,7 @@ const ENV_VAR_DENYLIST = new Set([
   "AUTHZ_NOT_INITIALIZED", // AuthzAssertionError code (AUTHZ_GUIDE.md)
   "MODULE_NOT_FOUND", // Node runtime error code watched by service supervisor (ELECTRON_GUIDE.md)
   "ERR_DLOPEN_FAILED", // Node native-module load error code (ELECTRON_GUIDE.md)
+  "SQLITE_FULL", // SQLite result code returned when the disk is full (DATABASE_GUIDE.md)
   // ── Code-symbol / naming-convention examples documented in prose ─────────────
   "UPPER_SNAKE", // the literal naming-convention token in the style guide (CODEBASE_DOCUMENTATION.md)
   "DEFAULT_TIMEOUT", // example constant name in the UPPER_SNAKE convention row (AGENTS.md)
@@ -360,19 +384,6 @@ const SKIP_DOC_FILES = new Set([
   "docs/reference/PROVIDER_REFERENCE.md", // auto-generated from providers.ts
   "docs/openapi.yaml",
   "docs/i18n", // translations — separate workflow
-  // Design / research / plan docs: by definition describe not-yet-built files and
-  // proposed (not-yet-shipped) endpoints (each carries a `Status: Design`/`Active
-  // research`/`Plano` header). Same rationale as the audit report above — these are
-  // forward-looking specs, not living API docs, so their forward references are
-  // expected, not fabrications.
-  "docs/research", // DISCOVERY_TOOL_DESIGN.md, UNLIMITED_LLM_ACCESS.md, …
-  "docs/superpowers/plans", // dated implementation plans (files described before they exist)
-  "docs/superpowers/specs", // dated research/spec reports (point-in-time findings, may cite proposed/not-yet-built endpoints, env vars, and files) — same rationale as the plans/research dirs above
-  // Release notes are historical, point-in-time records: they intentionally describe
-  // modules/paths as they were at that release (e.g. a module later moved or renamed).
-  // Rewriting them to today's layout would falsify history — out of scope for a
-  // living-docs accuracy gate.
-  "docs/releases",
   // Forward-looking coverage plan: a `- [ ]` checklist of test targets and helper
   // components to be created. Same rationale as the design/plan docs above.
   "docs/ops/COVERAGE_PLAN.md",
@@ -402,9 +413,9 @@ function allScanFiles(root = ROOT) {
   const files = [];
   for (const p of SCAN_PATHS) walkMarkdown(p, files, root);
   return files.filter((f) => {
-    const rel = path.relative(root, f);
+    const rel = path.relative(root, f).split(path.sep).join("/");
     for (const skip of SKIP_DOC_FILES) {
-      if (rel === skip || rel.startsWith(skip + path.sep)) return false;
+      if (rel === skip || rel.startsWith(skip + "/")) return false;
     }
     return true;
   });
@@ -861,9 +872,13 @@ export function formatHumanReport(result) {
   return lines.join("\n");
 }
 
+export function isDirectExecution(moduleUrl, argvEntry) {
+  if (!argvEntry) return false;
+  return path.resolve(fileURLToPath(moduleUrl)) === path.resolve(argvEntry);
+}
+
 // CLI entry — only run when invoked directly (not when imported for tests).
-const isMain = import.meta.url === `file://${process.argv[1]}`;
-if (isMain) {
+if (isDirectExecution(import.meta.url, process.argv[1])) {
   main();
 }
 

@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   FREE_PROVIDERS,
+  NOAUTH_PROVIDERS,
   OAUTH_PROVIDERS,
   WEB_COOKIE_PROVIDERS,
   APIKEY_PROVIDERS,
@@ -41,6 +42,12 @@ type ProviderRecord = {
   hasFree?: boolean;
   deprecated?: boolean;
   deprecationReason?: string;
+  /**
+   * #7286: native function calling / prompt-emulated via webTools.ts / silently dropped.
+   * Loosely typed `string` (not a literal union) — the source provider-catalog object
+   * literals infer widened `string` for this field and are passed in as-is.
+   */
+  toolCalling?: string;
   [k: string]: unknown;
 };
 
@@ -54,13 +61,19 @@ function escapeCell(value: string | undefined): string {
   return value.replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\n/g, " ");
 }
 
-function row(p: ProviderRecord, category: string): string {
+function row(p: ProviderRecord, category: string, includeToolCalling: boolean): string {
   const alias = p.alias ? `\`${p.alias}\`` : "—";
   const hint = p.deprecated
     ? `⚠️ **DEPRECATED.** ${escapeCell(p.deprecationReason)}`
     : escapeCell(p.authHint || p.freeNote);
   const link = p.website ? `[link](${p.website})` : "—";
-  return `| \`${p.id}\` | ${alias} | ${escapeCell(p.name)} | ${category} | ${link} | ${hint} |`;
+  const base = `| \`${p.id}\` | ${alias} | ${escapeCell(p.name)} | ${category} | ${link} | ${hint} |`;
+  return includeToolCalling ? `${base} ${escapeCell(p.toolCalling)} |` : base;
+}
+
+/** #7286: only render the "Tool calling" column when at least one record in the section sets it. */
+function hasToolCallingColumn(rows: ProviderRecord[]): boolean {
+  return rows.some((p) => typeof p.toolCalling === "string");
 }
 
 function categoryTags(id: string): string[] {
@@ -82,11 +95,20 @@ function buildSection(title: string, rows: ProviderRecord[], category: string): 
   if (rows.length === 0) return "";
   const lines: string[] = [];
   lines.push(`## ${title} (${rows.length})\n`);
-  lines.push("| ID | Alias | Name | Tags | Website | Notes |");
-  lines.push("|----|-------|------|------|---------|-------|");
+  const includeToolCalling = hasToolCallingColumn(rows);
+  lines.push(
+    includeToolCalling
+      ? "| ID | Alias | Name | Tags | Website | Notes | Tool calling |"
+      : "| ID | Alias | Name | Tags | Website | Notes |"
+  );
+  lines.push(
+    includeToolCalling
+      ? "|----|-------|------|------|---------|-------|--------------|"
+      : "|----|-------|------|------|---------|-------|"
+  );
   for (const p of sortById(rows)) {
     const tags = [category, ...categoryTags(p.id)].join(", ");
-    lines.push(row(p, tags));
+    lines.push(row(p, tags, includeToolCalling));
   }
   lines.push("");
   return lines.join("\n");
@@ -115,6 +137,7 @@ function buildHeader(total: number): string {
     "## Categories",
     "",
     "- **Free** — free tier with API key (configured via dashboard)",
+    "- **No-auth** — public endpoints that require no key or sign-in at all",
     "- **OAuth** — sign-in flow handled by OmniRoute, no API key needed",
     "- **Web cookie** — wraps the provider's web app via cookie auth",
     "- **API key** — paid provider configured via API key (free credits may apply)",
@@ -127,6 +150,10 @@ function buildHeader(total: number): string {
     "",
     "Additional tags: `image`, `video`, `aggregator`, `enterprise`, `embed/rerank`, `self-hosted`.",
     "",
+    "`Tool calling` (where shown): `native` — real function-calling API; `emulated` — the " +
+      "`tools` array is prompt-emulated via `webTools.ts` (regex-parsed `<tool>{...}</tool>` " +
+      "blocks); `none` — `tools` is currently silently dropped. See #7286.",
+    "",
     "Use the dashboard at `/dashboard/providers` to enable, configure, and test each provider.",
     "",
     "---",
@@ -134,8 +161,19 @@ function buildHeader(total: number): string {
   ].join("\n");
 }
 
+function countExecutorImpls(): number {
+  const dir = path.join(ROOT, "open-sse", "executors");
+  const nonImpl = new Set(["index.ts", "index.mts", "types.ts", "base.ts", "constants.ts"]);
+  return fs
+    .readdirSync(dir)
+    .filter(
+      (f) => f.endsWith(".ts") && !f.endsWith(".test.ts") && !f.startsWith("__") && !nonImpl.has(f)
+    ).length;
+}
+
 function main() {
   const free = asRecords(FREE_PROVIDERS);
+  const noauth = asRecords(NOAUTH_PROVIDERS as Record<string, ProviderRecord>);
   const oauth = asRecords(OAUTH_PROVIDERS);
   const webCookie = asRecords(WEB_COOKIE_PROVIDERS);
   const apiKey = asRecords(APIKEY_PROVIDERS);
@@ -148,6 +186,7 @@ function main() {
 
   const allIds = new Set<string>([
     ...free.map((p) => p.id),
+    ...noauth.map((p) => p.id),
     ...oauth.map((p) => p.id),
     ...webCookie.map((p) => p.id),
     ...apiKey.map((p) => p.id),
@@ -161,6 +200,7 @@ function main() {
 
   const sections = [
     buildSection("Free Tier (OAuth-first or no-key)", free, "Free"),
+    buildSection("No-auth Providers (no key required)", noauth, "No-auth"),
     buildSection("OAuth Providers", oauth, "OAuth"),
     buildSection("Web Cookie Providers", webCookie, "Web cookie"),
     buildSection("API Key Providers (paid / paid-with-free-credits)", apiKey, "API key"),
@@ -177,7 +217,7 @@ function main() {
     "",
     "- Catalog: [`src/shared/constants/providers.ts`](../../src/shared/constants/providers.ts)",
     "- Registry (per-model details): [`open-sse/config/providerRegistry.ts`](../../open-sse/config/providerRegistry.ts)",
-    "- Executors: [`open-sse/executors/`](../../open-sse/executors/) (31 files)",
+    `- Executors: [\`open-sse/executors/\`](../../open-sse/executors/) (${countExecutorImpls()} implementations)`,
     "- Translators: [`open-sse/translator/`](../../open-sse/translator/)",
     "",
     "## See Also",
@@ -193,9 +233,10 @@ function main() {
   console.log(`✓ Wrote ${OUT_FILE}`);
   console.log(`  Providers: ${allIds.size} unique IDs`);
   console.log(
-    `  Sections: free=${free.length}, oauth=${oauth.length}, web=${webCookie.length}, ` +
-      `apikey=${apiKey.length}, local=${local.length}, search=${search.length}, ` +
-      `audio=${audio.length}, proxy=${upstreamProxy.length}, cloud=${cloudAgent.length}, system=${system.length}`
+    `  Sections: free=${free.length}, noauth=${noauth.length}, oauth=${oauth.length}, ` +
+      `web=${webCookie.length}, apikey=${apiKey.length}, local=${local.length}, ` +
+      `search=${search.length}, audio=${audio.length}, proxy=${upstreamProxy.length}, ` +
+      `cloud=${cloudAgent.length}, system=${system.length}`
   );
 }
 

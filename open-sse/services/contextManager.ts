@@ -6,7 +6,12 @@
  */
 
 import { REGISTRY } from "../config/providerRegistry.ts";
-import { getModelContextLimit } from "../../src/lib/modelCapabilities.ts";
+import {
+  getModelContextLimit,
+  type ModelCapabilityResolutionSnapshot,
+} from "../../src/lib/modelCapabilities.ts";
+import { parseModel } from "./model.ts";
+import { jsonLength } from "../utils/jsonSize.ts";
 
 // Default token limits per provider (fallbacks when not in registry)
 const DEFAULT_LIMITS: Record<string, number> = {
@@ -14,6 +19,10 @@ const DEFAULT_LIMITS: Record<string, number> = {
   openai: 128000,
   gemini: 1000000,
   codex: 400000,
+  // HyperAgent Claude-family agents (fable/opus/sonnet) — 1M default; was falling
+  // through to 128k and blocking normal agentic tool loops with huge catalogs.
+  hyperagent: 1_000_000,
+  ha: 1_000_000,
   default: 128000,
 };
 
@@ -44,24 +53,339 @@ function getReserveTokensOverride(): number | null {
   return null;
 }
 
+// How many of the newest inline images to keep when pruning older ones (#8560).
+function getKeepLatestImagesOverride(): number | null {
+  const envValue = process.env.CONTEXT_KEEP_LATEST_IMAGES;
+  if (envValue) {
+    const parsed = parseInt(envValue, 10);
+    if (!isNaN(parsed) && parsed >= 0) return parsed;
+  }
+  return null;
+}
+
+const DEFAULT_KEEP_LATEST_IMAGES = 2;
+const IMAGE_REMOVED_PLACEHOLDER = "[Earlier image removed to fit context window]";
+
 // Rough chars-per-token ratio for quick estimation
 const CHARS_PER_TOKEN = 4;
 
+// Bounded per-image token budget used in place of measuring the raw base64
+// payload as text. In line with the owner's PoC (~1052 total for prompt +
+// 1 image) and litellm's calculate_img_tokens() default-count fast-path —
+// see #8368 research notes.
+const IMAGE_TOKEN_ESTIMATE = 1200;
+
+// #10840: same budget, deliberately. The Gemini `inlineData` matcher does not
+// inspect media type, so a base64 PDF arriving in that shape is ALREADY measured
+// at IMAGE_TOKEN_ESTIMATE today. Reusing it makes the OpenAI `file` and Claude
+// `document` shapes agree with the estimate the same document already receives,
+// rather than introducing a second constant with no grounding in this repo.
+const DOCUMENT_TOKEN_ESTIMATE = IMAGE_TOKEN_ESTIMATE;
+
+// Matches inline base64 data URLs, e.g. "data:image/png;base64,AAAA...".
+// Deliberately scoped to `data:image/...;base64,` so remote (http/https)
+// URLs and generic long base64 text strings stay on the text-estimation path.
+const INLINE_BASE64_IMAGE_RE = /^data:image\/[a-zA-Z0-9.+-]+;base64,/;
+
+function isInlineBase64ImageUrl(value: unknown): boolean {
+  return typeof value === "string" && INLINE_BASE64_IMAGE_RE.test(value);
+}
+
+// OpenAI chat.completions: { type: 'image_url', image_url: { url: 'data:...' } | 'data:...' }
+function matchesOpenAIImageUrlShape(node: Record<string, unknown>): boolean {
+  const imageUrl = node.image_url;
+  if (isInlineBase64ImageUrl(imageUrl)) return true;
+  return (
+    !!imageUrl &&
+    typeof imageUrl === "object" &&
+    isInlineBase64ImageUrl((imageUrl as Record<string, unknown>).url)
+  );
+}
+
+// AI SDK: { type: 'image', image: 'data:...' } (also covers Responses API's
+// { type: 'input_image', image_url: 'data:...' } via matchesOpenAIImageUrlShape above).
+function matchesAiSdkImageShape(node: Record<string, unknown>): boolean {
+  return node.type === "image" && isInlineBase64ImageUrl(node.image);
+}
+
+// Claude: { type: 'image', source: { type: 'base64', data: '...' } }
+function matchesClaudeSourceShape(node: Record<string, unknown>): boolean {
+  if (node.type !== "image") return false;
+  const source = node.source;
+  if (!source || typeof source !== "object") return false;
+  const src = source as Record<string, unknown>;
+  return src.type === "base64" && typeof src.data === "string";
+}
+
+// Gemini: { inlineData: { data: '...' } } | { inline_data: { data: '...' } }
+function matchesGeminiInlineDataShape(node: Record<string, unknown>): boolean {
+  const inlineData = node.inlineData ?? node.inline_data;
+  if (!inlineData || typeof inlineData !== "object") return false;
+  return typeof (inlineData as Record<string, unknown>).data === "string";
+}
+
+// Any inline base64 data URL, regardless of media type — file parts legitimately
+// carry application/pdf, text/csv, and so on.
+const INLINE_BASE64_DATA_RE = /^data:[^;,]+;base64,/;
+
+function isInlineBase64DataUrl(value: unknown): boolean {
+  return typeof value === "string" && INLINE_BASE64_DATA_RE.test(value);
+}
+
+// OpenAI chat.completions: { type: 'file', file: { file_data | data: 'data:...;base64,...' } }
+// Responses API:          { type: 'input_file', file_data: 'data:...;base64,...' }
+// Shapes mirror services/ccOpenAiMediaBlocks.ts::convertOpenAiMediaBlock.
+function matchesOpenAIFileShape(node: Record<string, unknown>): boolean {
+  if (node.type === "input_file") return isInlineBase64DataUrl(node.file_data);
+  if (node.type !== "file") return false;
+  const file = node.file;
+  if (!file || typeof file !== "object") return false;
+  const f = file as Record<string, unknown>;
+  return isInlineBase64DataUrl(f.file_data) || isInlineBase64DataUrl(f.data);
+}
+
+// Claude: { type: 'document', source: { type: 'base64', data: '...' } }
+function matchesClaudeDocumentShape(node: Record<string, unknown>): boolean {
+  if (node.type !== "document") return false;
+  const source = node.source;
+  if (!source || typeof source !== "object") return false;
+  const src = source as Record<string, unknown>;
+  return src.type === "base64" && typeof src.data === "string";
+}
+
 /**
- * Estimate token count from text length
+ * Detect inline-base64 *document* blocks (#10840). Deliberately separate from
+ * {@link isInlineBase64ImageBlock}: that predicate also drives
+ * pruneOlderInlineImages, and dropping a user's attached PDF is not the same
+ * decision as dropping an old screenshot. This one only feeds token estimation.
  */
-export function estimateTokens(text: string | object | null | undefined): number {
+export function isInlineBase64DocumentBlock(node: Record<string, unknown>): boolean {
+  return matchesOpenAIFileShape(node) || matchesClaudeDocumentShape(node);
+}
+
+/**
+ * Detect the 5 documented inline-base64 image content-block shapes (see the
+ * shape-specific matchers above).
+ */
+export function isInlineBase64ImageBlock(node: Record<string, unknown>): boolean {
+  return (
+    matchesOpenAIImageUrlShape(node) ||
+    matchesAiSdkImageShape(node) ||
+    matchesClaudeSourceShape(node) ||
+    matchesGeminiInlineDataShape(node)
+  );
+}
+
+function replaceImageBlockWithPlaceholder(block: Record<string, unknown>): Record<string, unknown> {
+  // Responses API parts use input_text / input_image — keep that family so restore
+  // does not rewrite a chat-completions-shaped part into a Responses input item.
+  if (block.type === "input_image") {
+    return { type: "input_text", text: IMAGE_REMOVED_PLACEHOLDER };
+  }
+  if (block.inlineData || block.inline_data) {
+    return { text: IMAGE_REMOVED_PLACEHOLDER };
+  }
+  return { type: "text", text: IMAGE_REMOVED_PLACEHOLDER };
+}
+
+/**
+ * Replace oldest inline base64 image blocks with short text placeholders while
+ * keeping the newest `keepLatest` images intact. Vision models still receive
+ * recent screenshots; older ones are dropped so multi-turn Codex/Responses
+ * sessions can fit the concrete input cap (#8560).
+ */
+export function pruneOlderInlineImages(
+  messages: Record<string, unknown>[],
+  options: { keepLatest?: number; targetTokens?: number } = {}
+): { messages: Record<string, unknown>[]; pruned: number } {
+  const keepLatest =
+    options.keepLatest ?? getKeepLatestImagesOverride() ?? DEFAULT_KEEP_LATEST_IMAGES;
+  const targetTokens = options.targetTokens;
+
+  const locations: Array<{ messageIndex: number; contentIndex: number }> = [];
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
+    const content = messages[messageIndex]?.content;
+    if (!Array.isArray(content)) continue;
+    for (let contentIndex = 0; contentIndex < content.length; contentIndex++) {
+      const part = content[contentIndex];
+      if (
+        part &&
+        typeof part === "object" &&
+        !Array.isArray(part) &&
+        isInlineBase64ImageBlock(part as Record<string, unknown>)
+      ) {
+        locations.push({ messageIndex, contentIndex });
+      }
+    }
+  }
+
+  if (locations.length <= keepLatest) {
+    return { messages, pruned: 0 };
+  }
+
+  const prunable = locations.slice(0, Math.max(0, locations.length - keepLatest));
+  const next = messages.map((message) => {
+    if (!Array.isArray(message.content)) return message;
+    return { ...message, content: [...message.content] };
+  });
+  let pruned = 0;
+
+  for (const location of prunable) {
+    if (targetTokens != null && estimateTokens(next) <= targetTokens) break;
+    const content = next[location.messageIndex].content as unknown[];
+    const block = content[location.contentIndex] as Record<string, unknown>;
+    content[location.contentIndex] = replaceImageBlockWithPlaceholder(block);
+    pruned += 1;
+  }
+
+  return { messages: next, pruned };
+}
+
+/**
+ * Recursively walk a structured node, replacing every recognized inline
+ * base64 image block with a short placeholder (so its bulk is excluded from
+ * the char-count pass below) while accumulating a bounded per-image token
+ * cost. Returns the accumulated image token cost; the caller measures the
+ * placeholder-substituted structure with the normal char/4 heuristic.
+ *
+ * Non-image content (including remote image URLs and generic base64 text)
+ * is left untouched and continues to flow through the text-estimation path.
+ */
+function extractImageTokens(node: unknown, seen: Set<unknown>): { node: unknown; tokens: number } {
+  if (node === null || typeof node !== "object") {
+    return { node, tokens: 0 };
+  }
+  // Guard against cycles in structured request bodies.
+  if (seen.has(node)) return { node, tokens: 0 };
+  seen.add(node);
+
+  if (Array.isArray(node)) {
+    let tokens = 0;
+    const out = node.map((item) => {
+      const record =
+        item && typeof item === "object" && !Array.isArray(item)
+          ? (item as Record<string, unknown>)
+          : null;
+      if (record && isInlineBase64ImageBlock(record)) {
+        tokens += IMAGE_TOKEN_ESTIMATE;
+        return { __image_token_estimate__: IMAGE_TOKEN_ESTIMATE };
+      }
+      if (record && isInlineBase64DocumentBlock(record)) {
+        tokens += DOCUMENT_TOKEN_ESTIMATE;
+        return { __document_token_estimate__: DOCUMENT_TOKEN_ESTIMATE };
+      }
+      const result = extractImageTokens(item, seen);
+      tokens += result.tokens;
+      return result.node;
+    });
+    return { node: out, tokens };
+  }
+
+  const record = node as Record<string, unknown>;
+  if (isInlineBase64ImageBlock(record)) {
+    return {
+      node: { __image_token_estimate__: IMAGE_TOKEN_ESTIMATE },
+      tokens: IMAGE_TOKEN_ESTIMATE,
+    };
+  }
+  if (isInlineBase64DocumentBlock(record)) {
+    return {
+      node: { __document_token_estimate__: DOCUMENT_TOKEN_ESTIMATE },
+      tokens: DOCUMENT_TOKEN_ESTIMATE,
+    };
+  }
+
+  let tokens = 0;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    const result = extractImageTokens(value, seen);
+    out[key] = result.node;
+    tokens += result.tokens;
+  }
+  return { node: out, tokens };
+}
+
+/**
+ * Estimate token count from text length.
+ *
+ * Structured input is first walked for inline base64 image blocks (#8368):
+ * each recognized image block is substituted with a bounded per-image token
+ * budget instead of measuring its base64 payload as raw text, then the
+ * remainder of the structure is measured normally via the char/4 heuristic.
+ */
+export function estimateTokens(text: unknown): number {
   if (!text) return 0;
-  const str = typeof text === "string" ? text : JSON.stringify(text);
-  return Math.ceil(str.length / CHARS_PER_TOKEN);
+  if (typeof text === "string") {
+    return Math.ceil(text.length / CHARS_PER_TOKEN);
+  }
+  const { node, tokens: imageTokens } = extractImageTokens(text, new Set());
+  // #7847: count the serialized length instead of building the string. Only `.length` was ever
+  // used, and on a multi-megabyte agent body that string is a pure transient allocation.
+  // jsonLength is exact (property-tested against JSON.stringify), so the estimate is unchanged.
+  return Math.ceil(jsonLength(node) / CHARS_PER_TOKEN) + imageTokens;
 }
 
 /**
  * Get token limit for a provider/model combination
  * Priority: Env override > models.dev DB > Registry defaultContextLength > DEFAULT_LIMITS
  */
-export function getTokenLimit(provider: string, model: string | null = null): number {
-  return resolveTokenLimit(provider, model).limit;
+export function getTokenLimit(
+  provider: string,
+  model: string | null = null,
+  snapshot?: ModelCapabilityResolutionSnapshot | null
+): number {
+  return resolveTokenLimit(provider, model, snapshot).limit;
+}
+
+/**
+ * Context window from a known source only: an explicit canonical window, or a
+ * provider/model-specific `resolveTokenLimit` result. The generic 128000
+ * catch-all (`specific: false`) is treated as unknown so combo `min()` does
+ * not advertise 128k when every real member is larger (#10734).
+ */
+export function getSourcedTokenLimit(
+  provider: string,
+  model: string | null = null,
+  canonicalWindow?: unknown,
+  snapshot?: ModelCapabilityResolutionSnapshot | null
+): number | undefined {
+  if (
+    typeof canonicalWindow === "number" &&
+    Number.isFinite(canonicalWindow) &&
+    canonicalWindow > 0
+  ) {
+    return canonicalWindow;
+  }
+  const resolved = resolveTokenLimit(provider, model, snapshot);
+  return resolved.specific ? resolved.limit : undefined;
+}
+
+/**
+ * Resolve a combo target's token limit without crashing when `parseModel(modelStr)`
+ * returns `provider: null` (model id with no `provider/` prefix).
+ *
+ * `ResolvedComboTarget.provider` is populated independently of `modelStr`, so fall
+ * back to it before calling `getTokenLimit` (#8716).
+ */
+export function getComboTargetTokenLimit(options: {
+  modelStr?: string | null;
+  provider?: string | null;
+  parsedProvider?: string | null;
+  parsedModel?: string | null;
+  targetProvider?: string | null;
+}): number {
+  let parsedProvider = options.parsedProvider;
+  let parsedModel = options.parsedModel;
+  if (
+    (parsedProvider === undefined || parsedModel === undefined) &&
+    Object.prototype.hasOwnProperty.call(options, "modelStr")
+  ) {
+    const parsed = parseModel(options.modelStr);
+    if (parsedProvider === undefined) parsedProvider = parsed.provider;
+    if (parsedModel === undefined) parsedModel = parsed.model;
+  }
+  const provider = parsedProvider ?? options.targetProvider ?? options.provider ?? "unknown";
+  return getTokenLimit(provider, parsedModel ?? null);
 }
 
 /**
@@ -70,17 +394,20 @@ export function getTokenLimit(provider: string, model: string | null = null): nu
  * name heuristic, curated per-provider default) or only from the generic
  * catch-all default.
  */
-function resolveTokenLimit(
+export function resolveTokenLimit(
   provider: string,
-  model: string | null = null
+  model: string | null = null,
+  snapshot?: ModelCapabilityResolutionSnapshot | null
 ): { limit: number; specific: boolean } {
   // 1. Check environment variable override first
   const envOverride = getEnvOverride(provider);
   if (envOverride) return { limit: envOverride, specific: true };
 
+  const lowerModel = (model || "").toLowerCase();
+
   // 2. Check models.dev synced DB for per-model context limit
   if (model) {
-    const dbLimit = getModelContextLimit(provider, model);
+    const dbLimit = getModelContextLimit(provider, model, snapshot);
     if (dbLimit && dbLimit > 0) return { limit: dbLimit, specific: true };
   }
 
@@ -92,15 +419,14 @@ function resolveTokenLimit(
 
   // 4. Check if model name hints at a known limit
   if (model) {
-    const lower = model.toLowerCase();
-    if (lower.includes("claude")) return { limit: DEFAULT_LIMITS.claude, specific: true };
-    if (lower.includes("gemini")) return { limit: DEFAULT_LIMITS.gemini, specific: true };
+    if (lowerModel.includes("claude")) return { limit: DEFAULT_LIMITS.claude, specific: true };
+    if (lowerModel.includes("gemini")) return { limit: DEFAULT_LIMITS.gemini, specific: true };
     if (
-      lower.includes("gpt") ||
-      lower.includes("o1") ||
-      lower.includes("o3") ||
-      lower.includes("o4") ||
-      lower.includes("codex")
+      lowerModel.includes("gpt") ||
+      lowerModel.includes("o1") ||
+      lowerModel.includes("o3") ||
+      lowerModel.includes("o4") ||
+      lowerModel.includes("codex")
     )
       return { limit: DEFAULT_LIMITS.codex, specific: true };
   }
@@ -144,19 +470,30 @@ export function resolveComboContextLimit(options: {
 
 /**
  * Apply context compression to request body.
- * Operates in 3 layers of increasing aggressiveness:
+ * Operates in layers of increasing aggressiveness:
  *
  * Layer 1: Trim tool_result messages (truncate long outputs)
+ * Layer 1.5: Prune older inline images (keep latest N — #8560)
  * Layer 2: Compress structured thinking blocks (remove from history, keep last)
  * Layer 3: Aggressive purification (drop old messages until fitting)
  *
+ * Callers with OpenAI Responses `input[]` (Codex) must adapt via
+ * `adaptBodyForCompression` before calling and `restore()` after — this helper
+ * is message-centric by design.
+ *
  * @param {object} body - Request body with messages[]
- * @param {object} options - { provider?, model?, maxTokens?, reserveTokens? }
+ * @param {object} options - { provider?, model?, maxTokens?, reserveTokens?, keepLatestImages? }
  * @returns {{ body: object, compressed: boolean, stats: object }}
  */
 export function compressContext(
-  body: Record<string, unknown>,
-  options: { provider?: string; model?: string; maxTokens?: number; reserveTokens?: number } = {}
+  body: Record<string, unknown> | null | undefined,
+  options: {
+    provider?: string;
+    model?: string;
+    maxTokens?: number;
+    reserveTokens?: number;
+    keepLatestImages?: number;
+  } = {}
 ) {
   if (!body || !body.messages || !Array.isArray(body.messages)) {
     return { body, compressed: false, stats: {} };
@@ -172,8 +509,12 @@ export function compressContext(
   );
   const targetTokens = Math.max(0, maxTokens - reserveTokens);
 
-  let messages = [...body.messages];
-  let currentTokens = estimateTokens(JSON.stringify(messages));
+  let messages = [...(body.messages as Record<string, unknown>[])];
+  // #8594: pass the structured messages array directly — estimateTokens walks it for
+  // inline base64 image blocks (#8368) and substitutes a bounded per-image estimate.
+  // JSON.stringify()-ing first forces the char/4 text path and mis-measures a ~500KB
+  // image as ~125k tokens, triggering needless compression / context loss.
+  let currentTokens = estimateTokens(messages);
   const stats = { original: currentTokens, layers: [] as { name: string; tokens: number }[] };
 
   // Already fits
@@ -183,7 +524,7 @@ export function compressContext(
 
   // Layer 1: Trim tool_result/tool messages
   messages = trimToolMessages(messages, 2000); // Max 2000 chars per tool result
-  currentTokens = estimateTokens(JSON.stringify(messages));
+  currentTokens = estimateTokens(messages); // #8594: object-path keeps the #8368 image estimate
   stats.layers.push({ name: "trim_tools", tokens: currentTokens });
 
   if (currentTokens <= targetTokens) {
@@ -194,9 +535,27 @@ export function compressContext(
     };
   }
 
+  // Layer 1.5: Drop oldest inline images while keeping the newest ones (#8560).
+  const imagePrune = pruneOlderInlineImages(messages, {
+    keepLatest: options.keepLatestImages,
+    targetTokens,
+  });
+  if (imagePrune.pruned > 0) {
+    messages = imagePrune.messages;
+    currentTokens = estimateTokens(messages);
+    stats.layers.push({ name: "prune_images", tokens: currentTokens });
+    if (currentTokens <= targetTokens) {
+      return {
+        body: { ...body, messages },
+        compressed: true,
+        stats: { ...stats, final: currentTokens },
+      };
+    }
+  }
+
   // Layer 2: Compress structured thinking blocks (remove from non-last assistant messages)
   messages = compressThinking(messages);
-  currentTokens = estimateTokens(JSON.stringify(messages));
+  currentTokens = estimateTokens(messages); // #8594: object-path keeps the #8368 image estimate
   stats.layers.push({ name: "compress_thinking", tokens: currentTokens });
 
   if (currentTokens <= targetTokens) {
@@ -209,7 +568,7 @@ export function compressContext(
 
   // Layer 3: Aggressive purification — drop oldest messages keeping system + last N pairs
   messages = purifyHistory(messages, targetTokens);
-  currentTokens = estimateTokens(JSON.stringify(messages));
+  currentTokens = estimateTokens(messages); // #8594: object-path keeps the #8368 image estimate
   stats.layers.push({ name: "purify_history", tokens: currentTokens });
 
   return {
@@ -295,7 +654,9 @@ function purifyHistory(messages: Record<string, unknown>[], targetTokens: number
     // orphan tool_results that Claude rejects ("tool_result without preceding tool_use").
     candidate = fixToolPairs(candidate);
     candidate = stripTrailingAssistantOrphanToolUse(candidate);
-    const tokens = estimateTokens(JSON.stringify(candidate));
+    // #8594: measure the candidate structure directly so image-bearing turns are not
+    // over-counted and pruned during the binary search.
+    const tokens = estimateTokens(candidate);
     if (tokens <= targetTokens) break;
     keep = Math.max(2, Math.floor(keep * 0.7)); // Drop 30% each iteration
   }
@@ -308,13 +669,35 @@ function purifyHistory(messages: Record<string, unknown>[], targetTokens: number
   result = fixToolPairs(result);
   result = stripTrailingAssistantOrphanToolUse(result);
 
-  // Add summary of dropped messages
+  // Add summary of dropped messages. Merge the notice INTO the leading
+  // system/developer message instead of splicing a second system-role message
+  // mid-array: strict gateways (TokenRouter confirmed live 2026-08-22, see the
+  // PROVIDERS_SYSTEM_MUST_BE_FIRST list in src/lib/memory/injection.ts) reject
+  // any system message at index > 0 with HTTP 400 "System message must be at
+  // the beginning". When there is no leading system message, prepend one --
+  // index 0 is accepted by every provider (same slot the old splice used when
+  // system[] was empty).
   if (keep < nonSystem.length) {
     const dropped = nonSystem.length - keep;
-    result.splice(system.length, 0, {
-      role: "system",
-      content: `[Context compressed: ${dropped} earlier messages removed to fit context window]`,
-    });
+    const droppedNotice = `[Context compressed: ${dropped} earlier messages removed to fit context window]`;
+    const first = result[0];
+    if (first && (first.role === "system" || first.role === "developer")) {
+      if (typeof first.content === "string") {
+        result[0] = {
+          ...first,
+          content: first.content ? `${droppedNotice}\n${first.content}` : droppedNotice,
+        };
+      } else if (Array.isArray(first.content)) {
+        result[0] = {
+          ...first,
+          content: [{ type: "text", text: droppedNotice }, ...(first.content as unknown[])],
+        };
+      } else {
+        result[0] = { ...first, content: droppedNotice };
+      }
+    } else {
+      result.unshift({ role: "system", content: droppedNotice });
+    }
   }
 
   return result;

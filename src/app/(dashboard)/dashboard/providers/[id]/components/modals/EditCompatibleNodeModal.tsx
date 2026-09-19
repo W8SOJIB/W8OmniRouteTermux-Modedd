@@ -1,8 +1,11 @@
 "use client";
 import { useState, useEffect } from "react";
 import { useTranslations } from "next-intl";
-import { Button, Badge, Input, Modal, Select } from "@/shared/components";
+import { Button, Badge, Input, Modal, Select, Toggle } from "@/shared/components";
+import { isValidProviderIconUrl } from "@/shared/validation/iconUrl";
 import { CC_COMPATIBLE_DEFAULT_CHAT_PATH } from "../../providerDetailConstants";
+import NewApiAggregatorFields from "./NewApiAggregatorFields";
+import { providerText } from "../../providerPageHelpers";
 interface EditCompatibleNodeModalNode {
   id?: string;
   name?: string;
@@ -12,6 +15,7 @@ interface EditCompatibleNodeModalNode {
   chatPath?: string;
   modelsPath?: string;
   iconUrl?: string;
+  providerSpecificData?: Record<string, unknown>;
 }
 
 interface EditCompatibleNodeModalProps {
@@ -40,18 +44,27 @@ export default function EditCompatibleNodeModal({
     chatPath: "",
     modelsPath: "",
     iconUrl: "",
+    newApiAggregatorBalance: false,
+    consoleApiKey: "",
+    newApiUserId: "",
+    quotaPerUnit: "",
   });
   const [saving, setSaving] = useState(false);
   const [checkKey, setCheckKey] = useState("");
   const [checkModelId, setCheckModelId] = useState("");
   const [validating, setValidating] = useState(false);
-  const [validationResult, setValidationResult] = useState<
-    null | { valid: boolean; error?: string | null; method?: string | null }
-  >(null);
+  const [validationResult, setValidationResult] = useState<null | {
+    valid: boolean;
+    error?: string | null;
+    method?: string | null;
+  }>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [iconUrlError, setIconUrlError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (node) {
+    if (isOpen && node) {
+      const psd = (node.providerSpecificData || {}) as Record<string, unknown>;
       setFormData({
         name: node.name || "",
         prefix: node.prefix || "",
@@ -66,7 +79,13 @@ export default function EditCompatibleNodeModal({
         chatPath: node.chatPath || (isCcCompatible ? CC_COMPATIBLE_DEFAULT_CHAT_PATH : ""),
         modelsPath: isCcCompatible ? "" : node.modelsPath || "",
         iconUrl: node.iconUrl || "",
+        newApiAggregatorBalance: psd.newApiAggregatorBalance === true,
+        consoleApiKey: typeof psd.consoleApiKey === "string" ? psd.consoleApiKey : "",
+        newApiUserId: typeof psd.newApiUserId === "string" ? psd.newApiUserId : "",
+        quotaPerUnit: typeof psd.quotaPerUnit === "number" ? String(psd.quotaPerUnit) : "",
       });
+      setSaveError(null);
+      setIconUrlError(null);
       setShowAdvanced(
         !!(
           node.chatPath ||
@@ -75,7 +94,7 @@ export default function EditCompatibleNodeModal({
         )
       );
     }
-  }, [node, isAnthropic, isCcCompatible]);
+  }, [isOpen, node, isAnthropic, isCcCompatible]);
 
   const apiTypeOptions = [
     { value: "chat", label: t("chatCompletions") },
@@ -88,6 +107,13 @@ export default function EditCompatibleNodeModal({
 
   const handleSubmit = async () => {
     if (!formData.name.trim() || !formData.prefix.trim() || !formData.baseUrl.trim()) return;
+    const iconUrl = formData.iconUrl.trim();
+    if (!isValidProviderIconUrl(iconUrl)) {
+      setIconUrlError(t("iconUrlInvalid"));
+      return;
+    }
+    setIconUrlError(null);
+    setSaveError(null);
     setSaving(true);
     try {
       const payload: any = {
@@ -101,7 +127,29 @@ export default function EditCompatibleNodeModal({
       if (!isAnthropic) {
         payload.apiType = formData.apiType;
       }
+      // Aggregator gateway fields (#9415)
+      if (formData.newApiAggregatorBalance) {
+        payload.providerSpecificData = {
+          newApiAggregatorBalance: true,
+        };
+        if (formData.consoleApiKey.trim()) {
+          payload.providerSpecificData.consoleApiKey = formData.consoleApiKey.trim();
+        }
+        if (formData.newApiUserId.trim()) {
+          payload.providerSpecificData.newApiUserId = formData.newApiUserId.trim();
+        }
+        const parsedQuotaPerUnit = parseInt(formData.quotaPerUnit, 10);
+        if (Number.isFinite(parsedQuotaPerUnit) && parsedQuotaPerUnit > 0) {
+          payload.providerSpecificData.quotaPerUnit = parsedQuotaPerUnit;
+        }
+      }
       await onSave(payload);
+    } catch (error) {
+      setSaveError(
+        error instanceof Error && error.message.trim()
+          ? error.message
+          : providerText(t, "failedSave", "Failed to save")
+      );
     } finally {
       setSaving(false);
     }
@@ -117,6 +165,7 @@ export default function EditCompatibleNodeModal({
           baseUrl: formData.baseUrl,
           apiKey: checkKey,
           type: isAnthropic ? "anthropic-compatible" : "openai-compatible",
+          apiType: !isAnthropic ? formData.apiType : undefined,
           compatMode: isCcCompatible ? "cc" : undefined,
           chatPath: formData.chatPath || (isCcCompatible ? CC_COMPATIBLE_DEFAULT_CHAT_PATH : ""),
           modelsPath: isCcCompatible ? "" : formData.modelsPath,
@@ -130,7 +179,10 @@ export default function EditCompatibleNodeModal({
         method: data.method ?? null,
       });
     } catch {
-      setValidationResult({ valid: false, error: "Network error" });
+      setValidationResult({
+        valid: false,
+        error: providerText(t, "networkError", "Network error"),
+      });
     } finally {
       setValidating(false);
     }
@@ -217,7 +269,25 @@ export default function EditCompatibleNodeModal({
           value={formData.iconUrl}
           onChange={(e) => setFormData({ ...formData, iconUrl: e.target.value })}
           placeholder="https://example.com/logo.png"
-          hint={t("iconUrlHint")}
+          hint={iconUrlError ?? t("iconUrlHint")}
+        />
+        <Toggle
+          label={t("newApiAggregatorToggleLabel")}
+          description={t("newApiAggregatorToggleHint")}
+          checked={formData.newApiAggregatorBalance}
+          onChange={(checked: boolean) =>
+            setFormData({ ...formData, newApiAggregatorBalance: checked })
+          }
+        />
+        <NewApiAggregatorFields
+          enabled={formData.newApiAggregatorBalance}
+          values={{
+            consoleApiKey: formData.consoleApiKey,
+            newApiUserId: formData.newApiUserId,
+            quotaPerUnit: formData.quotaPerUnit,
+          }}
+          onChange={(patch) => setFormData({ ...formData, ...patch })}
+          t={t}
         />
         <button
           type="button"
@@ -297,6 +367,15 @@ export default function EditCompatibleNodeModal({
                 {validationResult.error}
               </span>
             )}
+          </div>
+        )}
+        {saveError && (
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="text-sm text-red-500 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2"
+          >
+            {saveError}
           </div>
         )}
         <div className="flex gap-2">

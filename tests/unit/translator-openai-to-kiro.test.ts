@@ -966,7 +966,7 @@ test("OpenAI -> Kiro serializes non-string role:tool content to non-empty text (
 });
 
 // Only Claude models support images in Kiro. Non-Claude Kiro models
-// (deepseek-3.2, minimax-m2.5, glm-5, qwen3-coder-next, auto-kiro) must NOT
+// (deepseek-3.2, minimax-m2.5, glm-5, qwen3-coder-next) must NOT
 // receive image attachments — attaching them is wrong for those models.
 const PNG_DATA_URL = "data:image/png;base64,aGVsbG8=";
 
@@ -1016,8 +1016,8 @@ test("OpenAI -> Kiro drops images for non-Claude models (deepseek)", () => {
   );
 });
 
-test("OpenAI -> Kiro drops images for non-Claude models (glm / auto-kiro)", () => {
-  for (const model of ["glm-5", "minimax-m2.5", "qwen3-coder-next", "auto-kiro"]) {
+test("OpenAI -> Kiro drops images for other non-Claude Kiro models", () => {
+  for (const model of ["glm-5", "minimax-m2.5", "qwen3-coder-next"]) {
     const result = buildImageRequest(model);
     const images = result.conversationState.currentMessage.userInputMessage.images;
     assert.ok(
@@ -1031,7 +1031,7 @@ test("buildKiroPayload rejects the Anthropic-only [1m] context suffix before Bed
   const body = { messages: [{ role: "user", content: "Hello" }] };
 
   assert.throws(
-    () => buildKiroPayload("claude-opus-4.7-thinking-agentic[1m]", body, true, {}),
+    () => buildKiroPayload("claude-sonnet-5-thinking[1m]", body, true, {}),
     /\[1m\]' suffix is not supported by Kiro upstream/,
     "kr/* model ids carrying [1m] must be rejected, not forwarded to AWS Bedrock"
   );
@@ -1043,6 +1043,22 @@ test("buildKiroPayload accepts kr/* model ids without the [1m] suffix", () => {
   assert.doesNotThrow(
     () => buildKiroPayload("claude-sonnet-4.5", body, true, {}),
     "model ids without [1m] must continue to build normally"
+  );
+});
+
+test("buildKiroPayload strips the supported Thinking selector before upstream", () => {
+  const body = { messages: [{ role: "user", content: "Hello" }] };
+
+  const result = buildKiroPayload("claude-sonnet-5-thinking", body, true, {});
+  assert.equal(
+    result.conversationState.currentMessage.userInputMessage.modelId,
+    "claude-sonnet-5",
+    "the local -thinking alias must not be forwarded to Kiro"
+  );
+  assert.equal(
+    result.additionalModelRequestFields?.output_config?.effort,
+    "high",
+    "the -thinking selector should still request Kiro adaptive thinking"
   );
 });
 
@@ -1098,7 +1114,7 @@ test("buildKiroPayload enables thinking mode for Claude models via reasoning_eff
     max_tokens: 64000,
   };
 
-  const result = buildKiroPayload("claude-opus-4.8", body, false, null);
+  const result = buildKiroPayload("claude-sonnet-5", body, false, null); // only Kiro model accepting adaptive thinking (#6576)
 
   assert.ok(result.additionalModelRequestFields, "additionalModelRequestFields must be set");
   assert.deepEqual(result.additionalModelRequestFields.thinking, {
@@ -1119,6 +1135,31 @@ test("buildKiroPayload enables thinking mode for Claude models via reasoning_eff
   );
 });
 
+test("buildKiroPayload uses native Max reasoning for Kiro GPT-5.6 models", () => {
+  for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+    const result = buildKiroPayload(
+      model,
+      {
+        messages: [{ role: "user", content: "Solve a hard problem" }],
+        reasoning_effort: "max",
+        max_tokens: 64000,
+      },
+      false,
+      null
+    );
+
+    assert.ok(result.additionalModelRequestFields, "Max reasoning must be forwarded to Kiro");
+    assert.equal(result.additionalModelRequestFields.reasoning.effort, "max");
+    assert.equal(result.additionalModelRequestFields.output_config, undefined);
+    assert.equal(result.additionalModelRequestFields.thinking, undefined);
+    assert.equal(result.additionalModelRequestFields.max_tokens, undefined);
+    assert.doesNotMatch(
+      result.conversationState.currentMessage.userInputMessage.content,
+      /<thinking_mode>/
+    );
+  }
+});
+
 test("buildKiroPayload drops temperature when thinking is enabled", () => {
   const body = {
     messages: [{ role: "user", content: "Solve a hard problem" }],
@@ -1126,7 +1167,7 @@ test("buildKiroPayload drops temperature when thinking is enabled", () => {
     temperature: 0.5,
   };
 
-  const result = buildKiroPayload("claude-opus-4.8", body, false, null);
+  const result = buildKiroPayload("claude-sonnet-5", body, false, null);
 
   assert.ok(result.additionalModelRequestFields, "thinking must be enabled");
   assert.equal(
@@ -1157,7 +1198,7 @@ test("buildKiroPayload maps body.thinking budget_tokens to effort level", () => 
     thinking: { type: "enabled", budget_tokens: 50000 },
   };
 
-  const result = buildKiroPayload("claude-opus-4.7", body, false, null);
+  const result = buildKiroPayload("claude-sonnet-5", body, false, null);
 
   assert.ok(result.additionalModelRequestFields, "thinking must be enabled from budget_tokens");
   assert.equal(result.additionalModelRequestFields.output_config.effort, "high");
@@ -1189,7 +1230,7 @@ test("buildKiroPayload maps reasoning_effort to the same Kiro effort level (no +
 
 test("buildKiroPayload reads effort from Anthropic output_config.effort", () => {
   const result = buildKiroPayload(
-    "claude-opus-4.8",
+    "claude-sonnet-5",
     { messages: [{ role: "user", content: "hard" }], output_config: { effort: "xhigh" } },
     false,
     null
@@ -1201,7 +1242,7 @@ test("buildKiroPayload reads effort from Anthropic output_config.effort", () => 
 
 test("buildKiroPayload defaults adaptive thinking (no effort) to high", () => {
   const result = buildKiroPayload(
-    "claude-opus-4.8",
+    "claude-sonnet-5",
     { messages: [{ role: "user", content: "hard" }], thinking: { type: "adaptive" } },
     false,
     null
@@ -1216,7 +1257,7 @@ test("buildKiroPayload defaults adaptive thinking (no effort) to high", () => {
 
 test("buildKiroPayload drops both temperature and top_p when thinking is enabled", () => {
   const result = buildKiroPayload(
-    "claude-opus-4.8",
+    "claude-sonnet-5",
     {
       messages: [{ role: "user", content: "hard" }],
       reasoning_effort: "high",

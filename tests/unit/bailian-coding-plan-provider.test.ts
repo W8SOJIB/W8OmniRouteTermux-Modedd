@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 // in CI even though the module evaluation is well-formed.
 import { APIKEY_PROVIDERS, OAUTH_PROVIDERS } from "../../src/shared/constants/providers.ts";
 import { validateProviderApiKey } from "../../src/lib/providers/validation.ts";
+import { BAILIAN_CODING_PLAN_MODELS } from "../../open-sse/config/providers/registry/bailian-coding-plan/index.ts";
 import {
   validateBody,
   createProviderSchema,
@@ -21,7 +22,7 @@ test("APIKEY_PROVIDERS includes bailian-coding-plan", () => {
   const provider = APIKEY_PROVIDERS["bailian-coding-plan"];
   assert.equal(provider.id, "bailian-coding-plan", "Provider id should be 'bailian-coding-plan'");
   assert.equal(provider.alias, "bcp", "Provider alias should be 'bcp'");
-  assert.ok(provider.name, "Provider should have a name");
+  assert.equal(provider.name, "Alibaba Token Plan");
 });
 
 test("bailian-coding-plan not in OAUTH_PROVIDERS", () => {
@@ -33,7 +34,7 @@ test("bailian-coding-plan not in OAUTH_PROVIDERS", () => {
 });
 
 // Schema validation tests for providerSpecificData.baseUrl
-const VALID_BAILIAN_URL = "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1";
+const VALID_BAILIAN_URL = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic/v1";
 
 test("createProviderSchema accepts valid baseUrl in providerSpecificData", () => {
   const validation = validateBody(createProviderSchema, {
@@ -228,12 +229,12 @@ test("updateProviderConnectionSchema accepts http protocol", () => {
 // Import the exported helper function from the route
 const { getStaticModelsForProvider } = await import("../../src/lib/providers/staticModels.ts");
 
-test("getStaticModelsForProvider returns 10 models for bailian-coding-plan", () => {
+test("getStaticModelsForProvider returns 6 models for bailian-coding-plan", () => {
   const models = getStaticModelsForProvider("bailian-coding-plan");
 
   assert.ok(models, "Should return models for bailian-coding-plan");
   assert.ok(Array.isArray(models), "Should return an array");
-  assert.equal(models.length, 10, "Should return exactly 10 models");
+  assert.equal(models.length, 6, "Should return exactly 6 models");
 });
 
 test("getStaticModelsForProvider returns correct model IDs for bailian-coding-plan", () => {
@@ -245,26 +246,34 @@ test("getStaticModelsForProvider returns correct model IDs for bailian-coding-pl
   }
 
   const expectedIds = [
+    "qwen3.8-max-preview",
+    "qwen3.7-max",
     "qwen3.7-plus",
-    "qwen3-coder-plus",
-    "qwen3-coder-next",
-    "glm-4.7",
-    "qwen3.6-plus",
-    "qwen3.5-plus",
-    "qwen3-max-2026-01-23",
-    "kimi-k2.5",
-    "glm-5",
-    "MiniMax-M2.5",
+    "qwen3.6-flash",
+    "glm-5.2",
+    "deepseek-v4-pro",
   ];
 
   const actualIds = models.map((m) => m.id);
+  assert.deepEqual(actualIds, expectedIds);
+});
 
-  for (const expectedId of expectedIds) {
-    assert.ok(actualIds.includes(expectedId), `Should include model: ${expectedId}`);
-  }
-
-  // Verify no extra models
-  assert.equal(actualIds.length, expectedIds.length, "Should have exactly the expected models");
+test("bailian-coding-plan models match the documented reasoning and vision capabilities", () => {
+  assert.deepEqual(
+    BAILIAN_CODING_PLAN_MODELS.map(({ id, supportsReasoning, supportsVision }) => ({
+      id,
+      supportsReasoning,
+      supportsVision: supportsVision === true,
+    })),
+    [
+      { id: "qwen3.8-max-preview", supportsReasoning: true, supportsVision: true },
+      { id: "qwen3.7-max", supportsReasoning: true, supportsVision: false },
+      { id: "qwen3.7-plus", supportsReasoning: true, supportsVision: true },
+      { id: "qwen3.6-flash", supportsReasoning: true, supportsVision: true },
+      { id: "glm-5.2", supportsReasoning: true, supportsVision: false },
+      { id: "deepseek-v4-pro", supportsReasoning: true, supportsVision: false },
+    ]
+  );
 });
 
 test("getStaticModelsForProvider returns models with correct structure", () => {
@@ -293,13 +302,26 @@ test("getStaticModelsForProvider returns undefined for non-static providers", ()
 });
 
 test("getStaticModelsForProvider returns local image catalogs for image-only providers", () => {
-  const models = getStaticModelsForProvider("xai");
+  // nanobanana has IMAGE_PROVIDERS rows but no chat registry models — specialty
+  // must still surface them. Chat+image providers (xai/lmarena/openai) keep
+  // image models exclusively in IMAGE_PROVIDERS (not the chat specialty list).
+  const models = getStaticModelsForProvider("nanobanana");
 
-  assert.ok(models, "xAI should expose local image models");
-  assert.deepEqual(
-    models.map((model) => model.id),
-    ["grok-imagine-image-quality", "grok-imagine-image"]
-  );
+  assert.ok(models, "nanobanana should expose local image models");
+  assert.ok(models.length >= 1);
+  assert.ok(models.every((m) => m.supportedEndpoints?.includes("images")));
+});
+
+test("getStaticModelsForProvider does not dump IMAGE_PROVIDERS into chat specialty", () => {
+  for (const provider of ["lmarena", "openai", "xai"]) {
+    const models = getStaticModelsForProvider(provider) || [];
+    assert.ok(
+      !models.some((m) => m.supportedEndpoints?.includes("images")),
+      `${provider} chat specialty must not include image-only models`
+    );
+  }
+  const lmarena = getStaticModelsForProvider("lmarena") || [];
+  assert.ok(!lmarena.some((m) => String(m.id).includes("flux")));
 });
 
 test("getStaticModelsForProvider returns models for other static providers", () => {
@@ -405,7 +427,7 @@ test("validateProviderApiKey returns invalid for 401 response (bailian-coding-pl
       provider: "bailian-coding-plan",
       apiKey: "invalid-key",
       providerSpecificData: {
-        baseUrl: "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1",
+        baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic/v1",
       },
     });
 
@@ -430,7 +452,7 @@ test("validateProviderApiKey returns invalid for 403 response (bailian-coding-pl
       provider: "bailian-coding-plan",
       apiKey: "forbidden-key",
       providerSpecificData: {
-        baseUrl: "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1",
+        baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic/v1",
       },
     });
 
@@ -457,7 +479,7 @@ test("validateProviderApiKey returns valid for 400 response (bailian-coding-plan
       provider: "bailian-coding-plan",
       apiKey: "valid-key",
       providerSpecificData: {
-        baseUrl: "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1",
+        baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic/v1",
       },
     });
 
@@ -486,7 +508,7 @@ test("validateProviderApiKey returns valid for 200 response (bailian-coding-plan
       provider: "bailian-coding-plan",
       apiKey: "valid-key",
       providerSpecificData: {
-        baseUrl: "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1",
+        baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic/v1",
       },
     });
 
@@ -511,7 +533,7 @@ test("validateProviderApiKey returns invalid for 500 response (bailian-coding-pl
       provider: "bailian-coding-plan",
       apiKey: "bad-key",
       providerSpecificData: {
-        baseUrl: "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1",
+        baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic/v1",
       },
     });
 
@@ -539,7 +561,7 @@ test("validateProviderApiKey avoids double /messages suffix for bailian-coding-p
       provider: "bailian-coding-plan",
       apiKey: "valid-key",
       providerSpecificData: {
-        baseUrl: "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1/messages",
+        baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic/v1/messages",
       },
     });
 
@@ -547,7 +569,7 @@ test("validateProviderApiKey avoids double /messages suffix for bailian-coding-p
     assert.equal(urls.length, 1);
     assert.equal(
       urls[0],
-      "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1/messages",
+      "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic/v1/messages",
       "Should probe exactly one /messages suffix"
     );
   } finally {
@@ -566,7 +588,7 @@ test("POST /api/providers validation: bailian-coding-plan with baseUrl passes sc
     apiKey: "sk-placeholder-key",
     name: "Test Bailian Provider",
     providerSpecificData: {
-      baseUrl: "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1",
+      baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic/v1",
     },
   });
 
@@ -575,7 +597,7 @@ test("POST /api/providers validation: bailian-coding-plan with baseUrl passes sc
     assert.equal(validation.data.provider, "bailian-coding-plan");
     assert.equal(
       validation.data.providerSpecificData?.baseUrl,
-      "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1"
+      "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic/v1"
     );
   }
 });

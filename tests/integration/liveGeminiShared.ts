@@ -44,7 +44,7 @@ async function apiFetch(path: string, options: RequestInit = {}): Promise<Respon
     headers: {
       Authorization: `Bearer ${API_KEY}`,
       "Content-Type": "application/json",
-      ...(options.headers || {}),
+      ...options.headers,
     },
   });
 }
@@ -57,7 +57,8 @@ async function ensureGeminiProvider(): Promise<boolean> {
     const connections = data.connections || data;
     const geminiActive = Array.isArray(connections)
       ? connections.find(
-          (c: any) => c.provider === "gemini" && c.isActive && c.testStatus !== "expired"
+          (c: Record<string, unknown>) =>
+            c.provider === "gemini" && c.isActive && c.testStatus !== "expired"
         )
       : null;
 
@@ -68,7 +69,7 @@ async function ensureGeminiProvider(): Promise<boolean> {
 
     // Check if gemini exists but is expired — try to reactivate via DB
     const geminiExpired = Array.isArray(connections)
-      ? connections.find((c: any) => c.provider === "gemini" && c.isActive)
+      ? connections.find((c: Record<string, unknown>) => c.provider === "gemini" && c.isActive)
       : null;
 
     if (geminiExpired) {
@@ -143,7 +144,9 @@ async function ensureDefaultCombo(): Promise<void> {
     if (!res.ok) return;
     const data = await res.json();
     const combos = data.combos || data;
-    const existing = Array.isArray(combos) ? combos.find((c: any) => c.name === "default") : null;
+    const existing = Array.isArray(combos)
+      ? combos.find((c: Record<string, unknown>) => c.name === "default")
+      : null;
 
     if (existing) {
       console.log(
@@ -381,6 +384,33 @@ export function genAgenticTaskMessage(): Message {
   return { role: "user", content: pick(AGENTIC_TASKS) };
 }
 
+// #7360 follow-up: the standard CASE_BUILDERS prompts are a few hundred to a
+// couple thousand tokens — nowhere near Gemini's free-tier TPM ceiling (16000
+// tokens/min for gemma-4, per the live error text: "Quota exceeded for
+// metric: generate_content_free_tier_input_token_count, limit: 16000"). That
+// meant none of the existing workload tests ever exercised a REAL TPM 429 —
+// only RPM-style rate limiting. genHugeContextMessage builds a single message
+// large enough (~4 chars/token estimate) to approach or exceed that ceiling by
+// itself, so a couple of these back-to-back genuinely trips Gemini's TPM
+// limit and exercises the real classification (RATE_LIMIT_EXCEEDED, not
+// QUOTA_EXHAUSTED) + comboCooldownWait retry path end-to-end, not just a
+// synthetic/mocked 429.
+export function genHugeContextMessage(approxTokens = 12000): Message {
+  const CHARS_PER_TOKEN = 4;
+  const targetChars = approxTokens * CHARS_PER_TOKEN;
+  const chunks = [...LONG_DOCUMENTS, ...CODE_BLOCKS];
+  let content = "";
+  let i = 0;
+  while (content.length < targetChars) {
+    content += `\n\n--- Section ${i + 1} ---\n\n${chunks[i % chunks.length]}`;
+    i++;
+  }
+  return {
+    role: "user",
+    content: `I'm pasting a large batch of internal documentation and code samples below. Read through all of it, then give me a single consolidated summary (max 200 words) covering the recurring themes.\n${content}`,
+  };
+}
+
 export function genMultiTurnConversation(turns: number): Message[] {
   const messages: Message[] = [];
 
@@ -475,6 +505,72 @@ interface StreamResult {
   totalTokens: number;
 }
 
+// #7360 follow-up: extend the workload test to the Responses API too (not
+// just Chat Completions). Parses OmniRoute's own event shapes from
+// open-sse/translator/response/openai-responses.ts: response.output_text.delta
+// / response.reasoning_summary_text.delta for content, response.completed for
+// the terminal status + usage.
+export async function readResponsesSSEStream(response: Response): Promise<StreamResult> {
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullContent = "";
+  let finishReason = "unknown";
+  let totalTokens = 0;
+  let rawChunkCount = 0;
+  const debugLines: string[] = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    rawChunkCount++;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const data = line.slice(6).trim();
+      if (data === "[DONE]") continue;
+
+      if (debugLines.length < 3) {
+        debugLines.push(data.slice(0, 200));
+      }
+
+      try {
+        const parsed = JSON.parse(data) as Record<string, unknown>;
+        const type = parsed.type as string | undefined;
+
+        if (
+          type === "response.output_text.delta" ||
+          type === "response.reasoning_summary_text.delta"
+        ) {
+          const delta = parsed.delta as string | undefined;
+          if (delta) fullContent += delta;
+        } else if (type === "response.completed") {
+          const resp = parsed.response as Record<string, unknown> | undefined;
+          finishReason = (resp?.status as string) || "unknown";
+          const usage = resp?.usage as Record<string, number> | undefined;
+          if (usage) {
+            totalTokens =
+              usage.total_tokens ?? (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0);
+          }
+        }
+      } catch {
+        // skip malformed chunks
+      }
+    }
+  }
+
+  if (fullContent.length === 0 && rawChunkCount > 0) {
+    console.log(`    [DEBUG] responses: empty content: ${rawChunkCount} raw chunks`);
+    for (const d of debugLines) console.log(`    [DEBUG] data: ${d}`);
+  }
+
+  return { fullContent, finishReason, totalTokens };
+}
+
 export async function readSSEStream(response: Response): Promise<StreamResult> {
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
@@ -540,6 +636,414 @@ export async function readSSEStream(response: Response): Promise<StreamResult> {
 }
 
 // --------------------------------------------------------------------------
+// Tool Call Testing Helpers (Chat Completions + Responses API)
+// --------------------------------------------------------------------------
+
+export interface ToolCall {
+  id: string;
+  type: string;
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+export interface ResponsesToolCall {
+  id: string;
+  type: "function_call";
+  call_id: string;
+  name: string;
+  arguments: string;
+}
+
+export interface ChatResponse {
+  choices: Choice[];
+  model: string;
+}
+
+interface Choice {
+  finish_reason: string;
+  message: {
+    role: string;
+    content: string | null;
+    tool_calls?: ToolCall[];
+  };
+}
+
+export interface ResponsesResponse {
+  id: string;
+  object: string;
+  status: string;
+  model: string;
+  output: Array<{
+    id: string;
+    type: string;
+    role?: string;
+    content?: Array<{ type: string; text?: string; annotations?: unknown[] }>;
+    call_id?: string;
+    name?: string;
+    arguments?: string;
+  }>;
+  usage?: {
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+  };
+}
+
+export const TOOL_DEFINITION = {
+  type: "function" as const,
+  function: {
+    name: "write_file",
+    description: "Write content to a file",
+    parameters: {
+      type: "object" as const,
+      properties: {
+        path: { type: "string" as const, description: "File path" },
+        content: { type: "string" as const, description: "File content" },
+      },
+      required: ["path", "content"],
+    },
+    strict: true,
+  },
+};
+
+export function extractToolCalls(data: ChatResponse): ToolCall[] {
+  for (const choice of data.choices) {
+    if (choice.finish_reason === "tool_calls" && choice.message.tool_calls?.length) {
+      return choice.message.tool_calls;
+    }
+  }
+  return [];
+}
+
+export function extractToolCallsFromResponses(data: ResponsesResponse): ResponsesToolCall[] {
+  const results: ResponsesToolCall[] = [];
+  for (const item of data.output) {
+    if (item.type === "function_call" && item.arguments) {
+      results.push({
+        id: item.id,
+        type: "function_call",
+        call_id: item.call_id || item.id,
+        name: item.name || "",
+        arguments: item.arguments || "",
+      });
+    }
+  }
+  return results;
+}
+
+export function validateToolCallArguments(toolCalls: ToolCall[] | ResponsesToolCall[]): void {
+  assert.ok(toolCalls.length > 0, "expected at least one tool call");
+
+  for (const tc of toolCalls) {
+    const rawArgs = "function" in tc ? tc.function.arguments : tc.arguments;
+
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(rawArgs);
+    } catch (e) {
+      assert.fail(
+        `tool call arguments are NOT valid JSON: ${e}\n` +
+          `arguments repr: ${JSON.stringify(rawArgs)}\n` +
+          `arguments first 500 chars: ${rawArgs.slice(0, 500)}`
+      );
+      return;
+    }
+
+    assert.ok(typeof parsed === "object", "arguments must parse to an object");
+    assert.ok(typeof parsed.content === "string", "content must be a string");
+    assert.ok(typeof parsed.path === "string", "path must be a string");
+
+    const content = parsed.content as string;
+
+    if (content.includes("for ") || content.includes("def ")) {
+      assert.ok(content.includes("\n"), "multi-line code should contain actual newline characters");
+    }
+
+    const doubleEscaped = rawArgs.includes(String.raw`\\n`);
+    assert.ok(
+      !doubleEscaped,
+      String.raw`arguments should NOT contain double-escaped \\n sequences`
+    );
+
+    const reSerialized = JSON.stringify(parsed);
+    assert.doesNotThrow(() => JSON.parse(reSerialized), "re-serialized args should be valid JSON");
+  }
+}
+
+// Ad-hoc experiment flag: force tool_choice: "required" across every live
+// Gemini tool-call helper below, without permanently changing default test
+// behavior. Set FORCE_TOOL_CHOICE_REQUIRED=1 to compare against baseline.
+const FORCE_TOOL_CHOICE_REQUIRED = process.env.FORCE_TOOL_CHOICE_REQUIRED === "1";
+
+export async function sendToolCallChatRequest(
+  model: string,
+  prompt: string
+): Promise<ChatResponse> {
+  const res = await fetch(`${BASE_URL}/v1/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${API_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "user", content: prompt }],
+      tools: [TOOL_DEFINITION],
+      temperature: 0.1,
+      stream: false,
+      max_tokens: 4096,
+      ...(FORCE_TOOL_CHOICE_REQUIRED ? { tool_choice: "required" } : {}),
+    }),
+    signal: AbortSignal.timeout(90_000),
+  });
+
+  assert.equal(res.status, 200, `HTTP ${res.status}`);
+  const data = (await res.json()) as ChatResponse;
+  assert.ok(data.choices?.length > 0, "expected at least one choice");
+  return data;
+}
+
+export async function sendStreamingToolCallChatRequest(
+  model: string,
+  prompt: string
+): Promise<ChatResponse> {
+  const res = await fetch(`${BASE_URL}/v1/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${API_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "user", content: prompt }],
+      tools: [TOOL_DEFINITION],
+      temperature: 0.1,
+      stream: true,
+      max_tokens: 4096,
+      ...(FORCE_TOOL_CHOICE_REQUIRED ? { tool_choice: "required" } : {}),
+    }),
+    signal: AbortSignal.timeout(120_000),
+  });
+
+  assert.equal(res.status, 200, `HTTP ${res.status}`);
+
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const toolCallDeltas: Map<string, { id: string; name: string; arguments: string }> = new Map();
+  let finalFinishReason = "";
+  let finalModel = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const data = line.slice(6).trim();
+      if (data === "[DONE]") continue;
+
+      try {
+        const parsed = JSON.parse(data) as Record<string, unknown>;
+        const choices = (parsed.choices ?? []) as Array<Record<string, unknown>>;
+        const choice = choices[0];
+
+        if (choice?.finish_reason) {
+          finalFinishReason = choice.finish_reason as string;
+        }
+        if (parsed.model && !finalModel) {
+          finalModel = parsed.model as string;
+        }
+
+        const delta = choice?.delta as Record<string, unknown> | undefined;
+        const tcDeltas = delta?.tool_calls as Array<Record<string, unknown>> | undefined;
+        if (tcDeltas) {
+          for (const tcd of tcDeltas) {
+            const idx = tcd.index as number;
+            const id = tcd.id as string | undefined;
+            const fn = tcd.function as Record<string, unknown> | undefined;
+
+            if (!toolCallDeltas.has(String(idx))) {
+              toolCallDeltas.set(String(idx), { id: id ?? "", name: "", arguments: "" });
+            }
+            const entry = toolCallDeltas.get(String(idx))!;
+            if (id) entry.id = id;
+            if (fn?.name) entry.name = fn.name as string;
+            if (fn?.arguments) entry.arguments += fn.arguments as string;
+          }
+        }
+      } catch {
+        // skip malformed chunks
+      }
+    }
+  }
+
+  const toolCalls: ToolCall[] = [];
+  for (const [, delta] of toolCallDeltas) {
+    toolCalls.push({
+      id: delta.id,
+      type: "function",
+      function: { name: delta.name, arguments: delta.arguments },
+    });
+  }
+
+  return {
+    model: finalModel,
+    choices: [
+      {
+        finish_reason: finalFinishReason,
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+        },
+      },
+    ],
+  };
+}
+
+export async function sendToolCallResponsesRequest(
+  model: string,
+  prompt: string
+): Promise<ResponsesResponse> {
+  const res = await fetch(`${BASE_URL}/v1/responses`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${API_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      input: prompt,
+      tools: [
+        {
+          type: "function",
+          name: TOOL_DEFINITION.function.name,
+          description: TOOL_DEFINITION.function.description,
+          parameters: TOOL_DEFINITION.function.parameters,
+          strict: TOOL_DEFINITION.function.strict,
+        },
+      ],
+      temperature: 0.1,
+      stream: false,
+      max_output_tokens: 4096,
+      ...(FORCE_TOOL_CHOICE_REQUIRED ? { tool_choice: "required" } : {}),
+    }),
+    signal: AbortSignal.timeout(90_000),
+  });
+
+  assert.equal(res.status, 200, `HTTP ${res.status}`);
+  const data = (await res.json()) as ResponsesResponse;
+  return data;
+}
+
+export async function sendStreamingToolCallResponsesRequest(
+  model: string,
+  prompt: string
+): Promise<ResponsesToolCall[]> {
+  const res = await fetch(`${BASE_URL}/v1/responses`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${API_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      input: prompt,
+      tools: [
+        {
+          type: "function",
+          name: TOOL_DEFINITION.function.name,
+          description: TOOL_DEFINITION.function.description,
+          parameters: TOOL_DEFINITION.function.parameters,
+          strict: TOOL_DEFINITION.function.strict,
+        },
+      ],
+      temperature: 0.1,
+      stream: true,
+      max_output_tokens: 4096,
+      ...(FORCE_TOOL_CHOICE_REQUIRED ? { tool_choice: "required" } : {}),
+    }),
+    signal: AbortSignal.timeout(120_000),
+  });
+
+  assert.equal(res.status, 200, `HTTP ${res.status}`);
+
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const toolCallMap = new Map<
+    string,
+    { id: string; call_id: string; name: string; arguments: string }
+  >();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const data = line.slice(6).trim();
+      if (data === "[DONE]") continue;
+
+      try {
+        const parsed = JSON.parse(data) as Record<string, unknown>;
+        const eventType = parsed.type as string;
+
+        if (eventType === "response.output_item.added") {
+          const item = parsed.item as Record<string, unknown> | undefined;
+          if (item?.type === "function_call") {
+            const itemId = item.id as string;
+            const callId = (item.call_id as string) || itemId;
+            const name = (item.name as string) || "";
+            toolCallMap.set(itemId, { id: itemId, call_id: callId, name, arguments: "" });
+          }
+        } else if (eventType === "response.function_call_arguments.delta") {
+          const itemId = parsed.item_id as string;
+          const delta = parsed.delta as string;
+          if (!toolCallMap.has(itemId)) {
+            toolCallMap.set(itemId, { id: itemId, call_id: itemId, name: "", arguments: "" });
+          }
+          const entry = toolCallMap.get(itemId)!;
+          entry.arguments += delta;
+        } else if (eventType === "response.function_call_arguments.done") {
+          const itemId = parsed.item_id as string;
+          const args = parsed.arguments as string;
+          if (!toolCallMap.has(itemId)) {
+            toolCallMap.set(itemId, { id: itemId, call_id: itemId, name: "", arguments: "" });
+          }
+          const entry = toolCallMap.get(itemId)!;
+          entry.arguments = args;
+        }
+      } catch {
+        // skip malformed chunks
+      }
+    }
+  }
+
+  const toolCalls: ResponsesToolCall[] = [];
+  for (const [, tc] of toolCallMap) {
+    toolCalls.push({
+      id: tc.id,
+      type: "function_call",
+      call_id: tc.call_id,
+      name: tc.name,
+      arguments: tc.arguments,
+    });
+  }
+  return toolCalls;
+}
+
+// --------------------------------------------------------------------------
 // Shared helper
 // --------------------------------------------------------------------------
 
@@ -550,7 +1054,8 @@ function ts(): string {
 export async function sendAndValidate(
   tcName: string,
   buildMessages: () => Message[],
-  stream = true
+  stream = true,
+  apiFormat: "chat" | "responses" = "chat"
 ): Promise<{
   status: number;
   duration: number;
@@ -560,6 +1065,7 @@ export async function sendAndValidate(
 }> {
   const MAX_RETRIES = 3;
   const RETRY_DELAY_MS = 10_000;
+  const endpoint = apiFormat === "responses" ? "/v1/responses" : "/v1/chat/completions";
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     const messages = buildMessages();
@@ -570,19 +1076,30 @@ export async function sendAndValidate(
     const start = performance.now();
 
     try {
-      const response = await fetch(`${BASE_URL}/v1/chat/completions`, {
+      const body =
+        apiFormat === "responses"
+          ? {
+              model: MODEL,
+              input: messages,
+              stream,
+              max_output_tokens: 4096,
+              temperature: 0.3,
+            }
+          : {
+              model: MODEL,
+              messages,
+              stream,
+              max_tokens: 4096,
+              temperature: 0.3,
+            };
+
+      const response = await fetch(`${BASE_URL}${endpoint}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${API_KEY}`,
         },
-        body: JSON.stringify({
-          model: MODEL,
-          messages,
-          stream,
-          max_tokens: 4096,
-          temperature: 0.3,
-        }),
+        body: JSON.stringify(body),
         signal: controller.signal,
       });
 
@@ -595,10 +1112,19 @@ export async function sendAndValidate(
       let totalTokens = 0;
 
       if (stream) {
-        const streamResult = await readSSEStream(response);
+        const streamResult =
+          apiFormat === "responses"
+            ? await readResponsesSSEStream(response)
+            : await readSSEStream(response);
         content = streamResult.fullContent;
         finishReason = streamResult.finishReason;
         totalTokens = streamResult.totalTokens;
+      } else if (apiFormat === "responses") {
+        const json = await response.json().catch(() => ({}));
+        const textItem = json?.output?.find((o: Record<string, unknown>) => o.type === "message");
+        content = textItem?.content?.[0]?.text || "";
+        finishReason = json?.status || "unknown";
+        totalTokens = json?.usage?.total_tokens || 0;
       } else {
         const json = await response.json().catch(() => ({}));
         const choice = json?.choices?.[0];
@@ -622,7 +1148,8 @@ export async function sendAndValidate(
       );
 
       if (response.status === 200) {
-        const isGoodFinish = finishReason === "stop" || finishReason === "length";
+        const isGoodFinish =
+          finishReason === "stop" || finishReason === "length" || finishReason === "completed";
         const isRetryable =
           content.length === 0 ||
           finishReason === "malformed_response" ||
@@ -646,7 +1173,17 @@ export async function sendAndValidate(
         } else {
           assert.fail(`expected stop/length finish, got ${finishReason} | cid: ${correlationId}`);
         }
-      } else if ((response.status === 503 || response.status === 429) && attempt < MAX_RETRIES) {
+      } else if (response.status === 503) {
+        // #7360: a 503 from a combo means "all targets exhausted" — exactly
+        // the failure mode the cooldown-aware wait/retry is supposed to
+        // prevent. Silently retrying past it here would mask a regression
+        // instead of catching it, so this is a hard, immediate failure —
+        // never retried.
+        const errorBody = await response.text().catch(() => "unknown");
+        assert.fail(
+          `${ts()} ${tcName.padEnd(45)} HTTP 503 (combo exhausted, not retried): ${errorBody} | cid: ${correlationId}`
+        );
+      } else if (response.status === 429 && attempt < MAX_RETRIES) {
         console.log(
           `${ts()} ${tcName.padEnd(45)} RETRY ${attempt}/${MAX_RETRIES} after ${response.status} (waiting ${RETRY_DELAY_MS / 1000}s)`
         );
@@ -667,7 +1204,12 @@ export async function sendAndValidate(
     } catch (err) {
       clearTimeout(timeout);
       const errorMessage = err instanceof Error ? err.message : String(err);
-      if ((errorMessage.includes("503") || errorMessage.includes("429")) && attempt < MAX_RETRIES) {
+      if (errorMessage.includes("503")) {
+        // #7360: never retry past a 503 (combo exhausted) — see the non-throw
+        // branch above for why.
+        throw err;
+      }
+      if (errorMessage.includes("429") && attempt < MAX_RETRIES) {
         console.log(
           `${ts()} ${tcName.padEnd(45)} RETRY ${attempt}/${MAX_RETRIES} after error (waiting ${RETRY_DELAY_MS / 1000}s)`
         );
@@ -810,7 +1352,7 @@ export const CASE_BUILDERS = [
                   "Add-on Pack",
                 ]),
                 quantity: randomInt(1, 5),
-                price: parseFloat((Math.random() * 200 + 5).toFixed(2)),
+                price: Number.parseFloat((Math.random() * 200 + 5).toFixed(2)),
               })),
               total: 0,
               shipping: {

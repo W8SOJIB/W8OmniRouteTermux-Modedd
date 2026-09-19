@@ -37,6 +37,7 @@ import { registerProviders } from "./providers.mjs";
 import { registerProvider } from "./provider-cmd.mjs";
 import { registerConfig } from "./config.mjs";
 import { registerKeys } from "./keys.mjs";
+import { registerAuthExport } from "./auth-export.mjs";
 import { registerModels } from "./models.mjs";
 import { registerCombo } from "./combo.mjs";
 import { registerStatus } from "./status.mjs";
@@ -59,6 +60,7 @@ import { registerAutostart } from "./autostart.mjs";
 import { registerRepl } from "./repl.mjs";
 import { registerLaunch } from "./launch.mjs";
 import { registerLaunchCodex } from "./launch-codex.mjs";
+import { registerRun } from "./run.mjs";
 import { registerSetupCodex } from "./setup-codex.mjs";
 import { registerSetupClaude } from "./setup-claude.mjs";
 import { registerSetupOpencode } from "./setup-opencode.mjs";
@@ -69,14 +71,16 @@ import { registerSetupCursor } from "./setup-cursor.mjs";
 import { registerSetupRoo } from "./setup-roo.mjs";
 import { registerSetupCrush } from "./setup-crush.mjs";
 import { registerSetupGoose } from "./setup-goose.mjs";
-import { registerSetupQwen } from "./setup-qwen.mjs";
 import { registerSetupAider } from "./setup-aider.mjs";
+import { registerSetupQwen } from "./setup-qwen.mjs";
 import { registerConnect } from "./connect.mjs";
 import { registerContexts } from "./contexts.mjs";
 import { registerTokens } from "./tokens.mjs";
 import { registerConfigure } from "./configure.mjs";
 import { registerApiCommands } from "../api-commands/registry.mjs";
 import { registerPlugin } from "./plugin.mjs";
+import { registerRadar } from "./radar.mjs";
+import { registerPacks } from "./packs.mjs";
 
 export function registerCommands(program) {
   registerMemory(program);
@@ -118,6 +122,7 @@ export function registerCommands(program) {
   registerProvider(program);
   registerConfig(program);
   registerKeys(program);
+  registerAuthExport(program);
   registerModels(program);
   registerCombo(program);
   registerStatus(program);
@@ -141,6 +146,7 @@ export function registerCommands(program) {
   registerRepl(program);
   registerLaunch(program);
   registerLaunchCodex(program);
+  registerRun(program);
   registerSetupCodex(program);
   registerSetupClaude(program);
   registerSetupOpencode(program);
@@ -151,12 +157,14 @@ export function registerCommands(program) {
   registerSetupRoo(program);
   registerSetupCrush(program);
   registerSetupGoose(program);
-  registerSetupQwen(program);
   registerSetupAider(program);
+  registerSetupQwen(program);
   registerConnect(program);
   registerContexts(program);
   registerTokens(program);
   registerConfigure(program);
   registerApiCommands(program);
   registerPlugin(program);
+  registerRadar(program);
+  registerPacks(program);
 }

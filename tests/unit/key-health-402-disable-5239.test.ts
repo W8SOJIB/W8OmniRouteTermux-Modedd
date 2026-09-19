@@ -31,7 +31,7 @@ const { getValidApiKey, getAllKeyHealth, resetKeyStatus } = await import(
 
 test.after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 // Two keys live on ONE connection as API Key Round-Robin (extraApiKeys[]).

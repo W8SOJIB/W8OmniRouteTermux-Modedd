@@ -1,7 +1,7 @@
 /**
  * SessionFactory — Creates initialized Session instances
  *
- * For zero-auth providers (Pollinations, Puter): just assigns a fingerprint.
+ * For zero-auth providers (Pollinations): just assigns a fingerprint.
  * For cookie-based providers (ChatGPT Web, DeepSeek Web): would launch
  * headless Playwright, solve Turnstile, and extract cookies.
  *
@@ -33,7 +33,7 @@ export class SessionFactory {
       fingerprint,
       this.config.cooldownBase,
       this.config.cooldownMax,
-      this.config.cooldownJitter,
+      this.config.cooldownJitter
     );
   }
 
@@ -48,10 +48,7 @@ export class SessionFactory {
   }
 
   /** Build headers from session fingerprint */
-  buildHeaders(
-    session: Session,
-    extra?: Record<string, string>,
-  ): Record<string, string> {
+  buildHeaders(session: Session, extra?: Record<string, string>): Record<string, string> {
     return session.buildHeaders(extra);
   }
 }

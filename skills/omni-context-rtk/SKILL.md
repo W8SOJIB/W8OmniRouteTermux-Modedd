@@ -29,7 +29,7 @@ Update RTK compression settings
 
 ```bash
 curl -X PUT https://localhost:20128/api/context/rtk/config \
-  -H "Authorization: Bearer $OMNIROUTE_TOKEN"
+  -H "Authorization: Bearer $OMNIROUTE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{}'
 ```
@@ -43,13 +43,24 @@ curl https://localhost:20128/api/context/rtk/filters \
   -H "Authorization: Bearer $OMNIROUTE_TOKEN"
 ```
 
+### POST /api/context/rtk/import
+
+Validate or install an RTK TOML schema v1 filter file
+
+```bash
+curl -X POST https://localhost:20128/api/context/rtk/import \
+  -H "Authorization: Bearer $OMNIROUTE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
 ### POST /api/context/rtk/test
 
 Run RTK compression preview for text
 
 ```bash
 curl -X POST https://localhost:20128/api/context/rtk/test \
-  -H "Authorization: Bearer $OMNIROUTE_TOKEN"
+  -H "Authorization: Bearer $OMNIROUTE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{}'
 ```

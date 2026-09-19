@@ -25,7 +25,7 @@ async function resetStorage() {
   delete process.env.INITIAL_PASSWORD;
   core.resetDbInstance();
   apiKeysDb.resetApiKeyState();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -63,7 +63,7 @@ test.beforeEach(async () => {
 
 test.after(async () => {
   await resetStorage();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("API keys routes require management auth when login protection is enabled", async () => {
@@ -126,8 +126,10 @@ test("POST /api/keys creates a key, preserves special characters, and persists n
   assert.equal(response.status, 201);
   assert.equal(body.name, "Key / Prod #1");
   assert.equal(body.noLog, true);
+  assert.equal(body.compressionEnabled, true);
   assert.match(body.key, /^sk-[a-z0-9-]+/i);
   assert.equal(stored?.noLog, true);
+  assert.equal(stored?.compressionEnabled, true);
   assert.equal(compliance.isNoLog(body.id), true);
 });
 
@@ -278,10 +280,15 @@ test("POST /api/keys triggers cloud sync when cloud mode is enabled", async () =
       })
     );
     const body = (await response.json()) as any;
-    const syncPayload = JSON.parse(calls[0].options.body);
 
     assert.equal(response.status, 201);
     assert.equal(body.name, "Cloud Synced Key");
+
+    // #6570: cloud sync is fire-and-forget so it no longer blocks the
+    // response — give the background task a moment to run before asserting
+    // it happened.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const syncPayload = JSON.parse(calls[0].options.body);
     assert.equal(calls.length, 1);
     assert.match(String(calls[0].url), /^http:\/\/cloud\.example\/sync\//);
     assert.ok(Array.isArray(syncPayload.providers));
@@ -348,8 +355,13 @@ test("POST /api/keys still succeeds when cloud sync fails after creation", async
 
     assert.equal(response.status, 201);
     assert.equal(body.name, "Cloud Failure Tolerated");
-    assert.equal(syncAttempts, 1);
     assert.equal(stored?.name, "Cloud Failure Tolerated");
+
+    // #6570: cloud sync is fire-and-forget so it no longer blocks the
+    // response — give the background task a moment to run before asserting
+    // the (failed) sync attempt happened and was tolerated.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(syncAttempts, 1);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -400,6 +412,7 @@ test("PATCH /api/keys/[id] updates permissions and rejects invalid payloads", as
         allowedConnections: [],
         isActive: false,
         maxSessions: 2,
+        compressionEnabled: false,
       },
     }),
     { params: Promise.resolve({ id: created.id }) }
@@ -429,9 +442,11 @@ test("PATCH /api/keys/[id] updates permissions and rejects invalid payloads", as
   assert.equal(patchBody.noLog, true);
   assert.equal(patchBody.isActive, false);
   assert.equal(patchBody.maxSessions, 2);
+  assert.equal(patchBody.compressionEnabled, false);
   assert.deepEqual(updated?.allowedModels, ["gpt-4.1-mini"]);
   assert.equal(updated?.noLog, true);
   assert.equal(updated?.isActive, false);
+  assert.equal(updated?.compressionEnabled, false);
   assert.equal(invalidJsonResponse.status, 400);
   assert.equal(invalidJsonBody.error.message, "Invalid request");
   assert.equal(missingKeyResponse.status, 404);

@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+export const dynamic = "force-dynamic";
 import { listBatches } from "@/lib/localDb";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 

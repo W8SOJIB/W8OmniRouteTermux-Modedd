@@ -16,6 +16,17 @@ export const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
   // leaving it in function_declarations triggers a hard upstream 400
   // ("Unknown name \"multipleOf\""). `minimum`/`maximum` ARE accepted and kept.
   "multipleOf",
+  // OpenAI "strict" tool-calling mode embeds `strict: true/false` directly inside
+  // a function's `parameters` schema (RubyLLM and other OpenAI-convention clients
+  // do this by default). Gemini's function_declarations schema doesn't recognize
+  // it and 400s the same way ("Unknown name \"strict\" ... Cannot find field").
+  "strict",
+  // Codex's multi-agent collaboration tools (spawn_agent / send_message /
+  // followup_task) mark their `message` parameter schema with a non-standard
+  // `encrypted: true` annotation (JsonSchema::with_encrypted). Gemini's
+  // function_declarations schema doesn't recognize it and 400s the same way
+  // ("Unknown name \"encrypted\" ... Cannot find field").
+  "encrypted",
   // NOTE: `pattern` is intentionally NOT in this set. Antigravity (Gemini-derived
   // surface) accepts `pattern` on string constraints, and glob/grep/file-search
   // tools depend on it to express their argument regex. Removing it produced
@@ -47,6 +58,11 @@ export const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
   "contains",
   "minContains",
   "maxContains",
+  // #9617: array uniqueness keyword — agentic-CLI tool schemas (JSON-Schema
+  // generators) set this routinely and Gemini's schema parser has no field for
+  // it, rejecting the whole request with "Unknown name \"uniqueItems\"".
+  // Upstream 9router already strips it alongside `contains` for the same error.
+  "uniqueItems",
   // Complex schema keywords (handled by flattenAnyOfOneOf/mergeAllOf)
   "anyOf",
   "oneOf",
@@ -90,13 +106,23 @@ export const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
 
 export const UNSUPPORTED_SCHEMA_CONSTRAINTS = [...GEMINI_UNSUPPORTED_SCHEMA_KEYS];
 
-// Default safety settings
+// Default safety settings for the standard Gemini API surface.
+//
+// HARM_CATEGORY_CIVIC_INTEGRITY is intentionally NOT included here (#8231): the
+// dynamic validation on some models/endpoints rejects it with a hard 400
+// (`safety_settings[N]: element predicate failed`), taking down every request
+// through that model. The Antigravity/Cloud Code surface already worked around
+// this for #5003 (see ANTIGRAVITY_UNSUPPORTED_SAFETY_CATEGORIES in
+// open-sse/executors/antigravity.ts) — this drops the same category from the
+// standard-path default so behavior is consistent across Gemini surfaces. A
+// caller that explicitly supplies safetySettings (including one that itself
+// requests CIVIC_INTEGRITY) is still honored as-is — only this unconditional
+// default is scoped down.
 export const DEFAULT_SAFETY_SETTINGS = [
   { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "OFF" },
   { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "OFF" },
   { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "OFF" },
   { category: "HARM_CATEGORY_HARASSMENT", threshold: "OFF" },
-  { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "OFF" },
 ];
 
 function normalizeAudioMimeType(format: unknown): string {
@@ -172,17 +198,35 @@ export function convertOpenAIContentToParts(content: unknown): JsonRecord[] {
 
         // 3. Handle raw data strings (e.g. {"type": "file", "data": "JVBER...", "mime_type": "..."}).
         //    Also accept the Responses-API shape {"type":"input_file","file_data":"JVBER...","filename":...}
-        //    so PDFs sent as `input_file` reach Gemini instead of being silently dropped (#2515).
+        //    AND the OpenAI Chat Completions shape
+        //    {"type":"file","file":{"filename":...,"file_data":"data:<mime>;base64,..."}} so PDFs and
+        //    videos reach Gemini instead of being silently dropped (#2515). Gemini reads
+        //    application/pdf and video/* natively via inlineData, exactly like images.
         const file = toRecord(rec.file);
         const doc = toRecord(rec.document);
-        const rawDataStr = rec.data || rec.file_data || file?.data || doc?.data;
-        const mimeTypeFallback =
-          rec.mime_type || rec.media_type || file?.mime_type || doc?.mime_type || "application/pdf";
+        const rawDataStr =
+          rec.data || rec.file_data || file?.data || file?.file_data || doc?.data || doc?.file_data;
         if (typeof rawDataStr === "string" && !rawDataStr.startsWith("http")) {
+          // Prefer the mime embedded in the data: URI (e.g. application/pdf, video/mp4) so
+          // documents and videos are not mislabeled as the fallback; the fallback applies
+          // only to bare base64 that carries no data: prefix.
+          let mimeType =
+            rec.mime_type ||
+            rec.media_type ||
+            file?.mime_type ||
+            doc?.mime_type ||
+            "application/pdf";
+          if (rawDataStr.startsWith("data:")) {
+            const commaIndex = rawDataStr.indexOf(",");
+            if (commaIndex !== -1) {
+              const parsedMime = rawDataStr.substring(5, commaIndex).split(";")[0];
+              if (parsedMime) mimeType = parsedMime;
+            }
+          }
           const rawData = rawDataStr.replace(/^data:[a-zA-Z0-9/+-]+;base64,/, "");
           parts.push({
             inlineData: {
-              mimeType: String(mimeTypeFallback),
+              mimeType: String(mimeType),
               data: rawData,
             },
           });
@@ -652,6 +696,64 @@ export function cleanJSONSchemaForAntigravity(schema: unknown): unknown {
   }
 
   addPlaceholders(cleaned);
+
+  // Phase 7: Recursive type:"object" injection for nested schemas (#9268).
+  // Gemini/Vertex requires every node with properties/required to have an explicit
+  // `type: "object"`. Some clients (e.g. Composio-exported tools) emit nested
+  // schemas with `properties` but no `type`, causing a Gemini 400. Follow the
+  // `removeUnsupportedKeywords()`/`addPlaceholders()` visitor pattern.
+  function injectObjectType(obj: unknown): void {
+    if (!obj || typeof obj !== "object") return;
+
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        injectObjectType(item);
+      }
+      return;
+    }
+
+    const record = obj as JsonRecord;
+    if (!record.type && (record.properties !== undefined || record.required !== undefined)) {
+      record.type = "object";
+    }
+
+    // Recurse into remaining values.
+    for (const value of Object.values(record)) {
+      if (value && typeof value === "object") {
+        injectObjectType(value);
+      }
+    }
+  }
+
+  injectObjectType(cleaned);
+
+  // Phase 8: Ensure array types have an items schema (#10578).
+  // Gemini strictly requires array parameters to define their `items` schema.
+  // If an MCP tool defines an array but forgets the items, inject a safe default.
+  function ensureArrayItems(obj: unknown): void {
+    if (!obj || typeof obj !== "object") return;
+
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        ensureArrayItems(item);
+      }
+      return;
+    }
+
+    const record = obj as JsonRecord;
+    if (record.type === "array" && !record.items) {
+      record.items = { type: "string" };
+    }
+
+    // Recurse into remaining values.
+    for (const value of Object.values(record)) {
+      if (value && typeof value === "object") {
+        ensureArrayItems(value);
+      }
+    }
+  }
+
+  ensureArrayItems(cleaned);
 
   return cleaned;
 }

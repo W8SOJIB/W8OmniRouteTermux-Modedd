@@ -52,6 +52,34 @@ describe("responseSanitizer/reasoning — shouldParseTextualReasoningTags", () =
   });
 });
 
+describe("responseSanitizer/reasoning — Kimi Code K3 textual reasoning-tag route", () => {
+  it("extracts <think> blocks from the Kimi Code K3 route", () => {
+    const chunk = {
+      choices: [{ index: 0, delta: { content: "<think>reasoning here</think>final answer" } }],
+    };
+    const sanitized = sanitizeOpenAIResponse(chunk, {
+      parseTextualReasoningTags: shouldParseTextualReasoningTags("kimi-coding", "k3"),
+    }) as { choices: Array<{ delta: { content: string; reasoning_content?: string } }> };
+
+    const delta = sanitized.choices[0].delta;
+    assert.equal(delta.content, "final answer");
+    assert.equal(delta.reasoning_content, "reasoning here");
+  });
+
+  it("extracts <think> blocks from a K3 route", () => {
+    const chunk = {
+      choices: [{ index: 0, delta: { content: "<think>reasoning here</think>final answer" } }],
+    };
+    const sanitized = sanitizeOpenAIResponse(chunk, {
+      parseTextualReasoningTags: shouldParseTextualReasoningTags("kimi-coding", "k3"),
+    }) as { choices: Array<{ delta: { content: string; reasoning_content?: string } }> };
+
+    const delta = sanitized.choices[0].delta;
+    assert.equal(delta.content, "final answer");
+    assert.equal(delta.reasoning_content, "reasoning here");
+  });
+});
+
 // ── MiniMax M3 textual reasoning-tag route (9router#2231) ──────────────────────
 //
 // MiniMax M3 leaks raw <think>...</think> into `content` instead of a separate
@@ -109,12 +137,12 @@ describe("responseSanitizer/reasoning — MiniMax M3 textual reasoning-tag route
 });
 
 describe("responseSanitizer/reasoning — MiniMax M3 fix regression guards", () => {
-  it("direct minimax tier (claude format) stays unaffected", () => {
+  it("direct minimax tier (openai format) stays unaffected for textual reasoning tags", () => {
     assert.equal(isTextualReasoningTagNativeRoute("minimax", "minimax-m3"), false);
     assert.equal(shouldParseTextualReasoningTags("minimax", "MiniMax-M3"), false);
   });
 
-  it("direct minimax-cn tier (claude format) stays unaffected", () => {
+  it("direct minimax-cn tier (openai format) stays unaffected for textual reasoning tags", () => {
     assert.equal(isTextualReasoningTagNativeRoute("minimax-cn", "minimax-m3"), false);
     assert.equal(shouldParseTextualReasoningTags("minimax-cn", "MiniMax-M3"), false);
   });

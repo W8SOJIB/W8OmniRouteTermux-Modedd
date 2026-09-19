@@ -7,9 +7,23 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-const { assembleStreamingPipeline } = await import(
-  "../../open-sse/handlers/chatCore/streamingPipeline.ts"
-);
+const { assembleStreamingPipeline } =
+  await import("../../open-sse/handlers/chatCore/streamingPipeline.ts");
+
+type PipeWithDisconnectParameters = Parameters<
+  typeof import("../../open-sse/utils/streamHandler.ts").pipeWithDisconnect
+>;
+type ShapeForClientFormatParameters = Parameters<
+  typeof import("../../open-sse/utils/sseHeartbeat.ts").shapeForClientFormat
+>;
+
+function assertPipelineInputContracts(args: Parameters<typeof assembleStreamingPipeline>[0]) {
+  const providerResponse: PipeWithDisconnectParameters[0] = args.providerResponse;
+  const transformStream: PipeWithDisconnectParameters[1] = args.transformStream;
+  const streamController: PipeWithDisconnectParameters[2] = args.streamController;
+  const clientResponseFormat: ShapeForClientFormatParameters[0] = args.clientResponseFormat;
+  return { providerResponse, transformStream, streamController, clientResponseFormat };
+}
 
 // A fake stream: each pipeThrough appends the transform's tag and returns a new fake stream.
 function fakeStream(tag: string, log: string[]) {
@@ -51,6 +65,30 @@ function baseArgs(over: Record<string, unknown> = {}) {
     ...over,
   } as Parameters<typeof assembleStreamingPipeline>[0];
 }
+
+test("pipeline arguments preserve the dependency parameter contracts", () => {
+  const args = baseArgs({
+    providerResponse: new Response(),
+    transformStream: new TransformStream<Uint8Array, Uint8Array>(),
+    streamController: {
+      signal: new AbortController().signal,
+      startTime: Date.now(),
+      isConnected: () => true,
+      handleDisconnect: () => {},
+      handleComplete: () => {},
+      markClientTerminalSeen: () => {},
+      handleError: () => {},
+      abort: () => {},
+      clientResponseFormat: "openai",
+    },
+    clientResponseFormat: "openai",
+  });
+  const contracts = assertPipelineInputContracts(args);
+  assert.ok(contracts.providerResponse instanceof Response);
+  assert.ok(contracts.transformStream instanceof TransformStream);
+  assert.equal(contracts.streamController.clientResponseFormat, "openai");
+  assert.equal(contracts.clientResponseFormat, "openai");
+});
 
 test("baseline (no pii, no progress, no echo) → only heartbeat in the chain", () => {
   const { deps, log } = makeDeps();
@@ -99,4 +137,38 @@ test("full chain order: pii → progress → heartbeat → echo", () => {
   });
   assembleStreamingPipeline(baseArgs({ echoModel: "alias-x" }), deps);
   assert.deepEqual(log, ["pii-flag", "progress", "heartbeat", "echo"]);
+});
+
+test("pipeline assembly creates performance mark and measure entries", () => {
+  performance.clearMarks();
+  performance.clearMeasures();
+  const { deps } = makeDeps();
+  assembleStreamingPipeline(baseArgs(), deps);
+  assert.equal(performance.getEntriesByName("omni-pipeline-start").length, 1, "start mark");
+  assert.equal(performance.getEntriesByName("omni-pipeline-end").length, 1, "end mark");
+  assert.equal(performance.getEntriesByName("omni-pipeline").length, 1, "measure");
+});
+
+test("re-entering pipeline clears previous timeline entries", () => {
+  performance.clearMarks();
+  performance.clearMeasures();
+  const { deps } = makeDeps();
+  // First call creates entries
+  assembleStreamingPipeline(baseArgs(), deps);
+  // Second call — clearMarks/clearMeasures runs before new marks, so count stays 1
+  assembleStreamingPipeline(baseArgs(), deps);
+  assert.equal(performance.getEntriesByName("omni-pipeline-start").length, 1, "start cleared");
+  assert.equal(performance.getEntriesByName("omni-pipeline-end").length, 1, "end cleared");
+  assert.equal(performance.getEntriesByName("omni-pipeline").length, 1, "measure cleared");
+});
+
+test("performance measure has positive duration", () => {
+  performance.clearMarks();
+  performance.clearMeasures();
+  const { deps } = makeDeps();
+  assembleStreamingPipeline(baseArgs(), deps);
+  const [entry] = performance.getEntriesByName("omni-pipeline");
+  assert.ok(entry, "measure exists");
+  assert.equal(entry.entryType, "measure");
+  assert.ok(entry.duration >= 0, `duration ${entry.duration} >= 0`);
 });

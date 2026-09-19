@@ -139,13 +139,13 @@ function buildResponsesNdjson(text = "Brasilia") {
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
-async function waitForAsyncSideEffects() {
-  await new Promise((resolve) => setImmediate(resolve));
-  await new Promise((resolve) => setTimeout(resolve, 10));
+async function flushAsyncSideEffects() {
+  // setImmediate rounds drain the event loop more reliably than setTimeout under CI load.
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
 }
 
 async function invokeChatCore({
@@ -192,7 +192,7 @@ async function invokeChatCore({
       },
       userAgent: "unit-test",
     });
-    await waitForAsyncSideEffects();
+    await flushAsyncSideEffects();
     return { result, calls, call: calls.at(-1) };
   } finally {
     globalThis.fetch = originalFetch;
@@ -207,20 +207,20 @@ test.beforeEach(async () => {
 test.after(async () => {
   globalThis.fetch = originalFetch;
   await resetStorage();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("CodexExecutor.transformRequest clones the request body before forcing stream=true", () => {
   const executor = new CodexExecutor();
   const body = {
-    model: "gpt-5.4",
+    model: "gpt-5.6-sol",
     input: [{ role: "user", content: [{ type: "input_text", text: "Oi" }] }],
     stream: false,
     reasoning: { effort: "low" },
   };
   const original = structuredClone(body);
 
-  const transformed = executor.transformRequest("gpt-5.4", body, false, {
+  const transformed = executor.transformRequest("gpt-5.6-sol", body, false, {
     requestEndpointPath: "/responses",
   });
 
@@ -314,7 +314,7 @@ test("chatCore converts Responses-style NDJSON fallback into JSON when stream=fa
 test("handleComboChat validates non-stream quality using the original client stream intent", async () => {
   const combo = {
     name: "codex-stream-false-quality",
-    models: ["codex/gpt-5.4", "openai/gpt-4o-mini"],
+    models: ["codex/gpt-5.6-sol", "openai/gpt-4o-mini"],
   };
   const log = createComboLog();
   const seenModels = [];
@@ -327,7 +327,7 @@ test("handleComboChat validates non-stream quality using the original client str
     combo,
     handleSingleModel: async (requestBody, modelStr) => {
       seenModels.push(modelStr);
-      if (modelStr === "codex/gpt-5.4") {
+      if (modelStr === "codex/gpt-5.6-sol") {
         requestBody.stream = true;
         return jsonResponse({
           choices: [
@@ -355,7 +355,7 @@ test("handleComboChat validates non-stream quality using the original client str
   const payload = (await result.json()) as any;
 
   assert.equal(result.ok, true);
-  assert.deepEqual(seenModels, ["codex/gpt-5.4", "openai/gpt-4o-mini"]);
+  assert.deepEqual(seenModels, ["codex/gpt-5.6-sol", "openai/gpt-4o-mini"]);
   assert.equal(payload.choices[0].message.content, "Brasilia");
   assert.ok(
     log.entries.some(

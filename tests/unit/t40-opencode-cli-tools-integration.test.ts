@@ -20,7 +20,9 @@ test("T40: OpenCode card documents config paths and --variant usage", () => {
     .join(" ")
     .toLowerCase();
 
-  assert.match(notesText, /\.config\/opencode\/opencode\.json/);
+  assert.match(notesText, /or opencode\.json\b/);
+  assert.match(notesText, /\.config\/opencode\/opencode\.jsonc/);
+  assert.match(notesText, /preferred when present/);
   // #3330: OpenCode uses ~/.config on all platforms (incl. Windows) — the note
   // must no longer point Windows users at %APPDATA%.
   assert.doesNotMatch(notesText, /%appdata%/);
@@ -46,10 +48,7 @@ test("T40: OpenCode config path resolves per-platform", () => {
     { APPDATA: "C:\\Users\\dev\\AppData\\Roaming" },
     "C:\\Users\\dev"
   );
-  assert.equal(
-    windowsPath,
-    path.join("C:\\Users\\dev", ".config", "opencode", "opencode.json")
-  );
+  assert.equal(windowsPath, path.join("C:\\Users\\dev", ".config", "opencode", "opencode.json"));
 
   // Windows still honors XDG_CONFIG_HOME when set.
   const windowsXdg = resolveOpencodeConfigPath(
@@ -111,7 +110,11 @@ test("T40: OpenCode config document uses current provider schema", () => {
     configDocument.provider.omniroute.models["gg/gemini-2.5-pro"].name,
     "Gemini 2.5 Pro"
   );
-  assert.equal(configDocument.providers, undefined);
+  // v2 provider schema is dual-written alongside the v1 block.
+  assert.equal(
+    configDocument.providers.omniroute.package,
+    "@opencode-ai/ai/providers/openai-compatible"
+  );
 });
 
 test("T40: OpenCode explicit multi-model selection overrides fallback defaults", () => {
@@ -149,8 +152,8 @@ test("T40: OpenCode merge preserves unrelated config and updates only provider.o
     {
       baseUrl: "http://localhost:20128/v1",
       apiKey: "sk_test_opencode",
-      models: ["cx/gpt-5.4"],
-      modelLabels: { "cx/gpt-5.4": "GPT-5.4" },
+      models: ["cx/gpt-5.6-sol"],
+      modelLabels: { "cx/gpt-5.6-sol": "GPT-5.6 Sol" },
     }
   );
 
@@ -159,7 +162,13 @@ test("T40: OpenCode merge preserves unrelated config and updates only provider.o
     github: { command: "npx", args: ["-y", "@modelcontextprotocol/server-github"] },
   });
   assert.deepEqual(mergedConfig.provider.omniroute.models, {
-    "cx/gpt-5.4": { name: "GPT-5.4" },
+    "cx/gpt-5.6-sol": {
+      name: "GPT-5.6 Sol",
+      limit: {
+        context: 128_000,
+        output: 8_192,
+      },
+    },
   });
 });
 

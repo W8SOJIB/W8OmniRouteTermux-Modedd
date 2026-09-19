@@ -1,8 +1,36 @@
 import { FORMATS } from "../../translator/formats.ts";
+import { isVerifiedNativeCodexRequest } from "../../config/codexIdentity.ts";
 import { isClaudeCodeCompatibleProvider } from "../../services/claudeCodeCompatible.ts";
+import { isResponsesEndpointPath } from "../../utils/responsesEndpoint.ts";
 import { getHeaderValueCaseInsensitive } from "./headers.ts";
 
+export { isResponsesEndpointPath };
+
+export const XAI_API_PROVIDERS = new Set(["xai", "xai-oauth", "xao"]);
+
 export function shouldUseNativeCodexPassthrough({
+  provider,
+  sourceFormat,
+  endpointPath,
+  body,
+  headers,
+}: {
+  provider?: string | null;
+  sourceFormat?: string | null;
+  endpointPath?: string | null;
+  body?: unknown;
+  headers?: Headers | Record<string, unknown> | null;
+}): boolean {
+  if (provider !== "codex" && provider !== "chatgpt-web-codex") return false;
+  if (sourceFormat !== FORMATS.OPENAI_RESPONSES) return false;
+  let normalizedEndpoint = String(endpointPath || "");
+  while (normalizedEndpoint.endsWith("/")) normalizedEndpoint = normalizedEndpoint.slice(0, -1);
+  const segments = normalizedEndpoint.split("/");
+  if (!segments.includes("responses")) return false;
+  return provider === "codex" || isVerifiedNativeCodexRequest(body, headers);
+}
+
+export function shouldUseNativeXaiResponsesPassthrough({
   provider,
   sourceFormat,
   endpointPath,
@@ -11,12 +39,40 @@ export function shouldUseNativeCodexPassthrough({
   sourceFormat?: string | null;
   endpointPath?: string | null;
 }): boolean {
-  if (provider !== "codex") return false;
+  if (!provider || !XAI_API_PROVIDERS.has(provider)) return false;
   if (sourceFormat !== FORMATS.OPENAI_RESPONSES) return false;
-  let normalizedEndpoint = String(endpointPath || "");
-  while (normalizedEndpoint.endsWith("/")) normalizedEndpoint = normalizedEndpoint.slice(0, -1);
-  const segments = normalizedEndpoint.split("/");
-  return segments.includes("responses");
+  return isResponsesEndpointPath(endpointPath);
+}
+
+export function stampNativeResponsesPassthroughBody(
+  body: Record<string, unknown>,
+  mode: "codex" | "xai" | "openai-compatible"
+): Record<string, unknown> {
+  if (mode === "codex") return { ...body, _nativeCodexPassthrough: true };
+  if (mode === "xai") return { ...body, _nativeXaiResponsesPassthrough: true };
+  return { ...body, _nativeOpenAICompatibleResponsesPassthrough: true };
+}
+
+export function shouldUseNativeOpenAICompatibleResponsesPassthrough({
+  provider,
+  sourceFormat,
+  endpointPath,
+  providerSpecificData,
+}: {
+  provider?: string | null;
+  sourceFormat?: string | null;
+  endpointPath?: string | null;
+  providerSpecificData?: unknown;
+}): boolean {
+  if (!provider?.startsWith("openai-compatible-")) return false;
+  if (sourceFormat !== FORMATS.OPENAI_RESPONSES) return false;
+  if (providerSpecificData && typeof providerSpecificData === "object") {
+    const psd = providerSpecificData as Record<string, unknown>;
+    if (psd.apiType === "responses" || psd._omnirouteForceResponsesUpstream === true) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -50,6 +106,162 @@ export function redactPassthroughThinkingSignatures(
   _signature: string
 ): unknown {
   return messages;
+}
+
+type MessageLike = {
+  role?: unknown;
+  content?: unknown;
+};
+
+type ThinkingSignatureError = {
+  provider?: string | null;
+  status?: number | null;
+  message?: string | null;
+};
+
+function isThinkingBlock(block: unknown): boolean {
+  if (!block || typeof block !== "object") return false;
+  const type = (block as { type?: unknown }).type;
+  return type === "thinking" || type === "redacted_thinking";
+}
+
+function hasBlock(message: MessageLike | null | undefined, type: string): boolean {
+  return (
+    !!message &&
+    Array.isArray(message.content) &&
+    message.content.some(
+      (block) => !!block && typeof block === "object" && (block as { type?: unknown }).type === type
+    )
+  );
+}
+
+/**
+ * Match only the Anthropic validation failure this recovery path understands.
+ * Generic 400s and the separate "latest assistant message cannot be modified"
+ * validation error must continue through the normal error path unchanged.
+ */
+export function isAnthropicThinkingSignatureError({
+  provider,
+  status,
+  message,
+}: ThinkingSignatureError): boolean {
+  const isAnthropicTarget =
+    provider === "claude" ||
+    (typeof provider === "string" && provider.startsWith("anthropic-compatible-"));
+  if (!isAnthropicTarget || status !== 400 || typeof message !== "string") return false;
+
+  return /invalid\s+[`'\"]?signature[`'\"]?\s+in\s+[`'\"]?thinking[`'\"]?\s+block/i.test(message);
+}
+
+/**
+ * Build a one-shot recovery body after Anthropic has explicitly rejected a
+ * thinking signature. Historical thinking blocks are omitted, but the complete
+ * active tool-use cycle is preserved verbatim: when the request ends in one or
+ * more `user[tool_result]` turns, every paired assistant `tool_use` turn in that
+ * still-open cycle keeps its thinking blocks. A trailing unresolved assistant
+ * `tool_use` turn is protected as well.
+ *
+ * This helper is intentionally NOT used eagerly. Normal same-model requests must
+ * retain their thinking history, cache shape, and current-model semantics.
+ * Returns the original body reference when no safe recovery change is possible.
+ */
+export function stripHistoricalThinkingForSignatureRecovery<T>(body: T): T {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+
+  const record = body as Record<string, unknown>;
+  if (!Array.isArray(record.messages)) return body;
+
+  const messages = record.messages as MessageLike[];
+  const protectedAssistantIndexes = new Set<number>();
+  let cursor = messages.length - 1;
+
+  // Some internal callers can resume from an unresolved assistant tool_use.
+  if (
+    cursor >= 0 &&
+    messages[cursor]?.role === "assistant" &&
+    hasBlock(messages[cursor], "tool_use")
+  ) {
+    protectedAssistantIndexes.add(cursor);
+    cursor -= 1;
+  }
+
+  // Walk the complete trailing tool-result chain. Interleaved thinking can span
+  // several assistant/tool_result pairs, so protecting only the latest assistant
+  // message is insufficient.
+  while (
+    cursor >= 0 &&
+    messages[cursor]?.role === "user" &&
+    hasBlock(messages[cursor], "tool_result")
+  ) {
+    cursor -= 1;
+    while (cursor >= 0 && messages[cursor]?.role !== "assistant") cursor -= 1;
+    if (cursor < 0 || !hasBlock(messages[cursor], "tool_use")) break;
+    protectedAssistantIndexes.add(cursor);
+    cursor -= 1;
+  }
+
+  let changed = false;
+  const recoveredMessages = messages.map((message, index) => {
+    if (
+      !message ||
+      message.role !== "assistant" ||
+      !Array.isArray(message.content) ||
+      protectedAssistantIndexes.has(index)
+    ) {
+      return message;
+    }
+
+    const content = message.content.filter((block) => !isThinkingBlock(block));
+    if (content.length === message.content.length) return message;
+    changed = true;
+    return { ...message, content };
+  });
+
+  if (!changed) return body;
+  return { ...record, messages: recoveredMessages } as T;
+}
+
+type SignatureRecoveryExecution<T> = {
+  result: T;
+  retried: boolean;
+  recoveryBody: unknown | null;
+};
+
+/** Execute the normal body once, then perform at most one exact-error recovery. */
+export async function executeWithAnthropicThinkingSignatureRecovery<T>(args: {
+  provider?: string | null;
+  body: unknown;
+  execute: (body: unknown) => Promise<T>;
+  getError: (
+    result: T
+  ) =>
+    | { status?: number | null; message?: string | null }
+    | null
+    | Promise<{ status?: number | null; message?: string | null } | null>;
+}): Promise<SignatureRecoveryExecution<T>> {
+  const first = await args.execute(args.body);
+  const failure = await args.getError(first);
+  if (
+    !failure ||
+    !isAnthropicThinkingSignatureError({
+      provider: args.provider,
+      status: failure.status,
+      message: failure.message,
+    })
+  ) {
+    return { result: first, retried: false, recoveryBody: null };
+  }
+
+  const recoveryBody = stripHistoricalThinkingForSignatureRecovery(args.body);
+  if (recoveryBody === args.body) {
+    return { result: first, retried: false, recoveryBody: null };
+  }
+
+  return {
+    result: await args.execute(recoveryBody),
+    retried: true,
+    recoveryBody,
+  };
 }
 
 export function isClaudeCodeSemanticPassthroughRequest({

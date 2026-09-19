@@ -1,5 +1,10 @@
 import { clearHealthCheckLogCache } from "@/lib/tokenHealthCheck";
 import { setCustomBannedSignals } from "@omniroute/open-sse/services/accountFallback.ts";
+import {
+  setOperatorProviderErrorRules,
+  type OperatorProviderErrorRule,
+} from "@omniroute/open-sse/config/providerErrorRules.ts";
+import { isAutomatedTestProcess } from "@/shared/utils/testProcess";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -45,6 +50,7 @@ interface RuntimeSettingsSnapshot {
   systemTransforms: unknown;
   authzBypass: AuthzBypassSnapshot;
   customBannedSignals: string[];
+  providerErrorRules: Record<string, OperatorProviderErrorRule[]> | null;
 }
 
 // Default bypass policy: kill-switch on, `/api/mcp/` bypassable. Mirrors the
@@ -71,6 +77,7 @@ const DEFAULT_RUNTIME_SETTINGS_SNAPSHOT: RuntimeSettingsSnapshot = {
   systemTransforms: null,
   authzBypass: DEFAULT_AUTHZ_BYPASS_SNAPSHOT,
   customBannedSignals: [],
+  providerErrorRules: null,
 };
 
 let lastAppliedSnapshot: RuntimeSettingsSnapshot | null = null;
@@ -86,14 +93,6 @@ function isTruthyEnvFlag(value: string | undefined): boolean {
   return new Set(["1", "true", "yes", "on"]).has(value.trim().toLowerCase());
 }
 
-function isAutomatedTestProcess(): boolean {
-  return (
-    typeof process !== "undefined" &&
-    (process.env.NODE_ENV === "test" ||
-      process.env.VITEST !== undefined ||
-      process.argv.some((arg) => arg.includes("test")))
-  );
-}
 
 function toRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
@@ -143,6 +142,34 @@ function normalizeStringArray(value: unknown): string[] {
         .filter((entry) => entry.length > 0)
     )
   );
+}
+
+/**
+ * Defensive shape-check of operator-declared error rules pulled from settings.
+ * The settings schema already validates this on write; this guard prevents a
+ * malformed stored value (or an unexpected shape) from crashing the
+ * error-classification hot path. Returns null when the value is missing or not
+ * a record of non-empty rule arrays.
+ */
+function normalizeOperatorProviderErrorRules(
+  value: unknown
+): Record<string, OperatorProviderErrorRule[]> | null {
+  if (value === null || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const result: Record<string, OperatorProviderErrorRule[]> = {};
+  for (const [provider, list] of Object.entries(record)) {
+    if (!Array.isArray(list) || list.length === 0) continue;
+    const rules = list.filter(
+      (entry): entry is OperatorProviderErrorRule =>
+        !!entry &&
+        typeof entry === "object" &&
+        typeof (entry as OperatorProviderErrorRule).status === "number" &&
+        typeof (entry as OperatorProviderErrorRule).match === "string" &&
+        typeof (entry as OperatorProviderErrorRule).scope === "string"
+    );
+    if (rules.length > 0) result[provider.toLowerCase()] = rules;
+  }
+  return Object.keys(result).length > 0 ? result : null;
 }
 
 function normalizeStringRecord(value: unknown): Record<string, string> {
@@ -251,6 +278,7 @@ export function buildRuntimeSettingsSnapshot(
     systemTransforms: parseStoredJson(settings.systemTransforms, "systemTransforms"),
     authzBypass: normalizeAuthzBypass(settings),
     customBannedSignals: normalizeStringArray(settings.customBannedSignals),
+    providerErrorRules: normalizeOperatorProviderErrorRules(settings.providerErrorRules),
   };
 }
 
@@ -381,18 +409,24 @@ async function applyModelsDevSyncSection(
   currentSnapshot: RuntimeSettingsSnapshot,
   force: boolean
 ) {
-  const { startPeriodicSync, stopPeriodicSync } = await import("@/lib/modelsDevSync");
+  const {
+    startPeriodicSync,
+    stopPeriodicSync,
+    isModelsDevSyncEnvDisabled,
+    isModelsDevSyncEnvForcedOn,
+  } = await import("@/lib/modelsDevSync");
   const skipBackgroundSyncInTests =
     (isAutomatedTestProcess() && process.env.OMNIROUTE_ENABLE_RUNTIME_BACKGROUND_TASKS !== "1") ||
     isTruthyEnvFlag(process.env.OMNIROUTE_DISABLE_BACKGROUND_SERVICES);
 
-  if (skipBackgroundSyncInTests) {
+  if (skipBackgroundSyncInTests || isModelsDevSyncEnvDisabled()) {
     stopPeriodicSync();
     return;
   }
 
   const wasEnabled = previousSnapshot.modelsDevSyncEnabled === true;
-  const isEnabled = currentSnapshot.modelsDevSyncEnabled === true;
+  const isEnabled =
+    isModelsDevSyncEnvForcedOn() || currentSnapshot.modelsDevSyncEnabled === true;
   const intervalChanged =
     previousSnapshot.modelsDevSyncInterval !== currentSnapshot.modelsDevSyncInterval;
 
@@ -539,6 +573,13 @@ export async function applyRuntimeSettings(
   ) {
     setCustomBannedSignals(currentSnapshot.customBannedSignals);
     markChanged("bannedSignals");
+  }
+
+  if (
+    force ||
+    hasChanged(currentSnapshot.providerErrorRules, previousSnapshot.providerErrorRules)
+  ) {
+    setOperatorProviderErrorRules(currentSnapshot.providerErrorRules ?? undefined);
   }
 
   lastAppliedSnapshot = currentSnapshot;

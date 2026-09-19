@@ -68,7 +68,7 @@ test.after(() => {
     /* ignore */
   }
   try {
-    fs.rmSync(process.env.DATA_DIR as string, { recursive: true, force: true });
+    fs.rmSync(process.env.DATA_DIR as string, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   } catch {
     /* ignore */
   }

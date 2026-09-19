@@ -167,6 +167,41 @@ test("createDisconnectAwareStream treats cancel after Responses completed as suc
   assert.equal(disconnectHandled, false);
 });
 
+test("createDisconnectAwareStream recognizes a large Responses compaction completion", async () => {
+  let errorHandled = false;
+  const completed = `event: response.completed\ndata: ${JSON.stringify({
+    type: "response.completed",
+    response: {
+      status: "completed",
+      output: [{ type: "compaction", encrypted_content: "x".repeat(5000) }],
+    },
+  })}\n\n`;
+  const transformStream = {
+    readable: new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(completed));
+        controller.close();
+      },
+    }),
+    writable: createNoopAbortWritable(),
+  };
+
+  const stream = createDisconnectAwareStream(
+    transformStream,
+    createStreamController({
+      clientResponseFormat: FORMATS.OPENAI_RESPONSES,
+      onError() {
+        errorHandled = true;
+      },
+    })
+  );
+  const text = await readStreamText(stream);
+
+  assert.equal(text, completed);
+  assert.equal(errorHandled, false);
+  assert.doesNotMatch(text, /response\.failed/);
+});
+
 test("createDisconnectAwareStream: Gemini 503 high-demand error becomes SSE error chunk with message preserved", async () => {
   const geminiMsg =
     "[503]: This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.";
@@ -353,6 +388,30 @@ test("createDisconnectAwareStream keeps newlines escaped for Claude SSE errors",
   assert.match(text, /^event: error\ndata: \{"type":"error"/);
   assert.match(text, /"message":"claude line one\\nclaude line two"/);
   assert.doesNotMatch(text, /^claude line two/m);
+});
+
+// #7699/#7816 — heuristic is scoped to FORMATS.CLAUDE (/v1/messages); a
+// plain non-Claude completion with no [DONE]/message_stop must pass through.
+test("createDisconnectAwareStream does not append a synthetic error to a plain non-SSE OpenAI completion", async () => {
+  const transformStream = {
+    readable: new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode("plain forwarded bytes, no completion marker"));
+        controller.close();
+      },
+    }),
+    writable: { getWriter: () => ({ abort() {} }) },
+  };
+
+  const stream = createDisconnectAwareStream(
+    transformStream,
+    createStreamController({ clientResponseFormat: FORMATS.OPENAI })
+  );
+  const text = await readStreamText(stream);
+
+  assert.equal(text, "plain forwarded bytes, no completion marker");
+  assert.doesNotMatch(text, /event: error/);
+  assert.doesNotMatch(text, /"finish_reason":"error"/);
 });
 
 test("createDisconnectAwareStream cancel propagates disconnect reason and aborts the writer", async () => {

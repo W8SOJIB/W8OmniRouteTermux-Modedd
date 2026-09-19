@@ -1,3 +1,13 @@
+// ENVIRONMENT NOTE (sandbox better-sqlite3 / glibc limitation, not a code defect):
+// This test constructs or exercises a real better-sqlite3-backed SQLite database.
+// better-sqlite3 is a native addon; production and CI load it normally, but some
+// sandboxes/dev boxes ship a system glibc older than the prebuilt binary requires
+// ("GLIBC_2.29 not found"), so the native module fails to dlopen and any test that
+// reaches better-sqlite3 directly (or asserts stdout that the load-failure warning
+// would pollute) fails HERE while passing in CI. This is a known environment
+// limitation, not a defect in the code under test: the OmniRoute runtime itself
+// cascades to node:sqlite/sql.js when better-sqlite3 is unavailable. See
+// tests/unit/_helpers/betterSqlite3Availability.ts for a guard helper.
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -127,16 +137,24 @@ function withNonTestEnvironment(fn) {
   const originalVitest = process.env.VITEST;
   const originalDisableAutoBackup = process.env.DISABLE_SQLITE_AUTO_BACKUP;
   const originalArgv = [...process.argv];
+  const originalExecArgv = [...process.execArgv];
 
   delete process.env.NODE_ENV;
   delete process.env.VITEST;
   delete process.env.DISABLE_SQLITE_AUTO_BACKUP;
   process.argv = process.argv.filter((arg) => !arg.includes("test"));
+  // #7359 made isAutomatedTestProcess() also scan process.execArgv (so `node --test`
+  // is caught even when NODE_ENV/VITEST/argv are clean). This harness runs under
+  // `node --test`, so execArgv always carries `--test` — strip it here too, or the
+  // "non-test" simulation is a no-op and the mass-migration safety checks under
+  // test never actually exercise their real-environment code path.
+  process.execArgv = process.execArgv.filter((arg) => !arg.includes("test"));
 
   try {
     return fn();
   } finally {
     process.argv = originalArgv;
+    process.execArgv = originalExecArgv;
 
     if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = originalNodeEnv;

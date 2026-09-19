@@ -33,25 +33,28 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 /** Run the capture-pipeline self-test (server/cert/dns reachability). */
-export function runDiagnose(): Promise<DiagnoseResult> {
-  return requestJson<DiagnoseResult>("/api/tools/agent-bridge/diagnose");
+export function runDiagnose(agentId?: string): Promise<DiagnoseResult> {
+  const url = agentId
+    ? `/api/tools/agent-bridge/diagnose?agentId=${encodeURIComponent(agentId)}`
+    : "/api/tools/agent-bridge/diagnose";
+  return requestJson<DiagnoseResult>(url);
 }
 
 /** Untrust + remove the MITM root CA from the OS store (explicit, idempotent). */
-export function removeCaCert(): Promise<{ trusted: boolean }> {
+export function removeCaCert(sudoPassword?: string): Promise<{ trusted: boolean }> {
   return requestJson<{ ok: boolean; trusted: boolean }>("/api/tools/agent-bridge/cert", {
     method: "DELETE",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({}),
+    body: JSON.stringify(sudoPassword ? { sudoPassword } : {}),
   });
 }
 
 /** Undo orphaned system state (DNS spoof, root CA, system proxy) after a crash. */
-export function repairMitmState(): Promise<{ repaired: string[] }> {
+export function repairMitmState(sudoPassword?: string): Promise<{ repaired: string[] }> {
   return requestJson<{ ok: boolean; repaired: string[] }>("/api/tools/agent-bridge/repair", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({}),
+    body: JSON.stringify(sudoPassword ? { sudoPassword } : {}),
   });
 }
 

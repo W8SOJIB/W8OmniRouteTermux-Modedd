@@ -10,9 +10,17 @@
  *
  * When such an id arrives on a request we strip the prefix back to the real
  * `<provider>/<model>` and suppress reasoning (`thinking:{type:"disabled"}` for the
- * Claude/Messages path; drop `reasoning`/`reasoning_effort` for the OpenAI path).
+ * Claude/Messages path; `reasoning_effort:"none"` for the OpenAI path — #6879: a
+ * thinks-by-default OpenAI-shape model left with no reasoning field at all keeps
+ * thinking with its provider default, so the alias must express "none" rather than
+ * merely deleting the field. The `reasoning` object is still dropped, since a
+ * Responses-shaped client's `reasoning:{...}` cannot itself express "none" and the
+ * translator promotes `reasoning_effort` into it downstream when absent).
  * The existing `normalizeThinkingForModel()` still runs downstream, so models that
- * reject `disabled` are handled exactly as before.
+ * reject `disabled` are handled exactly as before, and the per-lane
+ * unsupported-param strip (open-sse/translator/paramSupport.ts) still removes
+ * `reasoning_effort` for lanes known to reject it, falling back to today's
+ * delete-only behavior for those.
  *
  * Catalog visibility is gated (see `shouldExposeNoThinkingAlias`): we only advertise
  * the variant for Claude-family models that actually support thinking AND honor
@@ -22,6 +30,15 @@
 import { getModelSpec } from "@/shared/constants/modelSpecs";
 
 export const NO_THINKING_PREFIX = "no-think/";
+
+// Ids that already carry a Claude reasoning-effort suffix (see
+// claudeEffortVariants.ts's identical constant) — a no-think variant of an effort
+// variant would combine two independent OmniRoute catalog conventions on the same
+// id. Dispatch-time, applyNoThinkingAlias pre-sets reasoning_effort:"none" before
+// applyClaudeEffortVariant's hasExplicitClaudeEffort() check runs, so the pre-set
+// "none" is treated as explicit and the suffix's implied effort is silently
+// discarded — semantically incoherent, so never advertise the combination.
+const CLAUDE_EFFORT_SUFFIX_RE = /-(?:xhigh|high|medium|low)$/i;
 
 /** True when `modelId` carries the no-thinking gateway prefix. */
 export function isNoThinkingAlias(modelId: unknown): modelId is string {
@@ -61,8 +78,15 @@ export function applyNoThinkingAlias(
   body.model = realModel;
   if (opts.claudeFormat === true) {
     body.thinking = { type: "disabled" };
+    delete body.reasoning_effort;
+  } else {
+    // #6879: express "none" instead of deleting, so a thinks-by-default model
+    // actually stops thinking instead of falling back to its provider default.
+    // Lanes that reject reasoning_effort are still cleaned up downstream by the
+    // per-lane unsupported-param strip (paramSupport.ts), which removes it just
+    // like it would have been removed here — same end state, correct on more lanes.
+    body.reasoning_effort = "none";
   }
-  delete body.reasoning_effort;
   delete body.reasoning;
   return { applied: true, realModel };
 }
@@ -93,6 +117,7 @@ export function shouldExposeNoThinkingAlias(model: CatalogModelEntry): boolean {
   if (typeof id !== "string" || id.length === 0) return false;
   if (model.owned_by === "combo") return false; // combos are virtual
   if (isNoThinkingAlias(id)) return false; // never double-alias
+  if (CLAUDE_EFFORT_SUFFIX_RE.test(id)) return false; // never combine with an effort-suffix id
 
   const name = bareModelName(id);
   const spec = getModelSpec(name);
@@ -143,7 +168,8 @@ export function appendNoThinkingVariants<T extends CatalogModelEntry>(
     const rawId = model.id as string;
     const qualifiedId = aliasToCanonical ? normalizeProviderPrefix(rawId, aliasToCanonical) : rawId;
     const aliasId = toNoThinkingAlias(qualifiedId);
-    const variant: T = { ...model, id: aliasId, root: aliasId };
+    const bareRoot = toNoThinkingAlias(bareModelName(qualifiedId));
+    const variant: T = { ...model, id: aliasId, root: bareRoot };
     if (typeof model.name === "string" && model.name) {
       variant.name = `${model.name} (no thinking)`;
     }

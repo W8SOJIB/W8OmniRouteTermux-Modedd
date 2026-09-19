@@ -25,7 +25,7 @@ function jsonResponse(body, status = 200) {
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -154,7 +154,7 @@ test.beforeEach(async () => {
 test.after(async () => {
   delete PROVIDERS["custom-oauth-local-608"];
   await resetStorage();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("token refresh wrapper delegates provider-specific refresh helpers and formatter utilities", async () => {
@@ -186,13 +186,6 @@ test("token refresh wrapper delegates provider-specific refresh helpers and form
             access_token: "google-access",
             refresh_token: "google-refresh-next",
             expires_in: 3600,
-          });
-        case OAUTH_ENDPOINTS.qwen.token:
-          return jsonResponse({
-            access_token: "qwen-access",
-            refresh_token: "qwen-refresh-next",
-            expires_in: 900,
-            resource_url: "https://resource.qwen.local",
           });
         case OAUTH_ENDPOINTS.openai.token:
           return jsonResponse({
@@ -227,7 +220,6 @@ test("token refresh wrapper delegates provider-specific refresh helpers and form
         "override-client-id",
         "override-client-secret"
       );
-      const qwen = await tokenRefresh.refreshQwenToken("refresh-qwen");
       const codex = await tokenRefresh.refreshCodexToken("refresh-codex");
       const qoder = await tokenRefresh.refreshQoderToken("refresh-qoder");
       const github = await tokenRefresh.refreshGitHubToken("refresh-github");
@@ -244,10 +236,7 @@ test("token refresh wrapper delegates provider-specific refresh helpers and form
         refreshToken: "refresh-github",
       });
       const allTokens = await tokenRefresh.getAllAccessTokens({
-        connections: [
-          { provider: "github", refreshToken: "refresh-github-all", isActive: true },
-          { provider: "qwen", refreshToken: "refresh-qwen-all", isActive: false },
-        ],
+        connections: [{ provider: "github", refreshToken: "refresh-github-all", isActive: true }],
       });
 
       assert.equal(tokenRefresh.TOKEN_EXPIRY_BUFFER_MS, 5 * 60 * 1000);
@@ -258,7 +247,6 @@ test("token refresh wrapper delegates provider-specific refresh helpers and form
       });
       assert.equal(claude.accessToken, "claude-access");
       assert.equal(google.accessToken, "google-access");
-      assert.equal(qwen.providerSpecificData.resourceUrl, "https://resource.qwen.local");
       assert.equal(codex.accessToken, "codex-access");
       assert.equal(qoder, null);
       assert.equal(github.refreshToken, "github-refresh-next");
@@ -274,7 +262,7 @@ test("token refresh wrapper delegates provider-specific refresh helpers and form
     }
   );
 
-  assert.equal(calls.length >= 8, true);
+  assert.equal(calls.length >= 7, true);
   delete PROVIDERS["custom-oauth-local-608"];
 });
 

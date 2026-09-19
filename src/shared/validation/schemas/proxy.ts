@@ -14,7 +14,6 @@ import {
 } from "@/shared/constants/upstreamHeaders";
 import { MAX_TIMER_TIMEOUT_MS } from "@/shared/utils/runtimeTimeouts";
 
-
 export const proxyConfigSchema = z
   .object({
     type: z
@@ -109,15 +108,14 @@ export const proxyRegistryFieldsSchema = z
         (value) => (typeof value === "string" ? value.trim().toLowerCase() : value),
         z.enum(["http", "https", "socks5", "vercel", "deno", "cloudflare"])
       )
-      .optional()
-      .default("http"),
+      .optional(),
     host: z.string().trim().min(1, "host is required").max(255),
     port: z.coerce.number().int().min(1).max(65535),
     username: z.string().optional(),
     password: z.string().optional(),
     region: z.string().trim().max(64).nullable().optional(),
     notes: z.string().trim().max(1000).nullable().optional(),
-    status: z.enum(["active", "inactive"]).optional().default("active"),
+    status: z.enum(["active", "inactive", "dead"]).optional().default("active"),
     source: z
       .enum([
         "manual",
@@ -136,6 +134,13 @@ export const proxyRegistryFieldsSchema = z
 
 export const createProxyRegistrySchema = proxyRegistryFieldsSchema
   .extend({
+    type: z
+      .preprocess(
+        (value) => (typeof value === "string" ? value.trim().toLowerCase() : value),
+        z.enum(["http", "https", "socks5", "vercel", "deno", "cloudflare"])
+      )
+      .optional()
+      .default("http"),
     assignment: inlineProxyAssignmentSchema.optional(),
   })
   .strict();
@@ -201,6 +206,7 @@ export const PROXY_POOL_ROTATION_STRATEGY_VALUES = [
   "round-robin",
   "random",
   "sticky",
+  "latency",
 ] as const;
 
 // Add/remove one proxy to/from a scope's pool. proxyId is REQUIRED (unlike the

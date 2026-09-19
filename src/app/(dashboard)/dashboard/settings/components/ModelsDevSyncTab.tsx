@@ -24,6 +24,46 @@ interface SyncResult {
   error?: string;
 }
 
+// Slider works in "checkpoint space": position p ∈ [0, 3] maps linearly onto
+// these hour values, so the evenly spaced tick labels always match the thumb.
+const INTERVAL_CHECKPOINTS = [1, 6, 24, 168];
+const SNAP_THRESHOLD = 0.15;
+
+function positionToHours(pos: number): number {
+  const p = Math.min(INTERVAL_CHECKPOINTS.length - 1, Math.max(0, pos));
+  const lower = Math.floor(p);
+  const upper = Math.ceil(p);
+  if (lower === upper) return INTERVAL_CHECKPOINTS[lower];
+  const t = p - lower;
+  return Math.round(
+    INTERVAL_CHECKPOINTS[lower] + (INTERVAL_CHECKPOINTS[upper] - INTERVAL_CHECKPOINTS[lower]) * t
+  );
+}
+
+function hoursToPosition(hours: number): number {
+  const cps = INTERVAL_CHECKPOINTS;
+  if (hours <= cps[0]) return 0;
+  for (let i = 0; i < cps.length - 1; i++) {
+    if (hours <= cps[i + 1]) {
+      return i + (hours - cps[i]) / (cps[i + 1] - cps[i]);
+    }
+  }
+  return cps.length - 1;
+}
+
+// Magnetic checkpoints: snap to a reference point when released nearby,
+// otherwise keep the freely chosen position.
+function snapPosition(pos: number): number {
+  for (let i = 0; i < INTERVAL_CHECKPOINTS.length; i++) {
+    if (Math.abs(pos - i) <= SNAP_THRESHOLD) return i;
+  }
+  return pos;
+}
+
+function formatInterval(hours: number): string {
+  return hours === 168 ? "7d" : `${hours}h`;
+}
+
 export default function ModelsDevSyncTab() {
   const t = useTranslations("settings");
   const [status, setStatus] = useState<ModelsDevStatus | null>(null);
@@ -32,7 +72,7 @@ export default function ModelsDevSyncTab() {
   const [saving, setSaving] = useState(false);
   const [enabled, setEnabled] = useState(false);
   const [intervalHours, setIntervalHours] = useState(24);
-  const [draftIntervalHours, setDraftIntervalHours] = useState(24);
+  const [draftPos, setDraftPos] = useState(2);
   const [feedback, setFeedback] = useState<{ type: "success" | "error"; message: string } | null>(
     null
   );
@@ -58,7 +98,7 @@ export default function ModelsDevSyncTab() {
           const intervalMs = settingsData.modelsDevSyncInterval || 86400000;
           const hours = Math.round(intervalMs / 3600000);
           setIntervalHours(hours);
-          setDraftIntervalHours(hours);
+          setDraftPos(hoursToPosition(hours));
         }
       })
       .catch((err) => {
@@ -85,7 +125,7 @@ export default function ModelsDevSyncTab() {
           });
           fetchStatus();
         } else {
-          setFeedback({ type: "error", message: result.error || "Sync failed" });
+          setFeedback({ type: "error", message: result.error || t("syncFailed") });
         }
       } else {
         setFeedback({ type: "error", message: "Sync request failed" });
@@ -110,7 +150,7 @@ export default function ModelsDevSyncTab() {
       });
       if (!res.ok) {
         setEnabled(!newVal);
-        setFeedback({ type: "error", message: t("enableSyncError") || "Failed to update" });
+        setFeedback({ type: "error", message: t("enableSyncError") });
       } else {
         setFeedback({ type: "success", message: "Settings saved" });
       }
@@ -126,7 +166,7 @@ export default function ModelsDevSyncTab() {
   const updateInterval = async (hours: number) => {
     const oldInterval = intervalHours;
     setIntervalHours(hours);
-    setDraftIntervalHours(hours);
+    setDraftPos(hoursToPosition(hours));
     try {
       const res = await fetch("/api/settings", {
         method: "PATCH",
@@ -135,18 +175,25 @@ export default function ModelsDevSyncTab() {
       });
       if (!res.ok) {
         setIntervalHours(oldInterval);
-        setDraftIntervalHours(oldInterval);
-        setFeedback({ type: "error", message: t("enableSyncError") || "Failed to update" });
+        setDraftPos(hoursToPosition(oldInterval));
+        setFeedback({ type: "error", message: t("enableSyncError") });
       } else {
         setFeedback({ type: "success", message: "Interval updated" });
       }
     } catch {
       setIntervalHours(oldInterval);
-      setDraftIntervalHours(oldInterval);
+      setDraftPos(hoursToPosition(oldInterval));
       setFeedback({ type: "error", message: "Network error" });
     } finally {
       setTimeout(() => setFeedback(null), 3000);
     }
+  };
+
+  // Commit on release: snap to a checkpoint when near one, else keep free value.
+  const commitDraftInterval = () => {
+    const snapped = snapPosition(draftPos);
+    if (snapped !== draftPos) setDraftPos(snapped);
+    updateInterval(positionToHours(snapped));
   };
 
   if (loading) {
@@ -238,18 +285,20 @@ export default function ModelsDevSyncTab() {
             <div className="flex items-center justify-between mb-3">
               <p className="text-sm font-medium">{t("modelsDevInterval")}</p>
               <span className="text-sm font-mono tabular-nums text-blue-400">
-                {draftIntervalHours}h
+                {formatInterval(positionToHours(draftPos))}
               </span>
             </div>
             <input
               type="range"
-              min="1"
-              max="168"
-              step="1"
-              value={draftIntervalHours}
-              onChange={(e) => setDraftIntervalHours(parseInt(e.target.value))}
-              onMouseUp={(e) => updateInterval(parseInt((e.target as HTMLInputElement).value))}
-              onBlur={(e) => updateInterval(parseInt(e.target.value))}
+              min="0"
+              max={INTERVAL_CHECKPOINTS.length - 1}
+              step="any"
+              value={draftPos}
+              onChange={(e) => setDraftPos(parseFloat(e.target.value))}
+              onMouseUp={commitDraftInterval}
+              onTouchEnd={commitDraftInterval}
+              onBlur={commitDraftInterval}
+              aria-label={t("modelsDevInterval")}
               className="w-full accent-blue-500"
             />
             <div className="flex justify-between text-xs text-text-muted mt-1">

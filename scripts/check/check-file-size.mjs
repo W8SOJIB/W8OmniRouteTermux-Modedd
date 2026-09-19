@@ -5,9 +5,13 @@
 //  - arquivo congelado: só pode ENCOLHER (nunca crescer);
 //  - arquivo NOVO (fora do baseline): não pode passar do CAP.
 // Assim o próximo arquivo de 12.760 linhas é impossível, e os 91 atuais só melhoram.
-// --update ratcheta o baseline para baixo (encolhimentos + remove quem caiu < cap).
+// --update ratcheta o baseline para baixo: encolhimentos + remove toda entrada que
+// já cabe no cap, inclusive quem NÃO encolheu nesta rodada (loc === frozen[file]).
+// Antes a remoção só acontecia dentro do ramo de encolhimento, então uma entrada
+// igual ao próprio teto ficava presa no baseline para sempre — ver #8584.
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
 const ROOT = process.cwd();
@@ -19,6 +23,7 @@ const BASELINE_PATH = path.resolve(
   getArg("--baseline", path.join(ROOT, "config/quality/file-size-baseline.json"))
 );
 const UPDATE = process.argv.includes("--update");
+const BASE_REF = getArg("--base-ref"); // SHA for PR base-relative mode (#8522)
 const SCAN_DIRS = ["src", "open-sse", "electron", "bin"];
 // Test files live under tests/ plus co-located *.test.ts(x) inside the source dirs.
 const TEST_SCAN_DIRS = ["tests", ...SCAN_DIRS];
@@ -27,21 +32,49 @@ const SKIP_DIRS = new Set(["node_modules", "dist-electron", ".next", ".build", "
 
 /**
  * Avalia LOC atuais contra o baseline congelado.
- * @returns {{violations: string[], improvements: [string, number][]}}
+ *
+ * `redundant` (#8584): entrada que NAO precisa mais existir — o arquivo esta
+ * exatamente no valor congelado E ja cabe no cap de arquivo novo. Antes, a
+ * remocao do baseline so acontecia dentro do ramo de `improvements`
+ * (loc < frozen), entao uma entrada igual ao proprio teto nunca saia da lista,
+ * por mais abaixo do cap que estivesse (3 casos reais no v3.8.49).
+ *
+ * Quando `baseLocByFile` e fornecido (modo PR), a violacao e computada contra
+ * o MAIOR entre o valor congelado e o valor na base -- assim um PR inocente
+ * (head === base no arquivo) nao e penalizado por drift herdado (#8522).
+ *
+ * @param {Object} currentLocByFile — LOC atuais (head)
+ * @param {Object} frozen — baseline congelado
+ * @param {number} cap — teto para arquivos novos
+ * @param {Object} [baseLocByFile] — LOC na branch base (opcional, modo PR)
+ * @returns {{violations: string[], improvements: [string, number][], redundant: string[]}}
  */
-export function evaluateFileSizes(currentLocByFile, frozen, cap) {
+export function evaluateFileSizes(currentLocByFile, frozen, cap, baseLocByFile) {
   const violations = [];
   const improvements = [];
+  const redundant = [];
   for (const [file, loc] of Object.entries(currentLocByFile)) {
     if (file in frozen) {
-      if (loc > frozen[file])
+      const threshold = baseLocByFile
+        ? Math.max(frozen[file], baseLocByFile[file] ?? frozen[file])
+        : frozen[file];
+      if (loc > threshold)
         violations.push(`${file}: ${loc} > congelado ${frozen[file]} (não pode crescer)`);
       else if (loc < frozen[file]) improvements.push([file, loc]);
+      else if (loc <= cap) redundant.push(file);
     } else if (loc > cap) {
-      violations.push(`${file}: ${loc} > cap ${cap} (arquivo novo acima do limite)`);
+      if (!baseLocByFile) {
+        violations.push(`${file}: ${loc} > cap ${cap} (arquivo novo acima do limite)`);
+      } else {
+        // Modo PR: so viola se cresceu alem do que ja estava na base
+        const baseLoc = baseLocByFile[file] ?? 0;
+        const prThreshold = Math.max(cap, baseLoc);
+        if (loc > prThreshold)
+          violations.push(`${file}: ${loc} > cap ${cap} (arquivo novo acima do limite)`);
+      }
     }
   }
-  return { violations, improvements };
+  return { violations, improvements, redundant };
 }
 
 function countLines(file) {
@@ -96,6 +129,30 @@ function collectTestLoc() {
   return out;
 }
 
+/**
+ * Computa LOC por arquivo a partir de um ref git (branch, SHA, tag).
+ * Usado pelo modo --base-ref para obter a contagem na base do PR (#8522).
+ * @param {string} ref — git ref (e.g. SHA da branch base)
+ * @param {string[]} files — lista de paths relativos ao ROOT
+ * @returns {Object} mapa file → line count
+ */
+function getBaseLoc(ref, files) {
+  const out = {};
+  for (const file of files) {
+    try {
+      const buf = execFileSync("git", ["show", `${ref}:${file}`], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 5000,
+      });
+      out[file] = buf.split("\n").length;
+    } catch {
+      // Arquivo nao existe na base (novo no PR) — tratado como 0
+    }
+  }
+  return out;
+}
+
 function main() {
   if (!fs.existsSync(BASELINE_PATH)) {
     console.error(`[file-size] FAIL — ${path.basename(BASELINE_PATH)} ausente.`);
@@ -105,40 +162,67 @@ function main() {
   const cap = baseline.cap;
   const frozen = baseline.frozen || {};
   const current = collectLoc();
-  const { violations, improvements } = evaluateFileSizes(current, frozen, cap);
+
+  // Modo PR: computa LOC na branch base para comparacao relativa (#8522)
+  const baseLoc = BASE_REF ? getBaseLoc(BASE_REF, Object.keys(current)) : undefined;
+  if (BASE_REF) {
+    const baseKeys = Object.keys(baseLoc).length;
+    console.log(
+      `[file-size] modo PR (--base-ref ${BASE_REF.slice(0, 12)}): ${baseKeys} arquivos da base computados`
+    );
+  }
+
+  const { violations, improvements, redundant } = evaluateFileSizes(current, frozen, cap, baseLoc);
 
   // Test-file gate (Layer 1 anti-reinflation): same shrink-only + new-≤cap semantics,
   // reusing evaluateFileSizes against the testFrozen baseline + testCap.
   const testCap = baseline.testCap;
   const testFrozen = baseline.testFrozen || {};
   const currentTests = collectTestLoc();
-  const { violations: testViolations, improvements: testImprovements } =
-    typeof testCap === "number"
-      ? evaluateFileSizes(currentTests, testFrozen, testCap)
-      : { violations: [], improvements: [] };
+  const {
+    violations: testViolations,
+    improvements: testImprovements,
+    redundant: testRedundant,
+  } = typeof testCap === "number"
+    ? evaluateFileSizes(currentTests, testFrozen, testCap, BASE_REF ? baseLoc : undefined)
+    : { violations: [], improvements: [], redundant: [] };
 
   if (UPDATE) {
     let changed = false;
-    if (violations.length === 0 && improvements.length) {
+    if (violations.length === 0 && (improvements.length || redundant.length)) {
       for (const [file, loc] of improvements) {
         if (loc <= cap)
           delete frozen[file]; // caiu para dentro do cap → sai do baseline
         else frozen[file] = loc; // continua grande mas encolheu → trava no novo valor
       }
+      // #8584: entradas que já cabem no cap sem terem encolhido nesta rodada
+      // (loc === frozen[file]) também saem — antes ficavam presas para sempre.
+      for (const file of redundant) delete frozen[file];
       baseline.frozen = Object.fromEntries(Object.entries(frozen).sort());
       changed = true;
-      console.log(`[file-size] baseline ratcheado: ${improvements.length} arquivo(s) encolheram`);
+      console.log(
+        `[file-size] baseline ratcheado: ${improvements.length} arquivo(s) encolheram` +
+          (redundant.length ? `, ${redundant.length} entrada(s) redundante(s) removida(s)` : "")
+      );
     }
-    if (typeof testCap === "number" && testViolations.length === 0 && testImprovements.length) {
+    if (
+      typeof testCap === "number" &&
+      testViolations.length === 0 &&
+      (testImprovements.length || testRedundant.length)
+    ) {
       for (const [file, loc] of testImprovements) {
         if (loc <= testCap)
           delete testFrozen[file]; // caiu para dentro do testCap → sai do baseline
         else testFrozen[file] = loc; // continua grande mas encolheu → trava no novo valor
       }
+      for (const file of testRedundant) delete testFrozen[file];
       baseline.testFrozen = Object.fromEntries(Object.entries(testFrozen).sort());
       changed = true;
       console.log(
-        `[test-file-size] baseline ratcheado: ${testImprovements.length} arquivo(s) de teste encolheram`
+        `[test-file-size] baseline ratcheado: ${testImprovements.length} arquivo(s) de teste encolheram` +
+          (testRedundant.length
+            ? `, ${testRedundant.length} entrada(s) redundante(s) removida(s)`
+            : "")
       );
     }
     if (changed) fs.writeFileSync(BASELINE_PATH, JSON.stringify(baseline, null, 2) + "\n");

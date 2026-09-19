@@ -5,6 +5,7 @@ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { denoDeploySchema } from "@/shared/validation/freeProxySchemas";
 import { createProxy } from "@/lib/localDb";
 import { encrypt } from "@/lib/db/encryption";
+import { isPrivateRelayHostname } from "@/lib/proxyRelay/privateHostname";
 
 const DENO_API_BASE = process.env.DENO_DEPLOY_API_BASE || "https://api.deno.com/v2";
 const POLL_INTERVAL_MS = 2000;
@@ -80,34 +81,7 @@ export function resolveRelayTarget(
 function buildRelayWorker(relayAuth: string): string {
   return `const resolveRelayTarget = ${resolveRelayTarget.toString()};
 
-function isPrivateHostname(h) {
-  if (!h) return true;
-  const host = h.trim().toLowerCase().replace(/^\\[|\\]$/g, "");
-  if (
-    host === "localhost" ||
-    host === "0.0.0.0" ||
-    host === "127.0.0.1" ||
-    host === "::1" ||
-    host.endsWith(".localhost") ||
-    host.endsWith(".local") ||
-    host.endsWith(".internal") ||
-    host.startsWith("::ffff:")
-  ) return true;
-  const v4 = host.match(/^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$/);
-  if (v4) {
-    const a = +v4[1], b = +v4[2];
-    if (a === 0 || a === 10 || a === 127) return true;
-    if (a === 169 && b === 254) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 100 && b >= 64 && b <= 127) return true;
-    return false;
-  }
-  if (host.includes(":")) {
-    return host === "::1" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80:");
-  }
-  return false;
-}
+const isPrivateHostname = ${isPrivateRelayHostname.toString()};
 
 Deno.serve(async (request) => {
   const auth = request.headers.get("x-relay-auth");

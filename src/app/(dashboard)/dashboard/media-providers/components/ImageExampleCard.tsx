@@ -1,10 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Image from "next/image";
 import { useTranslations } from "next-intl";
 import { useApiKey } from "../../providers/hooks/useApiKey";
 import { useProviderModels } from "../../providers/hooks/useProviderModels";
 import { buildCurl } from "../../providers/utils/buildCurl";
+import { PLAYGROUND_KEY_ID_HEADER, resolvePlaygroundKeyId } from "../../providers/utils/playgroundAuth";
 import { PlaygroundCard } from "./PlaygroundCard";
 
 interface SuggestedHfModel {
@@ -66,7 +68,7 @@ function extractError(data: unknown): string | null {
   return null;
 }
 
-function ImageResultRenderer(data: unknown) {
+function ImageResultRenderer(data: unknown, altText: string) {
   if (!data || typeof data !== "object") return null;
   const d = data as Record<string, unknown>;
   const items = Array.isArray(d.data) ? (d.data as Array<Record<string, unknown>>) : [];
@@ -81,12 +83,15 @@ function ImageResultRenderer(data: unknown) {
         const src = url ?? (b64 ? `data:image/png;base64,${b64}` : null);
         if (!src) return null;
         return (
-          <img
+          <Image
             key={i}
             src={src}
-            alt={`Generated image ${i + 1}`}
+            alt={`${altText} ${i + 1}`}
+            width={200}
+            height={200}
+            unoptimized
             className="max-w-full rounded-lg border border-border"
-            style={{ maxHeight: "200px" }}
+            style={{ maxHeight: "200px", objectFit: "contain" }}
           />
         );
       })}
@@ -97,13 +102,13 @@ function ImageResultRenderer(data: unknown) {
 export function ImageExampleCard({ providerId }: Props) {
   const t = useTranslations("miniPlayground");
   const tMedia = useTranslations("media");
-  const { apiKey } = useApiKey();
+  const { apiKey, keys } = useApiKey();
   const { models } = useProviderModels(providerId);
   const suggestedModels = useHfSuggestedImageModels(providerId);
 
   const firstModel = models[0]?.id ?? "dall-e-3";
   const [model, setModel] = useState<string>("");
-  const [prompt, setPrompt] = useState<string>("A serene landscape with mountains at sunset");
+  const [prompt, setPrompt] = useState<string>(() => t("imageSample"));
   const [size, setSize] = useState<string>("1024x1024");
   const [running, setRunning] = useState<boolean>(false);
   const [result, setResult] = useState<{ data: unknown; latencyMs: number } | undefined>();
@@ -117,7 +122,7 @@ export function ImageExampleCard({ providerId }: Props) {
       (typeof window !== "undefined" ? window.location.origin : "http://localhost:20128") +
       ENDPOINT_PATH,
     headers: {
-      Authorization: `Bearer ${apiKey || "<your-api-key>"}`,
+      Authorization: "Bearer <your-api-key>",
       "Content-Type": "application/json",
     },
     body: buildBody(),
@@ -129,13 +134,18 @@ export function ImageExampleCard({ providerId }: Props) {
     setResult(undefined);
     const t0 = performance.now();
     try {
+      // Authenticate via the dashboard session cookie — never send the masked
+      // apiKey as a Bearer token (it is not a real credential; see #9935).
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        "x-connection-id": providerId,
+      };
+      const playgroundKeyId = resolvePlaygroundKeyId(apiKey, keys);
+      if (playgroundKeyId) headers[PLAYGROUND_KEY_ID_HEADER] = playgroundKeyId;
       const res = await fetch(ENDPOINT_PATH, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          "x-connection-id": providerId,
-        },
+        credentials: "same-origin",
+        headers,
         body: JSON.stringify(buildBody()),
       });
       const data: unknown = await res.json();
@@ -147,7 +157,7 @@ export function ImageExampleCard({ providerId }: Props) {
         setResult({ data, latencyMs });
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Request failed");
+      setError(err instanceof Error ? err.message : t("requestFailed"));
     } finally {
       setRunning(false);
     }
@@ -160,14 +170,14 @@ export function ImageExampleCard({ providerId }: Props) {
 
   return (
     <PlaygroundCard
-      kindLabel="Image"
+      kindLabel={t("image")}
       apiEndpoint={ENDPOINT_PATH}
       onRun={handleRun}
       curlSnippet={curlSnippet}
       running={running}
       result={result}
       error={error}
-      resultRenderer={ImageResultRenderer}
+      resultRenderer={(data) => ImageResultRenderer(data, tMedia("generatedImageAlt"))}
     >
       {/* Model */}
       <div>
@@ -187,9 +197,7 @@ export function ImageExampleCard({ providerId }: Props) {
       {/* Suggested models from HuggingFace Hub (image kind only) */}
       {suggestedOnly.length > 0 && (
         <div>
-          <label className="block text-xs text-text-muted mb-1">
-            {tMedia("suggestedModels")}
-          </label>
+          <label className="block text-xs text-text-muted mb-1">{tMedia("suggestedModels")}</label>
           <div className="flex flex-wrap gap-1.5">
             {suggestedOnly.map((m) => (
               <button
@@ -231,7 +239,7 @@ export function ImageExampleCard({ providerId }: Props) {
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           rows={2}
-          placeholder="A serene landscape..."
+          placeholder={t("imageSample")}
           className="w-full rounded-md border border-border bg-bg-subtle text-sm px-2 py-1.5 text-text-main focus:outline-none focus:ring-1 focus:ring-primary resize-none"
         />
       </div>

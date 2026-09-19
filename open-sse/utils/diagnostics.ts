@@ -122,6 +122,7 @@ export function synthOpenAIErrorChunk(opts: {
     error: {
       message: safeMessage,
       type: "upstream_empty_response",
+      code: "upstream_empty_response",
     },
   };
   return `data: ${JSON.stringify(body)}\n\n`;
@@ -210,7 +211,8 @@ export function detectMalformedNonStream(resp: unknown): MalformedReason | null 
   // `choices`. Without this branch every non-streaming Claude response (incl. plain text)
   // falls through to `empty_choices` → a false 502 (#5108, regression from #4942).
   if (body.type === "message" && Array.isArray(body.content)) {
-    const hasOutput = (body.content as unknown[]).some((block) => {
+    const content = body.content as unknown[];
+    const hasOutput = content.some((block) => {
       // A malformed/partial provider response could carry a null (or non-object)
       // entry in `content`; guard before type-asserting so the detector never
       // throws on `null.type` (that would crash the whole non-stream classifier).
@@ -228,16 +230,18 @@ export function detectMalformedNonStream(resp: unknown): MalformedReason | null 
       ) {
         return true;
       }
-      // Extended-thinking block: valid when it carries visible thinking text OR a
-      // non-empty `signature` (cryptographic proof the thinking step ran, so it is a
-      // valid completion even when the thinking text is "").
-      if (
-        b.type === "thinking" &&
-        ((typeof b.thinking === "string" && (b.thinking as string).length > 0) ||
-          (typeof b.signature === "string" && (b.signature as string).length > 0))
-      ) {
-        return true;
-      }
+      // Extended-thinking block: valid structural output whenever the model
+      // entered the thinking phase, even with no visible thinking text and no
+      // `signature`. #9971: the Claude Code OAuth upstream can truncate long
+      // large-input+large-output generations around the ~3-min turn boundary,
+      // leaving a content-less thinking-only body whose final text (and, when
+      // cut mid-think, its signature) never arrived. The block's very presence
+      // is proof the turn produced output upstream, so it is a valid
+      // in-progress completion, NOT a genuinely empty terminal response.
+      // (Previously only a non-empty `thinking` text OR `signature` counted —
+      // #5108 — which misclassified these content-less bodies as empty_choices
+      // → 502.)
+      if (b.type === "thinking") return true;
       // Redacted thinking and tool_use are valid structural output.
       if (b.type === "redacted_thinking") return true;
       if (b.type === "tool_use" && typeof b.id === "string" && (b.id as string).length > 0) {
@@ -245,7 +249,27 @@ export function detectMalformedNonStream(resp: unknown): MalformedReason | null 
       }
       return false;
     });
-    return hasOutput ? null : "empty_choices";
+    if (hasOutput) return null;
+
+    // No per-block output. Two distinct situations remain:
+    //  1) A block IS present but invalid (e.g. text:"", a lone "(empty response)"
+    //     sentinel, or only null entries) — the model genuinely produced no
+    //     usable output. That is a MALFORMED-200 empty_choices regardless of
+    //     stop_reason (parity with the OpenAI content:"" path).
+    //  2) `content: []` — no block at all. Only a genuinely *terminal* response
+    //     (a final stop_reason with no output) is empty_choices. #9971: a
+    //     truncated / non-terminal body — the Claude Code OAuth upstream cutting
+    //     a long generation mid-turn, or a content-less thinking-only stream
+    //     that never emitted a terminal event — carries content:[] with no
+    //     reachable end, so flagging it would turn an upstream truncation into a
+    //     false 502. Require a terminal stop_reason before calling a block-less
+    //     response genuinely empty.
+    if (content.length === 0) {
+      const stopReason = typeof body.stop_reason === "string" ? body.stop_reason : "";
+      const isTerminal = stopReason.length > 0;
+      return isTerminal ? "empty_choices" : null;
+    }
+    return "empty_choices";
   }
 
   // ── Chat Completions shape ──
@@ -275,13 +299,42 @@ export function detectMalformedNonStream(resp: unknown): MalformedReason | null 
     )
       return true;
     if (Array.isArray(msg?.tool_calls) && (msg.tool_calls as unknown[]).length > 0) return true;
+    // Reasoning-only completions are real output: a reasoning model that
+    // exhausts max_tokens on chain-of-thought returns `content: null` with the
+    // analysis in a reasoning field. Some OpenAI-compatible upstreams (e.g.
+    // opencode/mimo-v2.5-free via the OpenCode gateway) name it `reasoning`
+    // rather than `reasoning_content` — missing either variant falsely flagged
+    // these as empty_choices → 502 (#6623).
     if (typeof msg?.reasoning_content === "string" && (msg.reasoning_content as string).length > 0)
       return true;
+    if (typeof msg?.reasoning === "string" && (msg.reasoning as string).length > 0) return true;
     return false;
   });
 
   if (!anyHasOutput) return "empty_choices";
   return null;
+}
+
+export function describeMalformedNonStream(
+  resp: unknown,
+  reason: MalformedReason
+): { message: string; code: string; type: string } {
+  const body = resp && typeof resp === "object" ? (resp as Record<string, unknown>) : null;
+  if (body?.object === "response" && body.status === "failed") {
+    return {
+      message: "upstream reported a failed response without usable output",
+      code: "upstream_response_failed",
+      type: "upstream_response_error",
+    };
+  }
+  return {
+    message:
+      reason === "no_terminal"
+        ? "upstream response did not reach a terminal state"
+        : "upstream returned an empty response without usable output",
+    code: "upstream_empty_response",
+    type: "upstream_response_error",
+  };
 }
 
 // ── Test-only export ─────────────────────────────────────────────────────────

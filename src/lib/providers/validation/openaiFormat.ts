@@ -1,7 +1,6 @@
 // OpenAI/Gemini-format + Bedrock provider key validators (bedrock, openai-like, command-code, gemini-like, openai-compatible).
 // Extracted from validation.ts (god-file decomposition) — top-level functions; behavior is
 // byte-identical to the original inline defs.
-import { randomUUID } from "node:crypto";
 import { getRegistryEntry } from "@omniroute/open-sse/config/providerRegistry.ts";
 import {
   discoverBedrockNativeModels,
@@ -163,11 +162,28 @@ export async function validateOpenAILikeProvider({
     }
 
     if (chatRes.status === 404 || chatRes.status === 405) {
-      return { valid: false, error: "Provider validation endpoint not supported" };
+      return {
+        valid: false,
+        error: "Provider validation endpoint not supported",
+        unsupported: true,
+      };
     }
 
     if (chatRes.status >= 500) {
       return { valid: false, error: `Provider unavailable (${chatRes.status})` };
+    }
+
+    // #7284: A 429 on the chat probe means the key is accepted but this connection
+    // is rate/concurrency limited (e.g. always-throttled free tiers like opencode-zen).
+    // Keep valid:true (the key works) but surface a warning so the connection Test
+    // does not read as an unqualified green when real traffic will hit 429s.
+    // Mirrors validateBedrockProvider's existing 429 precedent above.
+    if (chatRes.status === 429) {
+      return {
+        valid: true,
+        error: null,
+        warning: "Provider accepted the key but is rate limited (429)",
+      };
     }
 
     return { valid: true, error: null };
@@ -179,13 +195,12 @@ export async function validateOpenAILikeProvider({
 export async function validateCommandCodeProvider({ apiKey, providerSpecificData = {} }: any) {
   const entry = getRegistryEntry("command-code");
   const baseUrl = normalizeBaseUrl(entry?.baseUrl || "https://api.commandcode.ai");
-  const chatPath = entry?.chatPath || "/alpha/generate";
+  const chatPath = entry?.chatPath || "/provider/v1/chat/completions";
   const url = `${baseUrl}${chatPath.startsWith("/") ? chatPath : `/${chatPath}`}`;
   const validationModelId =
     providerSpecificData?.validationModelId ||
     entry?.models?.find((model) => model.id === "deepseek/deepseek-v4-flash")?.id ||
     "deepseek/deepseek-v4-flash";
-  const { COMMAND_CODE_VERSION } = await import("@omniroute/open-sse/executors/commandCode.ts");
 
   return validateDirectChatProvider({
     url,
@@ -193,37 +208,13 @@ export async function validateCommandCodeProvider({ apiKey, providerSpecificData
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
-      "x-command-code-version": COMMAND_CODE_VERSION,
-      "x-cli-environment": "external",
-      "x-project-slug": "pi-cc",
-      "x-taste-learning": "false",
-      "x-co-flag": "false",
-      "x-session-id": randomUUID(),
+      Accept: "text/event-stream",
     },
     body: {
-      config: {
-        workingDir: "/workspace",
-        date: new Date().toISOString().slice(0, 10),
-        environment: "external",
-        structure: [],
-        isGitRepo: false,
-        currentBranch: "",
-        mainBranch: "",
-        gitStatus: "",
-        recentCommits: [],
-      },
-      memory: "",
-      taste: "",
-      skills: "",
-      permissionMode: "standard",
-      params: {
-        model: validationModelId,
-        messages: [{ role: "user", content: "test" }],
-        tools: [],
-        system: "",
-        max_tokens: 1,
-        stream: true,
-      },
+      model: validationModelId,
+      messages: [{ role: "user", content: "test" }],
+      stream: true,
+      max_tokens: 1,
     },
   });
 }
@@ -456,6 +447,31 @@ export async function validateOpenAICompatibleProvider({ apiKey, providerSpecifi
         error: null,
         method: "inference_available",
         warning: "Model ID may be invalid, but credentials are valid",
+      };
+    }
+
+    // #2032: a 404 on the chat probe commonly means the requested model id
+    // does not exist at this provider (OpenAI-compatible `model_not_found`,
+    // e.g. Featherless/OpenRouter-style `vendor/model` typos). Credentials
+    // are still valid (the endpoint responded), but silently passing this
+    // hides the bad model id from the user until a real request later trips
+    // the per-model lockout — surface it as a warning at Check time instead.
+    if (chatRes.status === 404) {
+      let modelNotFoundDetail = "";
+      try {
+        const body: any = await chatRes.json();
+        const err = body?.error;
+        if (typeof err?.message === "string" && err.message.trim()) {
+          modelNotFoundDetail = `: ${err.message.trim()}`;
+        }
+      } catch {
+        // Non-JSON or unreadable body — fall through with the generic warning.
+      }
+      return {
+        valid: true,
+        error: null,
+        method: "inference_available",
+        warning: `Model ID may not exist at this provider (404)${modelNotFoundDetail}`,
       };
     }
 

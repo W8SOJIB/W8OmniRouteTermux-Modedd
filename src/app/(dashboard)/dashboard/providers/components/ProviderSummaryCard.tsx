@@ -42,6 +42,7 @@ interface ProviderSummaryCardProps {
   onCategoryChange(category: string | null, freeOnly: boolean): void;
   onDisplayModeChange(mode: ProviderDisplayMode): void;
   onNewProvider(): void;
+  onImportFromFile(): void;
   searchQuery: string;
   setModelSearchQuery(value: string): void;
   setSearchQuery(value: string): void;
@@ -96,6 +97,7 @@ export default function ProviderSummaryCard({
   onCategoryChange,
   onDisplayModeChange,
   onNewProvider,
+  onImportFromFile,
   searchQuery,
   setModelSearchQuery,
   setSearchQuery,
@@ -108,7 +110,12 @@ export default function ProviderSummaryCard({
   const categories = [
     { key: null, color: null, label: t("providerSummaryAll"), stat: summaryStats.all },
     { key: "oauth", color: "bg-blue-500", label: t("oauthLabel"), stat: summaryStats.oauth },
-    { key: "ide", color: "bg-cyan-500", label: "IDE", stat: summaryStats.ide },
+    {
+      key: "ide",
+      color: "bg-cyan-500",
+      label: providerText(t, "categoryIde", "IDE"),
+      stat: summaryStats.ide,
+    },
     {
       key: "free",
       color: "bg-green-500",
@@ -130,8 +137,18 @@ export default function ProviderSummaryCard({
       label: t("compatibleLabel"),
       stat: summaryStats.compatible,
     },
-    { key: "webcookie", color: "bg-purple-500", label: "Web Cookie", stat: summaryStats.webcookie },
-    { key: "search", color: "bg-teal-500", label: "Search", stat: summaryStats.search },
+    {
+      key: "webcookie",
+      color: "bg-purple-500",
+      label: providerText(t, "categoryWebCookie", "Web Cookie"),
+      stat: summaryStats.webcookie,
+    },
+    {
+      key: "search",
+      color: "bg-teal-500",
+      label: providerText(t, "categorySearch", "Search"),
+      stat: summaryStats.search,
+    },
     {
       key: "webfetch",
       color: "bg-orange-500",
@@ -139,12 +156,22 @@ export default function ProviderSummaryCard({
       stat: summaryStats.webfetch,
       title: t("webFetchTooltip"),
     },
-    { key: "audio", color: "bg-rose-500", label: "Audio", stat: summaryStats.audio },
-    { key: "local", color: "bg-emerald-500", label: "Local", stat: summaryStats.local },
+    {
+      key: "audio",
+      color: "bg-rose-500",
+      label: providerText(t, "categoryAudio", "Audio"),
+      stat: summaryStats.audio,
+    },
+    {
+      key: "local",
+      color: "bg-emerald-500",
+      label: providerText(t, "categoryLocal", "Local"),
+      stat: summaryStats.local,
+    },
     {
       key: "cloudagent",
       color: "bg-violet-500",
-      label: "Cloud Agent",
+      label: providerText(t, "categoryCloudAgent", "Cloud Agent"),
       stat: summaryStats.cloudagent,
     },
   ].filter((category) => category.key !== "no-auth" || category.stat.total > 0);
@@ -176,8 +203,8 @@ export default function ProviderSummaryCard({
             <Input
               value={modelSearchQuery}
               onChange={(e) => setModelSearchQuery(e.target.value)}
-              placeholder={t("searchByModel") || "Search by model…"}
-              aria-label={t("searchByModel") || "Search by model"}
+              placeholder={providerText(t, "searchByModel", "Search by model…")}
+              aria-label={providerText(t, "searchByModelAria", "Search by model")}
               icon="psychology"
               inputClassName={modelSearchQuery ? "pr-9" : ""}
             />
@@ -199,6 +226,9 @@ export default function ProviderSummaryCard({
           />
           <Button size="sm" icon="add" onClick={onNewProvider}>
             {providerText(t, "onboardingWizardShort", "Onboarding Wizard")}
+          </Button>
+          <Button size="sm" variant="secondary" icon="upload_file" onClick={onImportFromFile}>
+            {providerText(t, "importFromFile", "Import from file")}
           </Button>
           <button
             onClick={() => onBatchTest("all")}

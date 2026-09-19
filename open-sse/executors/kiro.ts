@@ -6,14 +6,33 @@ import {
   type ProviderCredentials,
 } from "./base.ts";
 import { PROVIDERS } from "../config/constants.ts";
+import { getRegistryEntry } from "../config/providerRegistry.ts";
 import { v4 as uuidv4 } from "uuid";
 import { refreshKiroToken } from "../services/tokenRefresh.ts";
+import {
+  isExternalIdpAuthMethod,
+  KIRO_EXTERNAL_IDP_TOKEN_TYPE_HEADER,
+  KIRO_EXTERNAL_IDP_TOKEN_TYPE_VALUE,
+} from "../services/kiroExternalIdp.ts";
 import {
   splitInlineThinking,
   flushPendingThinking,
   type KiroThinkingState,
 } from "./kiroThinking.ts";
 import { ByteQueue, TEXT_ENCODER, parseEventFrame } from "./kiro/eventstream.ts";
+import { kiroRuntimeHost, resolveKiroRuntimeRegion } from "../services/kiroRegion.ts";
+import {
+  KIRO_TOOL_CALL_WRAPPER,
+  appendBufferedKiroToolInput,
+  encodeSse,
+  getBufferedKiroToolInput,
+  validateKiroToolCallWrapperInput,
+  validateKiroToolName,
+  validateKiroToolUse,
+  type PendingKiroWrapperToolCall,
+} from "./kiroToolCallValidation.ts";
+
+export { validateKiroToolUse } from "./kiroToolCallValidation.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -35,11 +54,14 @@ type KiroStreamState = {
   seenToolIds: Map<string, number>;
   toolArgsEmitted: Map<string, string>;
   toolArgsBuffered: Map<string, { toolIndex: number; canonical: string }>;
+  generatedToolIdCounter: number;
+  pendingWrapperToolCalls: Map<string, PendingKiroWrapperToolCall>;
+  invalidToolCall?: boolean;
   totalContentLength?: number;
   contextUsagePercentage?: number;
   hasContextUsage?: boolean;
   hasMeteringEvent?: boolean;
-  usage?: UsageSummary;
+  usage?: Partial<UsageSummary>;
   hasReasoningContent?: boolean;
   reasoningChunkCount?: number;
   // Inline-thinking splitter state (populated only when thinkingExpected=true).
@@ -124,58 +146,102 @@ function buildKiroFinishChunk(
   return finishChunk;
 }
 
-function ensureKiroUsage(state: KiroStreamState) {
-  if (state.usage) return;
+/**
+ * Kiro's fallback input-token budget when the model is absent from the registry.
+ * Mirrors the registry's own `defaultContextLength` and kiro-gateway's
+ * DEFAULT_MAX_INPUT_TOKENS.
+ */
+const KIRO_DEFAULT_MAX_INPUT_TOKENS = 200000;
 
+/**
+ * Input-token budget for a Kiro model, used to turn `contextUsagePercentage`
+ * into an absolute token count.
+ *
+ * Kiro reports only a percentage, so the budget it is a percentage OF decides the
+ * result. A fixed 200000 undercounts every model with a larger window by the
+ * ratio of the two windows — claude-sonnet-5 (1M) by 5x, gpt-5.6-* (272k) by
+ * ~26% — and those numbers land in usage_history and the API-key token-limit
+ * counters.
+ */
+function resolveKiroMaxInputTokens(model: string): number {
+  const entry = getRegistryEntry("kiro");
+  const modelEntry = entry?.models?.find((m) => m.id === model);
+  return modelEntry?.contextLength || entry?.defaultContextLength || KIRO_DEFAULT_MAX_INPUT_TOKENS;
+}
+
+/**
+ * Synthesize a usage block when Kiro sent no token counts of its own.
+ *
+ * Live `generateAssistantResponse` traffic carries no token counts at all — only
+ * `contextUsageEvent.contextUsagePercentage` and a `meteringEvent` credit figure
+ * (verified against the live API: frames are assistantResponseEvent /
+ * metadataEvent / contextUsageEvent / meteringEvent). So these numbers are
+ * ESTIMATES, derived the same way kiro-gateway derives them: the percentage
+ * yields the total, the response text yields the completion, and the prompt is
+ * the remainder.
+ *
+ * Subtracting matters: the percentage already covers the whole context, so
+ * adding a separately-estimated completion on top would double-count it and
+ * inflate `total_tokens`.
+ */
+function ensureKiroUsage(state: KiroStreamState, model: string) {
+  if (state.usage?.total_tokens !== undefined) return;
   const estimatedOutputTokens =
     state.totalContentLength && state.totalContentLength > 0
       ? Math.max(1, Math.floor(state.totalContentLength / 4))
       : 0;
 
-  const estimatedInputTokens =
+  const estimatedTotalTokens =
     state.contextUsagePercentage && state.contextUsagePercentage > 0
-      ? Math.floor((state.contextUsagePercentage * 200000) / 100)
+      ? Math.floor((state.contextUsagePercentage * resolveKiroMaxInputTokens(model)) / 100)
       : 0;
 
-  if (estimatedInputTokens <= 0 && estimatedOutputTokens <= 0) return;
+  if (estimatedTotalTokens <= 0 && estimatedOutputTokens <= 0) return;
+  // Without a percentage there is no total to split, so the output estimate is
+  // all that is known and stands on its own.
+  if (estimatedTotalTokens <= 0) {
+    state.usage = {
+      ...state.usage,
+      prompt_tokens: 0,
+      completion_tokens: estimatedOutputTokens,
+      total_tokens: estimatedOutputTokens,
+    };
+    return;
+  }
+
+  const promptTokens = Math.max(0, estimatedTotalTokens - estimatedOutputTokens);
 
   state.usage = {
-    prompt_tokens: estimatedInputTokens,
+    ...state.usage,
+    prompt_tokens: promptTokens,
     completion_tokens: estimatedOutputTokens,
-    total_tokens: estimatedInputTokens + estimatedOutputTokens,
+    total_tokens: promptTokens + estimatedOutputTokens,
   };
 }
 
 /**
- * Resolve the AWS region for a Kiro/CodeWhisperer connection. Enterprise AWS IAM Identity
- * Center accounts are region-bound: the access token, the Q Developer profile ARN and the
- * runtime endpoint must all match the region the IdC instance lives in (e.g. eu-central-1).
- * A request signed for one region is rejected by another ("bearer token is invalid"), and a
- * regional profileArn sent to us-east-1 fails with "Improperly formed request". Falls back to
- * the region embedded in the profileArn, then us-east-1 (the AWS Builder ID default).
+ * Resolve the RUNTIME AWS region for a Kiro/CodeWhisperer connection.
+ *
+ * The runtime region is the region of the Amazon Q Developer profile (embedded in the
+ * profileArn — always us-east-1 or eu-central-1), NOT the IAM Identity Center / OIDC token
+ * region. An enterprise IdC instance may live in eu-north-1 (or any region), but the Q Developer
+ * profile that serves generateAssistantResponse only exists in us-east-1 / eu-central-1, so a
+ * runtime call must target the profileArn's region — routing to q.{idcRegion}.amazonaws.com
+ * (a host that does not exist) is what caused "no limits + 502 on every request". Delegates to
+ * the shared resolver (profileArn region → valid stored profile region → us-east-1). The IdC
+ * token region is used only for oidc.{region} token mint/refresh, elsewhere.
  */
 export function resolveKiroRegion(
   credentials: { providerSpecificData?: unknown } | null | undefined
 ): string {
-  const psd = (credentials?.providerSpecificData || {}) as Record<string, unknown>;
-  const region = typeof psd.region === "string" ? psd.region.trim().toLowerCase() : "";
-  if (region) return region;
-  const arn = typeof psd.profileArn === "string" ? psd.profileArn.toLowerCase() : "";
-  const match = arn.match(/^arn:aws:codewhisperer:([a-z0-9-]+):/);
-  return match ? match[1] : "us-east-1";
+  return resolveKiroRuntimeRegion(
+    (credentials?.providerSpecificData || {}) as { region?: unknown; profileArn?: unknown }
+  );
 }
 
-/**
- * CodeWhisperer/Amazon Q runtime host for a region. us-east-1 keeps the legacy
- * codewhisperer.us-east-1 host (AWS Builder ID); other regions use the regional Amazon Q
- * endpoint q.{region}.amazonaws.com — codewhisperer.{region}.amazonaws.com does not resolve
- * for non-us-east-1 regions.
- */
-export function kiroRuntimeHost(region: string): string {
-  return region === "us-east-1"
-    ? "https://codewhisperer.us-east-1.amazonaws.com"
-    : `https://q.${region}.amazonaws.com`;
-}
+// Re-exported from the shared region module so existing importers (and tests) that pull
+// kiroRuntimeHost from this executor keep working.
+export { kiroRuntimeHost };
 
 /**
  * KiroExecutor - Executor for Kiro AI (AWS CodeWhisperer)
@@ -196,8 +262,29 @@ export class KiroExecutor extends BaseExecutor {
       "anthropic-beta": "prompt-caching-2024-07-31",
     };
 
-    if (credentials.accessToken) {
-      headers["Authorization"] = `Bearer ${credentials.accessToken}`;
+    const authMethod =
+      typeof credentials.providerSpecificData?.authMethod === "string"
+        ? credentials.providerSpecificData.authMethod
+        : undefined;
+    const isApiKey = authMethod === "api_key";
+    const token = isApiKey
+      ? credentials.apiKey || credentials.accessToken
+      : credentials.accessToken;
+
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+      // Long-lived Kiro/CodeWhisperer API keys authenticate with `tokentype: API_KEY`.
+      if (isApiKey) headers["tokentype"] = "API_KEY";
+
+      // Enterprise / Microsoft Entra "Your organization" (external_idp) logins send an
+      // org-IdP-issued access token. CodeWhisperer only binds it to the Amazon Q Developer
+      // profile when the request carries `TokenType: EXTERNAL_IDP`; without it every call
+      // returns `ValidationException: Invalid ARN <clientId>` (the service falls back to the
+      // token's client id as the resource ARN). AWS SSO (Builder ID / IDC) and social tokens
+      // must NOT send this header, so it is gated on the persisted authMethod.
+      if (isExternalIdpAuthMethod(authMethod)) {
+        headers[KIRO_EXTERNAL_IDP_TOKEN_TYPE_HEADER] = KIRO_EXTERNAL_IDP_TOKEN_TYPE_VALUE;
+      }
     }
 
     return headers;
@@ -324,9 +411,114 @@ export class KiroExecutor extends BaseExecutor {
       seenToolIds: new Map(),
       toolArgsEmitted: new Map(),
       toolArgsBuffered: new Map(),
+      generatedToolIdCounter: 0,
+      pendingWrapperToolCalls: new Map(),
       hasReasoningContent: false,
       reasoningChunkCount: 0,
       thinking: thinkingExpected ? { thinkingMode: false, pendingTag: "" } : undefined,
+    };
+
+    const getToolCallId = (toolUse: JsonRecord): string => {
+      if (typeof toolUse.toolUseId === "string" && toolUse.toolUseId) {
+        return toolUse.toolUseId;
+      }
+      state.generatedToolIdCounter += 1;
+      return `call_${created}_${state.generatedToolIdCounter}`;
+    };
+
+    const emitToolCallStart = (
+      controller: TransformStreamDefaultController,
+      toolCallId: string,
+      toolName: string,
+      toolIndex: number
+    ) => {
+      const startChunk: JsonRecord = {
+        id: responseId,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [
+          {
+            index: 0,
+            delta: {
+              ...(chunkIndex === 0 ? { role: "assistant" } : {}),
+              tool_calls: [
+                {
+                  index: toolIndex,
+                  id: toolCallId,
+                  type: "function",
+                  function: { name: toolName, arguments: "" },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      };
+      chunkIndex += 1;
+      controller.enqueue(encodeSse(`data: ${JSON.stringify(startChunk)}\n\n`));
+    };
+
+    const emitToolCallArguments = (
+      controller: TransformStreamDefaultController,
+      toolIndex: number,
+      argumentsStr: string
+    ) => {
+      const argsChunk: JsonRecord = {
+        id: responseId,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [{ index: toolIndex, function: { arguments: argumentsStr } }],
+            },
+            finish_reason: null,
+          },
+        ],
+      };
+      chunkIndex += 1;
+      controller.enqueue(encodeSse(`data: ${JSON.stringify(argsChunk)}\n\n`));
+    };
+
+    const failInvalidToolCall = (controller: TransformStreamDefaultController, message: string) => {
+      const error = {
+        error: {
+          message,
+          type: "invalid_request_error",
+          code: "invalid_kiro_tool_call",
+        },
+      };
+      state.invalidToolCall = true;
+      state.finishEmitted = true;
+      controller.enqueue(encodeSse(`data: ${JSON.stringify(error)}\n\n`));
+      controller.enqueue(encodeSse("data: [DONE]\n\n"));
+      controller.terminate();
+    };
+
+    const flushPendingWrapperToolCalls = (
+      controller: TransformStreamDefaultController
+    ): boolean => {
+      for (const toolCall of state.pendingWrapperToolCalls.values()) {
+        const toolInput = getBufferedKiroToolInput(toolCall);
+        try {
+          validateKiroToolCallWrapperInput(toolInput);
+        } catch (error) {
+          failInvalidToolCall(controller, error instanceof Error ? error.message : String(error));
+          return false;
+        }
+
+        const toolIndex = state.toolCallIndex++;
+        state.seenToolIds.set(toolCall.toolCallId, toolIndex);
+        emitToolCallStart(controller, toolCall.toolCallId, toolCall.toolName, toolIndex);
+        const argumentsStr =
+          typeof toolInput === "string" ? toolInput : JSON.stringify(toolInput ?? {});
+        if (argumentsStr) emitToolCallArguments(controller, toolIndex, argumentsStr);
+      }
+      state.pendingWrapperToolCalls.clear();
+      return true;
     };
 
     const transformStream = new TransformStream(
@@ -546,10 +738,54 @@ export class KiroExecutor extends BaseExecutor {
               const toolUse = event.payload;
               const toolUses = Array.isArray(toolUse) ? toolUse : [toolUse];
 
-              for (const singleToolUse of toolUses) {
-                const toolCallId = singleToolUse.toolUseId || `call_${Date.now()}`;
-                const toolName = singleToolUse.name || "";
+              for (const rawToolUse of toolUses) {
+                const singleToolUse = rawToolUse as JsonRecord;
+                let toolName: string;
+                try {
+                  toolName = validateKiroToolName(singleToolUse);
+                } catch (error) {
+                  failInvalidToolCall(
+                    controller,
+                    error instanceof Error ? error.message : String(error)
+                  );
+                  return;
+                }
+
+                const toolCallId = getToolCallId(singleToolUse);
                 const toolInput = singleToolUse.input;
+
+                if (toolName === KIRO_TOOL_CALL_WRAPPER) {
+                  let pending = state.pendingWrapperToolCalls.get(toolCallId);
+                  if (!pending) {
+                    if (state.seenToolIds.has(toolCallId)) {
+                      failInvalidToolCall(
+                        controller,
+                        "Invalid Kiro tool_call payload: duplicate toolUseId reused by wrapper"
+                      );
+                      return;
+                    }
+                    pending = { toolCallId, toolName };
+                    state.pendingWrapperToolCalls.set(toolCallId, pending);
+                  }
+                  try {
+                    appendBufferedKiroToolInput(pending, toolInput);
+                  } catch (error) {
+                    failInvalidToolCall(
+                      controller,
+                      error instanceof Error ? error.message : String(error)
+                    );
+                    return;
+                  }
+                  continue;
+                }
+
+                if (state.pendingWrapperToolCalls.has(toolCallId)) {
+                  failInvalidToolCall(
+                    controller,
+                    "Invalid Kiro tool_call payload: mixed wrapper and direct tool fragments"
+                  );
+                  return;
+                }
 
                 let toolIndex;
                 const isNewTool = !state.seenToolIds.has(toolCallId);
@@ -557,39 +793,9 @@ export class KiroExecutor extends BaseExecutor {
                 if (isNewTool) {
                   toolIndex = state.toolCallIndex++;
                   state.seenToolIds.set(toolCallId, toolIndex);
-
-                  const startChunk = {
-                    id: responseId,
-                    object: "chat.completion.chunk",
-                    created,
-                    model,
-                    choices: [
-                      {
-                        index: 0,
-                        delta: {
-                          ...(chunkIndex === 0 ? { role: "assistant" } : {}),
-                          tool_calls: [
-                            {
-                              index: toolIndex,
-                              id: toolCallId,
-                              type: "function",
-                              function: {
-                                name: toolName,
-                                arguments: "",
-                              },
-                            },
-                          ],
-                        },
-                        finish_reason: null,
-                      },
-                    ],
-                  };
-                  chunkIndex++;
-                  controller.enqueue(
-                    TEXT_ENCODER.encode(`data: ${JSON.stringify(startChunk)}\n\n`)
-                  );
+                  emitToolCallStart(controller, toolCallId, toolName, toolIndex);
                 } else {
-                  toolIndex = state.seenToolIds.get(toolCallId);
+                  toolIndex = state.seenToolIds.get(toolCallId) as number;
                 }
 
                 if (toolInput !== undefined) {
@@ -642,6 +848,7 @@ export class KiroExecutor extends BaseExecutor {
 
             // Handle messageStopEvent
             if (eventType === "messageStopEvent") {
+              if (!flushPendingWrapperToolCalls(controller)) return;
               flushBufferedToolArgs(state, controller, { responseId, created, model });
               state.stopSeen = true;
             }
@@ -665,37 +872,74 @@ export class KiroExecutor extends BaseExecutor {
               state.hasMeteringEvent = true;
             }
 
-            // Handle metricsEvent for token usage
-            if (eventType === "metricsEvent") {
-              // Extract usage data from metricsEvent payload
-              const metrics = event.payload?.metricsEvent || event.payload;
+            // Handle token usage. Kiro reports it under more than one frame: the
+            // `metricsEvent` shape covered by unit tests, and a `metadataEvent`
+            // carrying a nested `usage` object — the shape observed on live
+            // API-key traffic (see tests/unit/executor-kiro.test.ts, the
+            // "live API-key event shape" case, whose frames are
+            // assistantResponseEvent / metadataEvent / contextUsageEvent /
+            // meteringEvent with no metricsEvent at all). Reading only
+            // `metricsEvent` meant cache tokens were never picked up in
+            // production even after their field names were corrected, because
+            // the branch holding that code never ran.
+            if (eventType === "metricsEvent" || eventType === "metadataEvent") {
+              const metrics =
+                event.payload?.metricsEvent ||
+                event.payload?.usage ||
+                (event.payload?.metadataEvent as JsonRecord)?.usage ||
+                event.payload;
               if (metrics && typeof metrics === "object") {
+                const readNumber = (...candidates: unknown[]) =>
+                  candidates.find((value) => typeof value === "number") as number | undefined;
+
+                // Bedrock-style (`inputTokens`) and OpenAI-style
+                // (`prompt_tokens`) spellings both appear across Kiro frames.
                 const inputTokens =
-                  typeof (metrics as JsonRecord).inputTokens === "number"
-                    ? ((metrics as JsonRecord).inputTokens as number)
-                    : 0;
+                  readNumber(
+                    (metrics as JsonRecord).inputTokens,
+                    (metrics as JsonRecord).prompt_tokens
+                  ) || 0;
                 const outputTokens =
-                  typeof (metrics as JsonRecord).outputTokens === "number"
-                    ? ((metrics as JsonRecord).outputTokens as number)
-                    : 0;
+                  readNumber(
+                    (metrics as JsonRecord).outputTokens,
+                    (metrics as JsonRecord).completion_tokens
+                  ) || 0;
 
-                const cacheReadTokens =
-                  typeof (metrics as JsonRecord).cacheReadTokens === "number"
-                    ? ((metrics as JsonRecord).cacheReadTokens as number)
-                    : 0;
+                const cacheReadTokens = readNumber(
+                  (metrics as JsonRecord).cacheReadInputTokens,
+                  (metrics as JsonRecord).cacheReadTokens,
+                  (metrics as JsonRecord).cache_read_input_tokens
+                );
 
-                const cacheCreationTokens =
-                  typeof (metrics as JsonRecord).cacheCreationTokens === "number"
-                    ? ((metrics as JsonRecord).cacheCreationTokens as number)
-                    : 0;
+                const cacheCreationTokens = readNumber(
+                  (metrics as JsonRecord).cacheWriteInputTokens,
+                  (metrics as JsonRecord).cacheCreationTokens,
+                  (metrics as JsonRecord).cache_creation_input_tokens
+                );
 
                 if (inputTokens > 0 || outputTokens > 0) {
                   state.usage = {
                     prompt_tokens: inputTokens,
                     completion_tokens: outputTokens,
                     total_tokens: inputTokens + outputTokens,
-                    ...(cacheReadTokens > 0 && { cache_read_input_tokens: cacheReadTokens }),
-                    ...(cacheCreationTokens > 0 && {
+                    ...((cacheReadTokens || 0) > 0 && {
+                      cache_read_input_tokens: cacheReadTokens,
+                    }),
+                    ...((cacheCreationTokens || 0) > 0 && {
+                      cache_creation_input_tokens: cacheCreationTokens,
+                    }),
+                  };
+                } else if ((cacheReadTokens || 0) > 0 || (cacheCreationTokens || 0) > 0) {
+                  // Cache counts can arrive on a frame that carries no
+                  // input/output totals. Preserve them instead of dropping the
+                  // whole frame, and let ensureKiroUsage() fill the totals from
+                  // contextUsagePercentage.
+                  state.usage = {
+                    ...(state.usage || {}),
+                    ...((cacheReadTokens || 0) > 0 && {
+                      cache_read_input_tokens: cacheReadTokens,
+                    }),
+                    ...((cacheCreationTokens || 0) > 0 && {
                       cache_creation_input_tokens: cacheCreationTokens,
                     }),
                   };
@@ -710,6 +954,8 @@ export class KiroExecutor extends BaseExecutor {
         },
 
         flush(controller) {
+          if (!flushPendingWrapperToolCalls(controller)) return;
+          if (state.invalidToolCall) return;
           // Flush any buffered tool arguments (partial-object payloads) before finishing —
           // idempotent against toolArgsEmitted if messageStopEvent already flushed them.
           flushBufferedToolArgs(state, controller, { responseId, created, model });
@@ -752,7 +998,7 @@ export class KiroExecutor extends BaseExecutor {
           // Emit finish chunk if not already sent
           if (!state.finishEmitted) {
             state.finishEmitted = true;
-            ensureKiroUsage(state);
+            ensureKiroUsage(state, model);
             const finishChunk = buildKiroFinishChunk(state, responseId, created, model, true);
             controller.enqueue(TEXT_ENCODER.encode(`data: ${JSON.stringify(finishChunk)}\n\n`));
           }
@@ -780,6 +1026,7 @@ export class KiroExecutor extends BaseExecutor {
   }
 
   async refreshCredentials(credentials: ProviderCredentials, log?: ExecutorLog | null) {
+    if (credentials.providerSpecificData?.authMethod === "api_key") return null;
     if (!credentials.refreshToken) return null;
 
     try {

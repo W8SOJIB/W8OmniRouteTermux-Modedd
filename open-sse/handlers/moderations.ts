@@ -6,7 +6,7 @@ import { CORS_HEADERS } from "../utils/cors.ts";
  */
 
 import { getModerationProvider, parseModerationModel } from "../config/moderationRegistry.ts";
-import { errorResponse } from "../utils/error.ts";
+import { errorResponse, redactSensitiveErrorText } from "../utils/error.ts";
 import { attachOmniRouteMetaHeaders } from "@/domain/omnirouteResponseMeta";
 import { generateRequestId } from "@/shared/utils/requestId";
 
@@ -57,7 +57,9 @@ export async function handleModeration({ body, credentials }) {
 
     if (!res.ok) {
       const errText = await res.text();
-      return new Response(errText, {
+      // secret-leak hardening: redact any credential the upstream echoed back
+      // before relaying the error body to the client (structure-preserving).
+      return new Response(redactSensitiveErrorText(errText), {
         status: res.status,
         headers: {
           "Content-Type": "application/json",

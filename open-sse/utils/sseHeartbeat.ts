@@ -1,4 +1,19 @@
+/**
+ * @file sseHeartbeat.ts
+ * @description Mid-stream SSE heartbeat transform (comment / Anthropic ping / OpenAI chunk).
+ *
+ * @changes
+ * - [2026-07-28] [Cursor Grok 4.5] - Brand-neutral default OpenAI keepalive id/model
+ */
+const HEARTBEAT_ENCODER = new TextEncoder();
+const OPENAI_RESPONSES_IN_PROGRESS_PAYLOAD = 'data: {"type":"response.in_progress"}\n\n';
+
 export const DEFAULT_SSE_HEARTBEAT_INTERVAL_MS = 15_000;
+
+/** Shared Responses API heartbeat frame for early and mid-stream keepalives. */
+export const OPENAI_RESPONSES_IN_PROGRESS_FRAME = HEARTBEAT_ENCODER.encode(
+  OPENAI_RESPONSES_IN_PROGRESS_PAYLOAD
+);
 
 export const HEARTBEAT_SHAPES = {
   COMMENT: "comment",
@@ -32,15 +47,15 @@ function buildHeartbeatPayload(
 ): string {
   switch (shape) {
     case HEARTBEAT_SHAPES.ANTHROPIC_PING:
-      return "event: ping\ndata: {}\n\n";
+      return 'event: ping\ndata: {"type":"ping"}\n\n';
     case HEARTBEAT_SHAPES.OPENAI_RESPONSES_IN_PROGRESS:
-      return 'data: {"type":"response.in_progress"}\n\n';
+      return OPENAI_RESPONSES_IN_PROGRESS_PAYLOAD;
     case HEARTBEAT_SHAPES.OPENAI_CHUNK: {
       const payload = {
-        id: opts.chunkId ?? "omniroute-keepalive",
+        id: opts.chunkId ?? "chatcmpl-keepalive",
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
-        model: opts.chunkModel ?? "omniroute",
+        model: opts.chunkModel ?? "keepalive",
         choices: [{ index: 0, delta: {}, finish_reason: null }],
       };
       return `data: ${JSON.stringify(payload)}\n\n`;
@@ -59,7 +74,21 @@ type SseHeartbeatTransformOptions = {
   chunkModel?: string;
 };
 
-const HEARTBEAT_ENCODER = new TextEncoder();
+/**
+ * Whether OmniRoute may emit SSE `:` comment lines (e.g. the `: keepalive` heartbeat).
+ * Some strict OpenAI-compatible clients parse every SSE line as JSON and crash on `:` comments.
+ * Set OMNIROUTE_SSE_COMMENTS=on to enable comment-shaped heartbeats and telemetry trailers.
+ * #10524: defaults to disabled — strict SSE clients (WorkBuddy, etc.) break on `: x-omniroute-*`
+ * comment lines. Operators who want the telemetry can opt in with OMNIROUTE_SSE_COMMENTS=on.
+ */
+export function sseCommentsEnabled(): boolean {
+  // SSR/edge safety: `process` is not defined in Workers/Deno/edge runtimes.
+  if (typeof process === "undefined") return false;
+  const v = process.env.OMNIROUTE_SSE_COMMENTS;
+  if (v === undefined || v === "") return false;
+  const normalized = v.trim().toLowerCase();
+  return normalized === "on" || normalized === "true" || normalized === "1" || normalized === "yes";
+}
 
 export function createSseHeartbeatTransform({
   intervalMs = DEFAULT_SSE_HEARTBEAT_INTERVAL_MS,
@@ -69,6 +98,13 @@ export function createSseHeartbeatTransform({
   chunkModel,
 }: SseHeartbeatTransformOptions = {}): TransformStream<Uint8Array, Uint8Array> {
   if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+    return new TransformStream<Uint8Array, Uint8Array>();
+  }
+
+  // Opt-out for strict OpenAI-compatible clients that JSON.parse every SSE line and
+  // crash on `:` comment heartbeats. OMNIROUTE_SSE_COMMENTS=off disables comment-shaped
+  // heartbeats (they become a no-op); valid `data:` heartbeats are unaffected.
+  if (!sseCommentsEnabled() && shape === HEARTBEAT_SHAPES.COMMENT) {
     return new TransformStream<Uint8Array, Uint8Array>();
   }
 

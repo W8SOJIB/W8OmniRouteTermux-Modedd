@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { t } from "../i18n.mjs";
+import { npmBin, npmExecOptions } from "../npm-exec.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -31,9 +32,13 @@ export async function getCurrentVersion() {
 // they were already on the latest version (#4376). `execFn` is injectable for tests.
 export async function getLatestVersion(execFn = execFileAsync) {
   try {
-    const { stdout } = await execFn("npm", ["view", "omniroute", "version", "--prefer-online"], {
-      timeout: 15000,
-    });
+    // argv is all literals, so enabling the shell on win32 cannot splice a
+    // runtime value into the command line (Hard Rule #13).
+    const { stdout } = await execFn(
+      npmBin(),
+      ["view", "omniroute", "version", "--prefer-online"],
+      npmExecOptions(process.platform, { timeoutMs: 15000 })
+    );
     return stdout.trim();
   } catch {
     return null;
@@ -114,9 +119,11 @@ export async function runUpdateCommand(opts = {}) {
 
   if (showChangelog) {
     try {
-      const { stdout } = await execFileAsync("npm", ["view", "omniroute", "changelog"], {
-        timeout: 10000,
-      });
+      const { stdout } = await execFileAsync(
+        npmBin(),
+        ["view", "omniroute", "changelog"],
+        npmExecOptions(process.platform, { timeoutMs: 15000 })
+      );
       if (stdout.trim()) {
         console.log(stdout.trim());
       } else {
@@ -181,6 +188,28 @@ export async function runUpdateCommand(opts = {}) {
     // --include=optional keeps the optionalDependencies (better-sqlite3, keytar,
     // tls-client, llmlingua SLM stack) on update so an omit=optional config can't drop them.
     execSync("npm install -g omniroute@latest --include=optional", { stdio: "inherit" });
+    // Trust-but-verify: `npm install -g` exits 0 even when a shadowing local install
+    // (e.g. ~/node_modules/omniroute ahead of the global prefix on PATH) means the
+    // binary the user actually runs was not touched. Re-read the running binary's
+    // version and warn instead of lying about success (#9475).
+    const afterVersion = await getCurrentVersion();
+    if (afterVersion && compareVersions(afterVersion, latest) < 0) {
+      printError(
+        `Global install updated to ${latest}, but the running binary still reports ${afterVersion}.`
+      );
+      console.log(
+        "  A local `node_modules/omniroute` is likely shadowing the global install on PATH."
+      );
+      console.log("  Diagnose with:");
+      console.log("    which -a omniroute");
+      console.log("    command -v omniroute");
+      console.log("    npm prefix -g");
+      console.log(
+        "  Then remove the shadowing local copy (e.g. `npm uninstall omniroute` from its directory)"
+      );
+      console.log("  or reorder PATH so the global bin comes first.");
+      return 1;
+    }
     printSuccess(`Updated to version ${latest}`);
     printInfo("Run `omniroute --version` to verify.");
     return 0;

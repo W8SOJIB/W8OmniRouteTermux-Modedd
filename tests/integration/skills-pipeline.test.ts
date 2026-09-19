@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { OMNIROUTE_WEB_SEARCH_FALLBACK_TOOL_NAME } from "../../open-sse/services/webSearchFallback.ts";
+// Skill identifiers sao name@version, que viola o ^[a-zA-Z0-9_-]+$ exigido por
+// OpenAI/DeepSeek/Groq, entao injection.ts os codifica como omr_skill_<base64url>
+// (#9058). Derivar o nome esperado do MESMO helper que a producao usa, em vez de
+// repetir a string codificada, mantem o teste preso ao contrato: se a codificacao
+// mudar de novo, o assert acompanha; se ela sumir, o assert continua exigindo que
+// producao e teste concordem.
+import { encodeSkillToolName } from "../../src/lib/skills/injection.ts";
 
 import { createChatPipelineHarness } from "./_chatPipelineHarness.ts";
 
@@ -137,7 +144,11 @@ test("enabling a disabled skill makes it available in the request pipeline", asy
   assert.equal(updateResponse.status, 200);
   assert.equal(response.status, 200);
   assert.ok(Array.isArray(fetchBodies[0].tools));
-  assert.ok(fetchBodies[0].tools.some((tool) => tool.function.name === "lookupWeather@1.0.0"));
+  assert.ok(
+    fetchBodies[0].tools.some(
+      (tool) => tool.function.name === encodeSkillToolName("lookupWeather", "1.0.0")
+    )
+  );
 });
 
 test("matching tool calls execute the registered skill and return tool results", async () => {
@@ -156,7 +167,7 @@ test("matching tool calls execute the registered skill and return tool results",
 
   globalThis.fetch = async () =>
     buildOpenAIToolCallResponse({
-      toolName: "lookupWeather@1.0.0",
+      toolName: encodeSkillToolName("lookupWeather", "1.0.0"),
       argumentsObject: { location: "Recife" },
     });
 
@@ -351,7 +362,7 @@ test("injectSkills() correctly injects skill context into a request", async () =
   assert.ok(Array.isArray(tools), "injectSkills should return an array");
   assert.equal(tools.length, 1, "should inject exactly one skill tool");
   assert.equal((tools[0] as any).type, "function");
-  assert.equal((tools as any)[0].function.name, "translateText@1.0.0");
+  assert.equal((tools as any)[0].function.name, encodeSkillToolName("translateText", "1.0.0"));
   (assert as any).equal(
     (tools[0] as any).function.description,
     "Translate text to another language"
@@ -388,7 +399,7 @@ test("injectSkills() merges with existing tools without duplicating", async () =
 
   assert.equal(tools.length, 2, "should have injected skill + existing tool");
   const names = tools.map((t) => (t as any).function?.name || (t as any).name);
-  assert.ok(names.includes("calcRoute@1.0.0"));
+  assert.ok(names.includes(encodeSkillToolName("calcRoute", "1.0.0")));
   assert.ok(names.includes("preExistingTool"));
 });
 
@@ -447,8 +458,8 @@ test("responses input context participates in AUTO skill injection", async () =>
     .map((tool) => tool?.function?.name)
     .filter((name) => typeof name === "string");
 
-  assert.ok(names.includes("issueSearch@1.0.0"));
-  assert.ok(!names.includes("calendarPlanner@1.0.0"));
+  assert.ok(names.includes(encodeSkillToolName("issueSearch", "1.0.0")));
+  assert.ok(!names.includes(encodeSkillToolName("calendarPlanner", "1.0.0")));
 });
 
 test("handleToolCallExecution() processes a tool call correctly", async () => {
@@ -778,7 +789,10 @@ test("builtin and custom skills coexist in the injected tool list", async () => 
   const toolNames = (fetchBodies[0].tools || []).map((tool) => tool.function.name).sort();
 
   assert.equal(response.status, 200);
-  assert.deepEqual(toolNames, ["lookupWeather@1.0.0", "webSearch@1.0.0"]);
+  assert.deepEqual(toolNames, [
+    encodeSkillToolName("lookupWeather", "1.0.0"),
+    encodeSkillToolName("webSearch", "1.0.0"),
+  ]);
 });
 
 test("web_search fallback converts built-in tools for unsupported providers and executes search", async () => {

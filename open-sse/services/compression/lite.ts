@@ -17,40 +17,12 @@ interface LiteCompressionOptions {
   model?: string;
   supportsVision?: boolean | null;
   preserveSystemPrompt?: boolean;
-}
-
-function trimTrailingHorizontalWhitespace(line: string): string {
-  let end = line.length;
-  while (end > 0) {
-    const code = line.charCodeAt(end - 1);
-    if (code !== 32 && code !== 9) break;
-    end--;
-  }
-  return end === line.length ? line : line.slice(0, end);
-}
-
-function collapseNewlineRuns(content: string): string {
-  let normalized = "";
-  let newlineRun = 0;
-
-  for (const char of content) {
-    if (char === "\n") {
-      newlineRun++;
-      if (newlineRun <= 2) {
-        normalized += char;
-      }
-      continue;
-    }
-
-    newlineRun = 0;
-    normalized += char;
-  }
-
-  return normalized;
+  compressToolResults?: boolean;
 }
 
 function normalizeMessageWhitespace(content: string): string {
-  return collapseNewlineRuns(content).split("\n").map(trimTrailingHorizontalWhitespace).join("\n");
+  if (!content) return "";
+  return content.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+$/gm, "");
 }
 
 // Vision detection is centralized in `@/shared/constants/visionModels` (#4072) so
@@ -105,6 +77,47 @@ export function dedupSystemPrompt(
   return { body: { ...body, messages }, applied };
 }
 
+// Adjust a hard cut index to the nearest whitespace within a small lookback/lookahead
+// window, so a truncated tool result never garbles the word it lands in the middle of
+// (#8169). Prefers backing off to the end of the previous word (keeps the result at or
+// under the limit); if no whitespace precedes the cut within the window (e.g. the tail
+// end of a very long unbroken run), looks forward to complete the current word instead.
+// Falls back to the original hard cut index when neither direction finds a boundary.
+const TOOL_TRUNCATION_LOOKBACK = 80;
+
+function isWordChar(char: string | undefined): boolean {
+  return char !== undefined && /\S/.test(char);
+}
+
+function findWhitespaceBackward(content: string, cutIndex: number): number {
+  const windowStart = Math.max(0, cutIndex - TOOL_TRUNCATION_LOOKBACK);
+  for (let i = cutIndex; i > windowStart; i--) {
+    if (!isWordChar(content[i - 1])) return i - 1;
+  }
+  return -1;
+}
+
+function findWhitespaceForward(content: string, cutIndex: number): number {
+  const windowEnd = Math.min(content.length, cutIndex + TOOL_TRUNCATION_LOOKBACK);
+  for (let i = cutIndex; i < windowEnd; i++) {
+    if (!isWordChar(content[i])) return i;
+  }
+  return -1;
+}
+
+function backOffToWordBoundary(content: string, cutIndex: number): number {
+  const onWordBoundary = !isWordChar(content[cutIndex - 1]) || !isWordChar(content[cutIndex]);
+  if (onWordBoundary) return cutIndex;
+
+  const backward = findWhitespaceBackward(content, cutIndex);
+  if (backward !== -1) return backward;
+
+  const forward = findWhitespaceForward(content, cutIndex);
+  if (forward !== -1) return forward;
+
+  return cutIndex;
+}
+
 export function compressToolResults(body: ChatBody): {
   body: ChatBody;
   applied: boolean;
@@ -116,9 +129,10 @@ export function compressToolResults(body: ChatBody): {
     if (msg.role !== "tool" || typeof msg.content !== "string") return msg;
     if (msg.content.length <= MAX_TOOL_LENGTH) return msg;
     applied = true;
+    const cutIndex = backOffToWordBoundary(msg.content, MAX_TOOL_LENGTH);
     return {
       ...msg,
-      content: msg.content.slice(0, MAX_TOOL_LENGTH) + "\n...[truncated]",
+      content: msg.content.slice(0, cutIndex) + "\n...[truncated]",
     };
   });
   return { body: { ...body, messages }, applied };
@@ -211,9 +225,11 @@ export function applyLiteCompression(
   current = r2.body;
   if (r2.applied) techniquesApplied.push("system-dedup");
 
-  const r3 = compressToolResults(current);
-  current = r3.body;
-  if (r3.applied) techniquesApplied.push("tool-compress");
+  if (options?.compressToolResults !== false) {
+    const r3 = compressToolResults(current);
+    current = r3.body;
+    if (r3.applied) techniquesApplied.push("tool-compress");
+  }
 
   const r4 = removeRedundantContent(current, options);
   current = r4.body;

@@ -1,15 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-// The validator probes the provider's /models endpoint via safeOutboundFetch →
-// fetchWithTimeout, which binds globalThis.fetch at MODULE LOAD time. The mock MUST be
-// installed BEFORE importing validation.ts — a late reassignment (inside a test) is
-// ignored and the validator hits the real network instead. (That made the 401/403
-// assertions pass only by coincidence — live chatgpt.com returns 401/403 — while the
-// 200 case failed.) A mutable `nextResponse` lets each test vary the probe result, and
-// `fetchCalls` proves the mocked probe ran rather than the live network.
+// The validator probes the provider's /models endpoint via validationRead → safeOutboundFetch
+// → fetchWithTimeout, which reads `globalThis.fetch` dynamically at CALL time (#7058 — routed
+// through the proxy-aware patched fetch instead of a bypassing directHttpsRequest). Importing
+// validation.ts pulls in the proxy-patch module, which installs its own `globalThis.fetch`
+// exactly once at import time — so the mock must be (re)installed AFTER the import, not before,
+// or the patch silently clobbers it. A mutable `nextResponse` lets each test vary the probe
+// result, and `fetchCalls` proves the mocked probe ran rather than the live network.
 let nextResponse: { status: number; body: string } = { status: 200, body: "{}" };
 let fetchCalls = 0;
+
+const { validateWebCookieProvider } = await import("../../src/lib/providers/validation.ts");
+
 globalThis.fetch = (async () => {
   fetchCalls++;
   return new Response(nextResponse.body, {
@@ -17,8 +20,6 @@ globalThis.fetch = (async () => {
     headers: { "content-type": "application/json" },
   });
 }) as typeof fetch;
-
-const { validateWebCookieProvider } = await import("../../src/lib/providers/validation.ts");
 
 function mockFetch(status: number, body: string) {
   nextResponse = { status, body };
@@ -55,9 +56,13 @@ test("should_return_AUTH_007_when_models_endpoint_returns_403", async () => {
   assert.equal(result.error, "SESSION_EXPIRED");
 });
 
-test("should_return_valid_when_models_endpoint_returns_200", async () => {
-  // A non-401/403 status from the /models probe means the cookie was accepted,
-  // so the session is treated as valid.
+test("should_return_unsupported_when_models_endpoint_returns_200_for_a_conversation_baseUrl", async () => {
+  // #7857: chatgpt-web's registry baseUrl is a conversation endpoint
+  // ("https://chatgpt.com/backend-api/conversation"), not a real API root, so
+  // "${baseUrl}/models" is a path that never existed upstream. A 200 from that
+  // nonsense path (e.g. a login-page SPA shell) is not a meaningful auth signal and
+  // is indistinguishable from a genuinely valid session — it must be reported as
+  // unsupported, not silently accepted as valid.
   mockFetch(200, JSON.stringify({ ok: true, data: [] }));
 
   const result = await validateWebCookieProvider({
@@ -67,7 +72,8 @@ test("should_return_valid_when_models_endpoint_returns_200", async () => {
   });
 
   assert.equal(fetchCalls, 1, "the /models probe must be the mocked fetch, not the live network");
-  assert.equal(result.valid, true);
+  assert.equal(result.valid, false);
+  assert.equal(result.unsupported, true);
 });
 
 test("should_return_unsupported_when_provider_not_in_registry", async () => {

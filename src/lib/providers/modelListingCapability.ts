@@ -10,6 +10,31 @@
 /** Service kinds that, on their own, mean the provider lists no models. */
 const TOOL_ONLY_SERVICE_KINDS = new Set<string>(["webSearch", "webFetch"]);
 
+/** Providers whose registry catalog is the complete, intentional model list.
+ *
+ * Volcano Ark plan providers (`volcengine-agent-plan` / `volcengine-coding-plan`)
+ * are intentionally NOT curated: their model list is discovered live from the
+ * console API (see volcenginePlanModelDiscovery.ts) and merged into the synced
+ * catalog, so the static registry only acts as a capability-seed fallback. */
+const CURATED_MODEL_ONLY_PROVIDERS = new Set<string>(["chatgpt-web", "kimi-web", "zai-web"]);
+
+export function providerUsesCuratedModelsOnly(providerId: string): boolean {
+  return CURATED_MODEL_ONLY_PROVIDERS.has(providerId.trim().toLowerCase());
+}
+
+/**
+ * Providers whose non-empty synced AvailableModels catalog fully replaces the
+ * static registry for dashboard / `/v1/models` / Test All listing. Static rows
+ * remain offline fallback only when synced is empty.
+ *
+ * Cursor-only for now — other authoritative live-catalog providers keep
+ * coverage-style static preservation (e.g. command-code uncovered static ids).
+ */
+export function providerUsesExclusiveSyncedListing(providerId: string): boolean {
+  const id = providerId.trim().toLowerCase();
+  return id === "cursor" || id === "cu";
+}
+
 /**
  * True when the provider is tool-only and therefore has no model listing:
  *  - its id ends in `-search` (legacy search providers), OR

@@ -131,7 +131,12 @@ async function vertexError(res: Response): Promise<VertexHttpError> {
 }
 
 /** Wrap raw little-endian 16-bit PCM mono samples in a minimal WAV container. */
-export function pcmToWav(pcm: Buffer, sampleRate = 24000, channels = 1, bitsPerSample = 16): Buffer {
+export function pcmToWav(
+  pcm: Buffer,
+  sampleRate = 24000,
+  channels = 1,
+  bitsPerSample = 16
+): Buffer<ArrayBuffer> {
   const blockAlign = (channels * bitsPerSample) / 8;
   const byteRate = sampleRate * blockAlign;
   const header = Buffer.alloc(44);
@@ -151,13 +156,13 @@ export function pcmToWav(pcm: Buffer, sampleRate = 24000, channels = 1, bitsPerS
   return Buffer.concat([header, pcm]);
 }
 
-function parseSampleRate(mimeType: string | undefined): number {
+export function parsePcmSampleRate(mimeType: string | undefined): number {
   if (!mimeType) return 24000;
   const match = /rate=(\d+)/i.exec(mimeType);
   return match ? parseInt(match[1], 10) : 24000;
 }
 
-function extractInlineAudio(
+export function extractInlineAudio(
   data: unknown
 ): { base64: string; mimeType: string } | null {
   const parts = (data as { candidates?: Array<{ content?: { parts?: unknown[] } }> })?.candidates?.[0]
@@ -190,7 +195,7 @@ function extractText(data: unknown): string {
 export async function vertexGenerateSpeech(
   credentials: VertexMediaCredentials,
   options: { model: string; input: string; voice?: string }
-): Promise<{ audio: Buffer; contentType: string }> {
+): Promise<{ audio: Buffer<ArrayBuffer>; contentType: string }> {
   const auth = await resolveVertexAuth(credentials);
   const { url, headers } = buildModelRequest(auth, options.model, "generateContent");
   const payload = {
@@ -210,7 +215,7 @@ export async function vertexGenerateSpeech(
   const inline = extractInlineAudio(data);
   if (!inline) throw new Error("Vertex TTS returned no audio content");
   const pcm = Buffer.from(inline.base64, "base64");
-  return { audio: pcmToWav(pcm, parseSampleRate(inline.mimeType)), contentType: "audio/wav" };
+  return { audio: pcmToWav(pcm, parsePcmSampleRate(inline.mimeType)), contentType: "audio/wav" };
 }
 
 /** Gemini transcription (audio → text). `audioBase64` is the raw file bytes, base64-encoded. */

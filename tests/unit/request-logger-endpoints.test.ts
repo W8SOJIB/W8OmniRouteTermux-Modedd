@@ -13,7 +13,7 @@ const callLogs = await import("../../src/lib/usage/callLogs.ts");
 
 test.after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 // Captured stream chunks are prefixed with a per-chunk arrival timestamp
@@ -696,4 +696,45 @@ test("createRequestLogger disabled logger other methods are no-ops", async () =>
   logger.appendConvertedChunk("test");
 
   assert.equal(logger.getPipelinePayloads(), null);
+});
+
+test("request logging never persists a raw hard-lease owner", async () => {
+  const { createRequestLogger } = await import("../../open-sse/utils/requestLogger.ts");
+  const rawOwner = `vlo_${"A".repeat(43)}`;
+  const logger = await createRequestLogger("openai", "openai", "gpt-4", {
+    enabled: true,
+    captureStreamChunks: false,
+  });
+
+  logger.logClientRawRequest(
+    "/v1/chat/completions",
+    {},
+    {
+      "X-OmniRoute-Lease-Owner": rawOwner,
+      "X-OmniRoute-Lease-Generation": "7",
+    }
+  );
+
+  const payload = logger.getPipelinePayloads()?.clientRawRequest;
+  assert.deepEqual(payload?.headers, {
+    "X-OmniRoute-Lease-Owner": "[REDACTED]",
+    "X-OmniRoute-Lease-Generation": "7",
+  });
+  assert.doesNotMatch(JSON.stringify(payload), new RegExp(rawOwner));
+});
+
+test("generic client snapshots exclude hard-lease control headers", async () => {
+  const { buildClientRawRequest } = await import("../../src/sse/handlers/chat/clientRawRequest.ts");
+  const request = new Request("http://x/v1/chat/completions", {
+    headers: {
+      "X-OmniRoute-Lease-Owner": `vlo_${"A".repeat(43)}`,
+      "X-OmniRoute-Lease-Generation": "7",
+      "X-Session-Id": "independent-routing-session",
+    },
+  });
+  const out = buildClientRawRequest(request, { model: "m" });
+
+  assert.equal(out.headers["x-omniroute-lease-owner"], undefined);
+  assert.equal(out.headers["x-omniroute-lease-generation"], undefined);
+  assert.equal(out.headers["x-session-id"], "independent-routing-session");
 });

@@ -125,6 +125,27 @@ export function getEffectiveQuotaUsage(
 }
 
 /**
+ * Normalize a persisted `rate_limited_until` to epoch ms.
+ *
+ * The column is written in two shapes: epoch ms by `setConnectionRateLimitUntil`
+ * (the chat path) and an ISO-8601 string by `updateProviderConnection` (the
+ * dashboard/AUTH path). Returns null when the value is absent or unparseable —
+ * callers treat that as "no usable deadline".
+ */
+function parseCooldownUntilMs(value: string | number | null | undefined): number | null {
+  if (value == null || value === "") return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  const raw = String(value).trim();
+  if (raw === "") return null;
+  if (/^\d+$/.test(raw)) {
+    const numeric = Number(raw);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
  * T05: Startup crash-recovery — clear stale transient connection cooldowns.
  *
  * After an unclean crash (SIGKILL, OOM-kill, large-body burst) the normal
@@ -138,9 +159,19 @@ export function getEffectiveQuotaUsage(
  *  - Only connections with `rate_limited_until IS NOT NULL` are touched.
  *  - Terminal states (`banned`, `expired`, `credits_exhausted`) are skipped —
  *    those require a deliberate credential change or operator reset.
- *  - Past timestamps are also cleared: they are already expired in the lazy
+ *  - Past timestamps are cleared: they are already expired in the lazy
  *    expiry sense, but clearing them resets `backoffLevel` / transient error
- *    fields so the connection gets a clean slate on this fresh process.
+ *    fields so the connection gets a clean slate on this fresh process. An
+ *    unparseable timestamp is treated the same way — it can never expire
+ *    lazily, so leaving it would strand the connection forever.
+ *  - FUTURE timestamps are NEVER cleared. Clearing them was the original
+ *    behaviour and it wiped legitimate multi-day quota cooldowns on every
+ *    container recreate: a GLM weekly cap persisted until 2026-08-29 came
+ *    back `active` with `rate_limited_until = NULL`, combo dispatched it
+ *    immediately, and the connection re-earned a real upstream 429. A stale
+ *    crash-backoff value is bounded by the engine's own cooldown cap, so
+ *    honouring it costs at most that window — far less than burning quota
+ *    against an upstream that is provably exhausted.
  *
  * Must be called once, early in the startup sequence, before any request
  * is handled.  Returns the number of connections that were cleared.
@@ -148,6 +179,7 @@ export function getEffectiveQuotaUsage(
 export function clearStaleCrashCooldowns(): { cleared: number } {
   const db = getDbInstance() as unknown as DbLike;
   const now = new Date().toISOString();
+  const nowMs = Date.now();
 
   // Fetch all connections that have a rate_limited_until set and are NOT in
   // a terminal state.  We do the terminal-status filter in JS to reuse the
@@ -156,13 +188,20 @@ export function clearStaleCrashCooldowns(): { cleared: number } {
 
   const rows = db
     .prepare(
-      `SELECT id, test_status FROM provider_connections WHERE rate_limited_until IS NOT NULL`
+      `SELECT id, test_status, rate_limited_until FROM provider_connections WHERE rate_limited_until IS NOT NULL`
     )
-    .all() as Array<{ id: string; test_status: string | null }>;
+    .all() as Array<{
+    id: string;
+    test_status: string | null;
+    rate_limited_until: string | number | null;
+  }>;
 
   const toReset = rows.filter((r) => {
     const status = (r.test_status || "").trim().toLowerCase();
-    return !TERMINAL_STATUSES.has(status);
+    if (TERMINAL_STATUSES.has(status)) return false;
+    const untilMs = parseCooldownUntilMs(r.rate_limited_until);
+    // Unparseable → clear (cannot expire lazily). Future → keep.
+    return untilMs === null || untilMs <= nowMs;
   });
 
   if (toReset.length === 0) return { cleared: 0 };

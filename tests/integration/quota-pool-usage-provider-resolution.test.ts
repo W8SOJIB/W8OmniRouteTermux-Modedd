@@ -35,7 +35,7 @@ const usageRoute = await import("../../src/app/api/quota/pools/[id]/usage/route.
 function resetDb() {
   core.resetDbInstance();
   resetQuotaStoreSingleton();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -46,7 +46,7 @@ test.beforeEach(() => {
 test.after(() => {
   core.resetDbInstance();
   resetQuotaStoreSingleton();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("GET /usage surfaces catalog dimensions for a catalog-only pool (provider resolved from connection)", async () => {

@@ -8,7 +8,11 @@ import { applyCorsHeaders } from "../cors/origins";
 import { validateBrowserMutationOrigin } from "../origin/publicOrigin";
 import { classifyRoute } from "./classify";
 import { validateDashboardCsrfToken } from "./csrf";
-import { classifyStampedPeerLocality } from "./peerStamp";
+import {
+  classifyStampedPeerLocality,
+  resolveStampedPeer,
+  resolveStampedViaProxy,
+} from "./peerStamp";
 import { checkRequestIP } from "@omniroute/open-sse/services/ipFilter.ts";
 import { clientApiPolicy } from "./policies/clientApi";
 import { managementPolicy } from "./policies/management";
@@ -21,7 +25,9 @@ import {
   AUTHZ_HEADER_PEER_LOCALITY,
   AUTHZ_HEADER_REQUEST_ID,
   AUTHZ_HEADER_ROUTE_CLASS,
+  AUTHZ_HEADER_TRUSTED_PEER_IP,
   AUTHZ_TRUSTED_HEADERS,
+  CLI_TOKEN_HEADER,
   PEER_IP_HEADER,
   VIA_PROXY_HEADER,
 } from "./headers";
@@ -37,6 +43,29 @@ const POLICIES: Record<RouteClass, RoutePolicy> = {
   CLIENT_API: clientApiPolicy,
   MANAGEMENT: managementPolicy,
 };
+
+let staleDashboardJwtWarningEmitted = false;
+
+function isStaleDashboardJwtError(error: unknown): boolean {
+  const code =
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof (error as { code?: unknown }).code === "string"
+      ? (error as { code: string }).code
+      : "";
+
+  if (
+    code === "ERR_JWS_SIGNATURE_VERIFICATION_FAILED" ||
+    code === "ERR_JWT_EXPIRED" ||
+    code === "ERR_JWS_INVALID" ||
+    code === "ERR_JWT_CLAIM_VALIDATION_FAILED"
+  ) {
+    return true;
+  }
+
+  return error instanceof Error && error.message.includes("signature verification failed");
+}
 
 function stampSubject(headers: Headers, subject: AuthSubject): void {
   headers.set(AUTHZ_HEADER_AUTH_KIND, subject.kind);
@@ -144,6 +173,15 @@ async function refreshDashboardSessionIfNeeded(
       path: "/",
     });
   } catch (error) {
+    if (isStaleDashboardJwtError(error)) {
+      response.cookies.delete("auth_token");
+      if (!staleDashboardJwtWarningEmitted) {
+        staleDashboardJwtWarningEmitted = true;
+        console.warn("[Authz] Dropped stale dashboard session cookie during auto-refresh");
+      }
+      return;
+    }
+
     console.error("[Authz] JWT auto-refresh failed:", error);
   }
 }
@@ -168,6 +206,7 @@ function drainingResponse(requestId: string): NextResponse {
     { status: 503 }
   );
   response.headers.set(AUTHZ_HEADER_REQUEST_ID, requestId);
+  response.headers.set("Retry-After", "5");
   return response;
 }
 
@@ -294,6 +333,21 @@ export async function runAuthzPipeline(
     process.env.OMNIROUTE_PEER_STAMP_TOKEN
   );
   requestHeaders.set(AUTHZ_HEADER_PEER_LOCALITY, peerLocality);
+  // Stamp the resolved, non-spoofable peer IP for route handlers that need
+  // the real client IP (e.g. login rate-limit key). Only set when the stamp
+  // token is configured and the HMAC signature validates; absent otherwise.
+  const trustedPeerIp = resolveStampedPeer(
+    request.headers.get(PEER_IP_HEADER),
+    process.env.OMNIROUTE_PEER_STAMP_TOKEN
+  );
+  if (trustedPeerIp) {
+    requestHeaders.set(AUTHZ_HEADER_TRUSTED_PEER_IP, trustedPeerIp);
+  }
+  // Local CLI-token auth is decided centrally above. Preserve that trusted
+  // decision for route-level requireManagementAuth without forwarding the
+  // machine token itself: custom client auth headers are stripped before the
+  // route runs, so the route consumes only the stamped auth subject.
+  requestHeaders.delete(CLI_TOKEN_HEADER);
 
   if (method === "OPTIONS") {
     const preflight = new NextResponse(null, { status: 204 });
@@ -315,8 +369,23 @@ export async function runAuthzPipeline(
   // external surface. Loopback is exempt so the local operator can never lock
   // themselves out of the dashboard (they can always fix the list from
   // localhost). checkIP is a no-op when the filter is disabled.
+  //
+  // D1 (#9033): on a direct connection the proxy runtime has no socket, so
+  // checkRequestIP reads only forwarding headers + undefined request.ip and
+  // falls to "unknown", never blocking the blacklisted client. Resolve the
+  // trusted peer IP from the authenticated stamp and pass it to checkRequestIP,
+  // but only when NOT behind a reverse proxy (the via-proxy marker means the
+  // peer IP is the proxy hop, e.g. 127.0.0.1, and the real client is in XFF).
   if (peerLocality !== "loopback") {
-    const ipVerdict = checkRequestIP(request);
+    const trustedPeerIp = resolveStampedPeer(
+      request.headers.get(PEER_IP_HEADER),
+      process.env.OMNIROUTE_PEER_STAMP_TOKEN
+    );
+    const viaProxy = resolveStampedViaProxy(
+      request.headers.get(VIA_PROXY_HEADER),
+      process.env.OMNIROUTE_PEER_STAMP_TOKEN
+    );
+    const ipVerdict = checkRequestIP(request, viaProxy ? null : trustedPeerIp);
     if (!ipVerdict.allowed) {
       const blocked = NextResponse.json(
         { error: ipVerdict.reason || "Access denied" },

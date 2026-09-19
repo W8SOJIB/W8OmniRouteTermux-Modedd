@@ -72,6 +72,22 @@ export function isCcCompatibleProviderEnabled(): boolean {
   return isFeatureFlagEnabled("ENABLE_CC_COMPATIBLE_PROVIDER");
 }
 
+/**
+ * Context-window checks are fail-safe: an unavailable flag store must never
+ * silently disable local request bounds.
+ */
+export function areContextWindowChecksDisabled(): boolean {
+  try {
+    return isFeatureFlagEnabled("DISABLE_CONTEXT_WINDOW_CHECKS");
+  } catch (error) {
+    console.error(
+      "[featureFlags] Failed to resolve DISABLE_CONTEXT_WINDOW_CHECKS, keeping checks enabled:",
+      error instanceof Error ? error.message : error
+    );
+    return false;
+  }
+}
+
 export function isApiKeyRevealEnabledFlag(): boolean {
   try {
     return isFeatureFlagEnabled("ALLOW_API_KEY_REVEAL");
@@ -109,5 +125,17 @@ export function isControlPlaneProxyDirectFallbackEnabled(): boolean {
       error instanceof Error ? error.message : error
     );
     return false;
+  }
+}
+
+export function isNetworkRotationSharedEgressGuardEnabled(): boolean {
+  try {
+    return isFeatureFlagEnabled("NETWORK_ROTATION_SHARED_EGRESS_GUARD");
+  } catch (error) {
+    console.error(
+      "[featureFlags] Failed to resolve NETWORK_ROTATION_SHARED_EGRESS_GUARD, defaulting to enabled:",
+      error instanceof Error ? error.message : error
+    );
+    return true;
   }
 }

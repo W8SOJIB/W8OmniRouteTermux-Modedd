@@ -11,7 +11,8 @@
  * Schedule:
  *   - Initial delay: 30s after server boot (allows DB migrations to complete)
  *   - Interval: configurable via CREDENTIAL_HEALTH_CHECK_INTERVAL (default 5 min)
- *   - OAuth connections: tested less frequently (2x interval)
+ *   - Per-connection override: provider_connections.healthCheckInterval (minutes,
+ *     0 = never test this connection) paces each connection individually
  *   - Backoff on failure: 5min -> 10min -> 30min -> max 2h
  *   - Resets to default on success
  */
@@ -23,13 +24,18 @@ import {
   removeCredentialHealth,
   initCredentialCache,
 } from "@/lib/credentialHealth/cache";
+import {
+  isCredentialProbeInconclusive,
+  resolveInconclusiveProbeRecheckDelayMs,
+} from "@/lib/credentialHealth/probePolicy";
 import { emit } from "@/lib/events/eventBus";
+import { isAutomatedTestProcess } from "@/shared/utils/testProcess";
+import { SEARCH_VALIDATOR_CONFIGS } from "@/lib/providers/validation/searchProviders";
 
 // ── Config ────────────────────────────────────────────────────────────────
 
 const BACKOFF_SCHEDULE = [300_000, 600_000, 1_800_000, 7_200_000]; // 5min, 10min, 30min, 2h
 const INITIAL_DELAY_MS = 30_000; // Wait for server boot
-const OAUTH_INTERVAL_MULTIPLIER = 2; // OAuth tested 2x less frequently
 const CONCURRENCY_LIMIT = 5; // Max simultaneous connection tests
 const LOG_PREFIX = "[CredentialHealth]";
 const TRUE_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
@@ -44,6 +50,12 @@ declare global {
         sweepInProgress: boolean;
         /** Track consecutive scheduler failures per connection for backoff */
         failureCounts: Map<string, number>;
+        /**
+         * Per-connection timing for time-based backoff retry.
+         * `nextAttemptAt` is the earliest timestamp (ms) at which the connection
+         * should be tested again. Absent entry = never tested or healthy = due now.
+         */
+        perConnTiming: Map<string, { lastAttemptAt: number; nextAttemptAt: number }>;
       }
     | undefined;
 }
@@ -55,6 +67,7 @@ function getSchedulerState() {
       sweepTimer: null,
       sweepInProgress: false,
       failureCounts: new Map(),
+      perConnTiming: new Map(),
     };
   }
   return globalThis.__omnirouteCredentialHC;
@@ -64,15 +77,6 @@ function getSchedulerState() {
 
 function isBuildProcess(): boolean {
   return typeof process !== "undefined" && process.env.NEXT_PHASE === "phase-production-build";
-}
-
-function isAutomatedTestProcess(): boolean {
-  return (
-    typeof process !== "undefined" &&
-    (process.env.NODE_ENV === "test" ||
-      process.env.VITEST !== undefined ||
-      process.argv.some((arg) => arg.includes("test")))
-  );
 }
 
 function isCredentialHealthCheckDisabled(): boolean {
@@ -90,19 +94,23 @@ function getSweepInterval(): number {
   return 300_000; // default 5 min
 }
 
+/**
+ * Resolve the per-connection sweep interval (ms).
+ * - `healthCheckInterval > 0` → minutes × 60 000 (per-connection override)
+ * - `healthCheckInterval <= 0` → null (never test this connection — opt-out)
+ * - absent → global env interval (getSweepInterval())
+ */
+function getConnIntervalMs(conn: { healthCheckInterval?: number | null }): number | null {
+  const minutes = conn.healthCheckInterval;
+  if (minutes === null || minutes === undefined) return getSweepInterval();
+  if (minutes <= 0) return null;
+  return minutes * 60_000;
+}
+
 function getNextBackoff(connectionId: string): number {
   const state = getSchedulerState();
   const failures = state.failureCounts.get(connectionId) ?? 0;
   return BACKOFF_SCHEDULE[Math.min(failures, BACKOFF_SCHEDULE.length - 1)];
-}
-
-function getMaxFailuresAcrossConnections(): number {
-  const state = getSchedulerState();
-  let max = 0;
-  for (const count of state.failureCounts.values()) {
-    if (count > max) max = count;
-  }
-  return max;
 }
 
 // ── Core Sweep Logic ─────────────────────────────────────────────────────
@@ -110,9 +118,12 @@ function getMaxFailuresAcrossConnections(): number {
 async function testConnection(
   connectionId: string,
   provider: string,
-  isOAuth: boolean
+  intervalMs: number | null
 ): Promise<void> {
   const startTime = Date.now();
+
+  // Per-connection opt-out: healthCheckInterval <= 0 → never test.
+  if (intervalMs === null) return;
 
   let oldStatus: string | undefined;
   try {
@@ -123,12 +134,44 @@ async function testConnection(
   try {
     const result = await testSingleConnection(connectionId);
 
+    // Deliberate skips never rewrite credential health or failure state.
+    // Unsupported validation capability is stable enough to honor the
+    // connection's configured interval; an exclusive-lease skip intentionally
+    // remains due on the next global sweep so recovery is not delayed.
+    if (result.skipped === true) {
+      const diagnosis = result.diagnosis as { code?: string } | undefined;
+      if (diagnosis?.code === "unsupported") {
+        getSchedulerState().perConnTiming.set(connectionId, {
+          lastAttemptAt: startTime,
+          nextAttemptAt: startTime + intervalMs,
+        });
+      }
+      return;
+    }
+
     const latencyMs = Date.now() - startTime;
     const state = getSchedulerState();
 
     if (result.valid) {
-      // Success — reset failure count, update cache
+      // Success resets failure state. Credential-inconclusive probes remain
+      // active but are checked less often because repeating an expensive probe
+      // does not add authentication evidence; an ordinary success is paced by
+      // the per-connection interval (absent → global sweep interval).
       state.failureCounts.delete(connectionId);
+
+      if (isCredentialProbeInconclusive(result)) {
+        const recheckDelayMs = resolveInconclusiveProbeRecheckDelayMs(getSweepInterval());
+        state.perConnTiming.set(connectionId, {
+          lastAttemptAt: startTime,
+          nextAttemptAt: Date.now() + recheckDelayMs,
+        });
+      } else {
+        state.perConnTiming.set(connectionId, {
+          lastAttemptAt: startTime,
+          nextAttemptAt: startTime + intervalMs,
+        });
+      }
+
       setCredentialHealth(
         connectionId,
         provider,
@@ -146,9 +189,14 @@ async function testConnection(
         timestamp: Date.now(),
       });
     } else {
-      // Failure — increment failure count, update cache with error
+      // Failure — increment failure count, update cache with error, set retry timing
       const currentFailures = (state.failureCounts.get(connectionId) ?? 0) + 1;
       state.failureCounts.set(connectionId, currentFailures);
+      const nextBackoff = getNextBackoff(connectionId);
+      state.perConnTiming.set(connectionId, {
+        lastAttemptAt: startTime,
+        nextAttemptAt: Date.now() + nextBackoff,
+      });
 
       const diagnosis = result.diagnosis as { type?: string; source?: string } | undefined;
 
@@ -186,6 +234,11 @@ async function testConnection(
 
     const currentFailures = (state.failureCounts.get(connectionId) ?? 0) + 1;
     state.failureCounts.set(connectionId, currentFailures);
+    const nextBackoff = getNextBackoff(connectionId);
+    state.perConnTiming.set(connectionId, {
+      lastAttemptAt: startTime,
+      nextAttemptAt: Date.now() + nextBackoff,
+    });
 
     setCredentialHealth(connectionId, provider, "error", message);
 
@@ -207,21 +260,31 @@ export async function sweep(): Promise<void> {
   state.sweepInProgress = true;
 
   try {
-    // Get all provider connections (API-key + OAuth)
+    // Get active provider connections only (API-key + OAuth). Disabled
+    // connections are excluded from routing and must not consume health-check
+    // concurrency or delay the scheduler with avoidable upstream timeouts.
     let connections: Array<{
       id: string;
       provider: string;
       authType?: string;
+      healthCheckInterval?: number | null;
     }>;
 
     try {
-      const raw = await getProviderConnections({});
+      const raw = await getProviderConnections({ isActive: true });
       connections = (Array.isArray(raw) ? raw : []).filter(
-        (conn: any) => conn && conn.id && (conn.authType === "apikey" || conn.authType === "oauth")
+        (conn: any) =>
+          conn &&
+          conn.id &&
+          (conn.authType === "apikey" || conn.authType === "oauth") &&
+          // #9970: search-provider "validation" fires a REAL billed upstream
+          // query (e.g. POST api.tavily.com/search) — never sweep these.
+          !(conn.provider in SEARCH_VALIDATOR_CONFIGS)
       ) as Array<{
         id: string;
         provider: string;
         authType?: string;
+        healthCheckInterval?: number | null;
       }>;
     } catch (err) {
       console.error(LOG_PREFIX, "Failed to load provider connections:", err);
@@ -232,16 +295,17 @@ export async function sweep(): Promise<void> {
 
     // Compute backoff per connection — skip connections that aren't due yet
     const now = Date.now();
-    const interval = getSweepInterval();
 
     const dueConnections = connections.filter((conn) => {
-      const isOAuth = conn.authType === "oauth";
-      const connInterval = isOAuth ? interval * OAUTH_INTERVAL_MULTIPLIER : interval;
-      const backoff = getNextBackoff(conn.id);
-      const effectiveInterval = Math.max(connInterval, backoff);
-      // If we don't have a failure count, it hasn't been tested this session
+      const intervalMs = getConnIntervalMs(conn);
+      // Per-connection opt-out: never tested.
+      if (intervalMs === null) return false;
       const state_ = getSchedulerState();
-      return !state_.failureCounts.has(conn.id) || effectiveInterval <= interval;
+      const timing = state_.perConnTiming.get(conn.id);
+      // No timing entry = never tested since boot → due now
+      if (!timing) return true;
+      // Time-based: due when the current time has passed the next attempt time
+      return now >= timing.nextAttemptAt;
     });
 
     if (dueConnections.length === 0) return;
@@ -259,7 +323,7 @@ export async function sweep(): Promise<void> {
 
     for (const batch of batches) {
       await Promise.allSettled(
-        batch.map((conn) => testConnection(conn.id, conn.provider, conn.authType === "oauth"))
+        batch.map((conn) => testConnection(conn.id, conn.provider, getConnIntervalMs(conn)))
       );
     }
   } finally {
@@ -273,10 +337,10 @@ function scheduleSweep(): void {
   if (!state.initialized) return;
   if (state.sweepTimer) clearTimeout(state.sweepTimer);
 
-  const maxFailures = getMaxFailuresAcrossConnections();
-  const baseInterval = getSweepInterval();
-  const backoffInterval = BACKOFF_SCHEDULE[Math.min(maxFailures, BACKOFF_SCHEDULE.length - 1)];
-  const interval = Math.max(baseInterval, backoffInterval);
+  // Use a stable sweep interval — per-connection retry timing is now managed
+  // independently via perConnTiming, so one failed connection should not delay
+  // the global sweep for all connections.
+  const interval = getSweepInterval();
 
   state.sweepTimer = setTimeout(sweep, interval);
 }
@@ -285,10 +349,13 @@ function scheduleSweep(): void {
 
 /**
  * Start the credential health check scheduler (idempotent).
+ * Returns whether the sweep is armed. False when
+ * OMNIROUTE_DISABLE_CREDENTIAL_HEALTH_CHECK is set (#11016).
  */
-export function initCredentialHealthCheck(): void {
+export function initCredentialHealthCheck(): boolean {
   const state = getSchedulerState();
-  if (state.initialized || isCredentialHealthCheckDisabled()) return;
+  if (isCredentialHealthCheckDisabled()) return false;
+  if (state.initialized) return true;
   state.initialized = true;
   initCredentialCache();
 
@@ -300,6 +367,7 @@ export function initCredentialHealthCheck(): void {
   state.sweepTimer = setTimeout(() => {
     sweep().catch((err) => console.error(LOG_PREFIX, "Initial sweep failed:", err));
   }, INITIAL_DELAY_MS);
+  return true;
 }
 
 /**

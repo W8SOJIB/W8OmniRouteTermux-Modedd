@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { Card, Button, Input, Toggle, Modal } from "@/shared/components";
 import { AI_PROVIDERS } from "@/shared/constants/providers";
+import ProviderIcon from "@/shared/components/ProviderIcon";
 import IPFilterSection from "./IPFilterSection";
 import SessionInfoCard from "./SessionInfoCard";
 import AuthzSection from "./AuthzSection";
@@ -80,13 +81,11 @@ export default function SecurityTab() {
         setRequireLoginModalOpen(false);
       } else {
         const data = await res.json();
-        setRequireLoginError(
-          data?.error?.message || t("errorOccurred", { fallback: "An error occurred" })
-        );
+        setRequireLoginError(data?.error?.message || t("errorOccurred"));
       }
     } catch (err) {
       console.error("Failed to update require login:", err);
-      setRequireLoginError(t("errorOccurred", { fallback: "An error occurred" }));
+      setRequireLoginError(t("errorOccurred"));
     } finally {
       setRequireLoginLoading(false);
     }
@@ -195,9 +194,7 @@ export default function SecurityTab() {
             title={t("currentPassword")}
           >
             <div className="flex flex-col gap-4">
-              <p className="text-sm text-text-muted">
-                {t("enterCurrentPassword", { fallback: "Enter your current password to continue" })}
-              </p>
+              <p className="text-sm text-text-muted">{t("enterCurrentPassword")}</p>
               <Input
                 label={t("currentPassword")}
                 type="password"
@@ -225,7 +222,7 @@ export default function SecurityTab() {
                   loading={requireLoginLoading}
                   disabled={!requireLoginPassword}
                 >
-                  {t("confirm", { fallback: "Confirm" })}
+                  {t("confirm")}
                 </Button>
               </div>
             </div>
@@ -358,12 +355,16 @@ export default function SecurityTab() {
                         : t("blockProviderTitle", { provider: provider.name })
                     }
                   >
-                    <span
-                      className="material-symbols-outlined text-[14px]"
-                      style={{ color: isBlocked ? undefined : provider.color }}
-                    >
-                      {isBlocked ? "block" : provider.icon}
-                    </span>
+                    {isBlocked ? (
+                      <span className="material-symbols-outlined text-[14px]">block</span>
+                    ) : (
+                      <ProviderIcon
+                        providerId={provider.id}
+                        size={14}
+                        className="shrink-0"
+                        style={{ color: provider.color }}
+                      />
+                    )}
                     {provider.name}
                     {isBlocked && (
                       <span className="material-symbols-outlined text-[12px] text-red-500">
@@ -454,6 +455,45 @@ export default function SecurityTab() {
               )}
             </p>
           )}
+        </div>
+      </Card>
+
+      <Card>
+        <div className="flex items-center gap-3 mb-4">
+          <div className="p-2 rounded-lg bg-primary/10 text-primary">
+            <span className="material-symbols-outlined">shield</span>
+          </div>
+          <div>
+            <p className="font-medium">
+              {getSettingsLabel("credentialRedaction", "Credential Redaction")}
+            </p>
+            <p className="text-sm text-text-muted">
+              {getSettingsLabel(
+                "credentialRedactionDesc",
+                "Redact API keys, tokens, and secrets from context sent to providers and from responses."
+              )}
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="font-medium">
+              {getSettingsLabel("enableCredentialRedaction", "Enable credential redaction")}
+            </p>
+            <p className="text-sm text-text-muted">
+              {getSettingsLabel(
+                "enableCredentialRedactionDesc",
+                "Scrubs API keys, tokens, private keys, and JWTs from messages, tool calls, and responses."
+              )}
+            </p>
+          </div>
+          <Toggle
+            checked={settings.credentialRedactionEnabled === true}
+            onChange={() =>
+              updateSetting("credentialRedactionEnabled", !settings.credentialRedactionEnabled)
+            }
+            disabled={loading}
+          />
         </div>
       </Card>
 

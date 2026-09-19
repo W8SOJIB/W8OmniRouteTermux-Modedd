@@ -9,15 +9,83 @@ export const chatgpt_webProvider: RegistryEntry = {
   authType: "apikey",
   authHeader: "cookie",
   models: [
-    { id: "gpt-5.5-pro", name: "GPT-5.5 Pro" }, // pro tier only, standard effort
-    { id: "gpt-5.5-pro-extended", name: "GPT-5.5 Pro Extended" }, // pro tier only, extended effort
-    { id: "gpt-5.5-thinking", name: "GPT-5.5 Thinking" }, // plus, pro tier
-    { id: "gpt-5.5", name: "GPT-5.5 Instant" }, // free, plus, pro tier
-    { id: "gpt-5.4-pro", name: "GPT-5.4 Pro" }, // pro tier only
-    { id: "gpt-5.4-thinking", name: "GPT-5.4 Thinking" }, // plus, pro tier
-    { id: "gpt-5.4-thinking-mini", name: "GPT-5.4 Thinking Mini" }, // free-login only
-    { id: "gpt-5.3", name: "GPT-5.3 Instant" }, // free, free-login, plus, pro tier
-    { id: "gpt-5.3-mini", name: "GPT-5.3 Mini" }, // limit fallback
-    { id: "o3", name: "o3" }, // plus ~ tier
+    {
+      id: "gpt-5.6-sol-pro",
+      name: "GPT-5.6 Sol (Pro)",
+      liveCatalogIds: ["gpt-5-6-pro"],
+      toolCalling: false,
+    },
+    {
+      id: "gpt-5.6-sol-xhigh",
+      name: "GPT-5.6 Sol (Xhigh)",
+      liveCatalogIds: ["gpt-5-6-thinking"],
+      toolCalling: false,
+    },
+    {
+      id: "gpt-5.6-sol-high",
+      name: "GPT-5.6 Sol (High)",
+      liveCatalogIds: ["gpt-5-6-thinking"],
+      toolCalling: false,
+    },
+    {
+      id: "gpt-5.6-sol-medium",
+      name: "GPT-5.6 Sol (Medium)",
+      liveCatalogIds: ["gpt-5-6-thinking"],
+      toolCalling: false,
+    },
+    {
+      id: "gpt-5.6-sol-instant",
+      name: "GPT-5.6 Sol (Instant)",
+      liveCatalogIds: ["gpt-5-6"],
+      toolCalling: false,
+    },
+    {
+      id: "gpt-5.6-luna-free-thinking",
+      name: "GPT-5.6 Luna (Free, Think)",
+      liveCatalogIds: ["gpt-5-6"],
+      toolCalling: false,
+    },
+    {
+      id: "gpt-5.6-luna-free",
+      name: "GPT-5.6 Luna (Free)",
+      liveCatalogIds: ["gpt-5-6"],
+      toolCalling: false,
+    },
+    {
+      id: "gpt-5.5-pro-extended",
+      name: "GPT-5.5 (Pro Extended)",
+      liveCatalogIds: ["gpt-5-5-pro"],
+      toolCalling: false,
+    },
+    {
+      id: "gpt-5.5-pro",
+      name: "GPT-5.5 (Pro)",
+      liveCatalogIds: ["gpt-5-5-pro"],
+      toolCalling: false,
+    },
+    {
+      id: "gpt-5.5-xhigh",
+      name: "GPT-5.5 (Xhigh)",
+      liveCatalogIds: ["gpt-5-5-thinking"],
+      toolCalling: false,
+    },
+    {
+      id: "gpt-5.5-high",
+      name: "GPT-5.5 (High)",
+      liveCatalogIds: ["gpt-5-5-thinking"],
+      toolCalling: false,
+    },
+    {
+      id: "gpt-5.5-medium",
+      name: "GPT-5.5 (Medium)",
+      liveCatalogIds: ["gpt-5-5-thinking"],
+      toolCalling: false,
+    },
+    {
+      id: "gpt-5.5-instant",
+      name: "GPT-5.5 (Instant)",
+      liveCatalogIds: ["gpt-5-5"],
+      toolCalling: false,
+    },
   ],
 };

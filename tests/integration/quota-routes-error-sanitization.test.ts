@@ -42,7 +42,7 @@ const settingsRoute = await import("../../src/app/api/settings/quota-store/route
 function resetDb() {
   core.resetDbInstance();
   resetQuotaStoreSingleton();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -96,7 +96,7 @@ test.after(() => {
   core.resetDbInstance();
   resetQuotaStoreSingleton();
   delete process.env.QUOTA_STORE_REDIS_URL;
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 // ---------------------------------------------------------------------------

@@ -47,6 +47,8 @@
 
 import { registerQuotaFetcher, registerQuotaWindows, type QuotaInfo } from "./quotaPreflight.ts";
 import { registerMonitorFetcher } from "./quotaMonitor.ts";
+import { throttleQuotaFetch } from "./quotaFetchThrottle.ts";
+import { resolveOpenCodeGoDashboardConfig } from "./opencodeOllamaUsage.ts";
 
 // OpenCode quota endpoint — same key works across opencode, opencode-go, opencode-zen
 // Default points at /zen/go/v1/quota which returns 404 today (no public quota API yet,
@@ -226,6 +228,114 @@ function parseOpencodeQuotaResponse(data: unknown): OpencodeTripleWindowQuota | 
 
 // ─── Core Fetcher ─────────────────────────────────────────────────────────────
 
+// ─── Dashboard Snapshot Bridge (#11234) ───────────────────────────────────────
+//
+// The live endpoint above has no public quota API today (404 — see module
+// JSDoc), so without this bridge every preflight evaluated `null` and
+// proceeded (fail-open) even when the dashboard already showed a drained
+// window. The dashboard scrape (`getOpenCodeGoUsage` in
+// opencodeOllamaUsage.ts) persists per-window snapshots through
+// `src/domain/quotaCache.ts::setQuotaCache` under the window keys
+// session / weekly / mcp_monthly; this bridge synthesizes the same
+// OpencodeTripleWindowQuota shape from those cached snapshots so the quota
+// cutoff sees them.
+//
+// Read-only: accessors only, never SQL, never a re-scrape on the hot path.
+// Fail-open is preserved — no snapshots means `null`, exactly as before.
+
+// Dashboard snapshot key → fetcher/preflight window key.
+const DASHBOARD_SNAPSHOT_WINDOW_MAP: ReadonlyArray<readonly [string, string]> = [
+  ["session", OPENCODE_WINDOW_5H],
+  ["weekly", OPENCODE_WINDOW_WEEKLY],
+  ["mcp_monthly", OPENCODE_WINDOW_MONTHLY],
+];
+
+function hasDashboardQuotaConfig(connection?: Record<string, unknown>): boolean {
+  // Snapshots can only exist when the operator configured the dashboard
+  // scrape for this connection (or globally via env). Gating on it keeps the
+  // snapshot read (and its cold-start DB hydration) off connections that
+  // could never have produced one.
+  const psd = connection?.providerSpecificData as Record<string, unknown> | undefined;
+  return resolveOpenCodeGoDashboardConfig(psd).state !== "none";
+}
+
+async function synthesizeQuotaFromDashboardSnapshots(
+  connectionId: string
+): Promise<OpencodeTripleWindowQuota | null> {
+  let quotaCacheDomain: typeof import("../../src/domain/quotaCache.ts");
+  try {
+    // Dynamic import: a static edge would close an initialization cycle
+    // (opencodeQuotaFetcher → quotaCache → usage.ts → usage/opencode.ts →
+    // opencodeQuotaFetcher).
+    quotaCacheDomain = await import("../../src/domain/quotaCache.ts");
+  } catch {
+    return null;
+  }
+
+  // Hydrate the in-memory cache from persisted snapshots when cold (the
+  // accessor does this internally), then read the raw per-window rows.
+  quotaCacheDomain.getQuotaWindowStatus(connectionId, DASHBOARD_SNAPSHOT_WINDOW_MAP[0][0]);
+  const entry = quotaCacheDomain.getQuotaCache(connectionId);
+  const quotas = entry?.quotas;
+  if (!quotas || typeof quotas !== "object") return null;
+
+  const now = Date.now();
+  const windows: Record<string, { percentUsed: number; resetAt: string | null }> = {};
+
+  for (const [snapshotKey, windowKey] of DASHBOARD_SNAPSHOT_WINDOW_MAP) {
+    const raw = quotas[snapshotKey];
+    if (!raw || typeof raw.remainingPercentage !== "number") continue;
+    // #10095 mirror: a window whose fraction upstream never reported is
+    // "unknown", not 0% — it must not count as exhausted.
+    if (raw.fractionReported === false) continue;
+    const resetAt = typeof raw.resetAt === "string" && raw.resetAt ? raw.resetAt : null;
+    if (resetAt) {
+      const resetMs = Date.parse(resetAt);
+      // Mirror getQuotaWindowStatus (quotaCache.ts): an expired resetAt means
+      // the window has rolled into a fresh period — the cached percentage is
+      // stale and must not count as exhausted.
+      if (Number.isFinite(resetMs) && resetMs <= now) continue;
+    }
+    const remaining = Math.max(0, Math.min(100, raw.remainingPercentage));
+    windows[windowKey] = { percentUsed: 1 - remaining / 100, resetAt };
+  }
+
+  if (Object.keys(windows).length === 0) return null;
+
+  const window5h = windows[OPENCODE_WINDOW_5H] ?? { percentUsed: 0, resetAt: null };
+  const windowWeekly = windows[OPENCODE_WINDOW_WEEKLY] ?? { percentUsed: 0, resetAt: null };
+  const windowMonthly = windows[OPENCODE_WINDOW_MONTHLY] ?? { percentUsed: 0, resetAt: null };
+
+  const worstPercent = Math.max(
+    window5h.percentUsed,
+    windowWeekly.percentUsed,
+    windowMonthly.percentUsed
+  );
+
+  // Dominant reset: pick the window with the worst usage (same policy as the
+  // live-response parser above).
+  let dominantResetAt: string | null = null;
+  if (worstPercent === window5h.percentUsed) {
+    dominantResetAt = window5h.resetAt ?? windowWeekly.resetAt ?? windowMonthly.resetAt;
+  } else if (worstPercent === windowWeekly.percentUsed) {
+    dominantResetAt = windowWeekly.resetAt ?? window5h.resetAt ?? windowMonthly.resetAt;
+  } else {
+    dominantResetAt = windowMonthly.resetAt ?? windowWeekly.resetAt ?? window5h.resetAt;
+  }
+
+  return {
+    used: worstPercent * 100,
+    total: 100,
+    percentUsed: worstPercent,
+    resetAt: dominantResetAt,
+    windows,
+    window5h,
+    windowWeekly,
+    windowMonthly,
+    limitReached: worstPercent >= 1,
+  };
+}
+
 /**
  * Fetch current quota for an OpenCode connection.
  * Returns percentUsed = max(5h%, weekly%, monthly%) — worst-case across all windows.
@@ -241,18 +351,37 @@ export async function fetchOpencodeQuota(
   connectionId: string,
   connection?: Record<string, unknown>
 ): Promise<OpencodeTripleWindowQuota | null> {
+  // Snapshots can only exist when the dashboard scrape is configured for this
+  // connection (or globally via env); without it the bridge stays off and the
+  // fetcher never touches the snapshot store.
+  const dashboardConfigured = hasDashboardQuotaConfig(connection);
+
   // Check cache first
   const cached = quotaCache.get(connectionId);
   if (cached) {
     // 404 sentinel — use longer TTL to avoid hammering a non-existent endpoint
     if (cached.noEndpoint && Date.now() - cached.fetchedAt < NO_ENDPOINT_TTL_MS) {
-      return null;
+      // The live endpoint is known-absent — serve dashboard snapshots if the
+      // operator configured the scrape (#11234).
+      return dashboardConfigured ? synthesizeQuotaFromDashboardSnapshots(connectionId) : null;
     }
     if (cached.quota !== null && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
       return cached.quota;
     }
   }
 
+  const live = await fetchLiveOpencodeQuota(connectionId, connection);
+  if (live) return live;
+
+  // #11234 — the live endpoint has no public quota API (404) or failed:
+  // fall back to the operator-configured dashboard snapshots, read-only.
+  return dashboardConfigured ? synthesizeQuotaFromDashboardSnapshots(connectionId) : null;
+}
+
+async function fetchLiveOpencodeQuota(
+  connectionId: string,
+  connection?: Record<string, unknown>
+): Promise<OpencodeTripleWindowQuota | null> {
   // Extract API key from connection
   const apiKey =
     typeof connection?.apiKey === "string" && connection.apiKey.trim().length > 0
@@ -264,6 +393,8 @@ export async function fetchOpencodeQuota(
   }
 
   try {
+    // #6911: space concurrent upstream quota fetches (mirrors codexQuotaFetcher.ts).
+    await throttleQuotaFetch();
     const response = await fetch(OPENCODE_QUOTA_URL, {
       method: "GET",
       headers: {

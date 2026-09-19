@@ -39,6 +39,32 @@ Verified by `isDashboardSessionAuthenticated()` in `src/shared/utils/apiAuth.ts`
 
 Some management routes accept **either** mode: cookie OR `Bearer <key>` when the API key has the `manage` (or `admin`) scope. This is what enables the "configurable via API calls" workflow added in v3.8.
 
+#### Optional OIDC login gate (#6973)
+
+The dashboard admin login also supports an **opt-in** OIDC (OpenID Connect) flow
+alongside the default password login — password login is never removed, only
+supplemented:
+
+- Disabled unless `settings.oidcEnabled === true` **and** `oidcIssuer` /
+  `oidcClientId` / `oidcClientSecret` are all configured (Settings → Auth).
+  `GET /api/auth/oidc/login` returns `400` otherwise.
+- `GET /api/auth/oidc/login` discovers the `authorization_endpoint` from the
+  issuer's `/.well-known/openid-configuration` (falls back to
+  `<issuer>/authorize`), builds the redirect URI from the incoming request
+  (`x-forwarded-proto`-aware), and redirects to the IdP with a random `state`
+  stored in an `httpOnly` `oidc_state` cookie.
+- `GET /api/auth/oidc/callback` validates `state`, exchanges the authorization
+  code, and verifies the ID token's signature via the issuer's JWKS
+  (`jose`'s `createRemoteJWKSet`, cached per JWKS URI) with `issuer`/`audience`
+  checks. An optional `oidcAllowedSubjects` allowlist matches the token's
+  `sub` claim or its `email` claim — the email claim is only honored when
+  `email_verified === true`, so an unverified email at the IdP can never pass
+  the gate.
+- On success it mints the **exact same** 30-day `auth_token` JWT the password
+  login issues (`src/app/api/auth/login/route.ts`), so the rest of the
+  dashboard session pipeline (auto-refresh, cookie flags) is unchanged —
+  OIDC only replaces how the cookie gets minted, not what it grants.
+
 ## Route Classes
 
 `src/server/authz/types.ts` defines three classes; any route that cannot be classified deterministically falls back to `MANAGEMENT`.
@@ -82,24 +108,48 @@ A successful policy returns `AuthSubject` with `kind ∈ { client_api_key, dashb
 
 `src/shared/constants/publicApiRoutes.ts` is the explicit allowlist:
 
+The list is split by **shape**, and the split is load-bearing (GHSA-74g9-q8f6-793h): a prefix is
+matched with `startsWith()`, so it also matches every adjacent path sharing its leading characters.
+`/api/usage/om-usage` as a prefix marked `/api/usage/om-usage<anything>` PUBLIC, and Next resolves
+that to `/api/usage/[connectionId]` — a handler with no auth of its own.
+
 ```ts
+// Genuine subtrees. Every entry MUST end in "/" (asserted by a unit test).
 PUBLIC_API_ROUTE_PREFIXES = [
+  "/api/auth/oidc/",
+  "/api/v1/", // treated as CLIENT_API in classify, not as "no-auth public"
+  "/api/oauth/",
+  "/api/codex/connect/",
+  "/api/telegram/",
+  "/api/cursor-cli/",
+];
+
+// Single routes, matched EXACTLY (with or without a trailing slash).
+PUBLIC_API_ROUTES_EXACT = new Set([
   "/api/auth/login",
   "/api/auth/logout",
   "/api/auth/status",
   "/api/init",
-  "/api/v1/", // treated as CLIENT_API in classify, not as "no-auth public"
-  "/api/cloud/",
   "/api/sync/bundle",
-  "/api/oauth/",
+  "/api/cli/connect",
+  "/api/usage/om-usage",
+  "/api/skills/collect/chaos",
+]);
+
+// Read-only single routes that also take the CORS origin relaxation.
+PUBLIC_READONLY_CORS_API_ROUTES = [
+  "/api/health/ping",
+  "/api/monitoring/health",
+  "/api/settings/require-login",
 ];
 
-PUBLIC_READONLY_API_ROUTE_PREFIXES = ["/api/monitoring/health", "/api/settings/require-login"];
+// Read-only single route WITHOUT the CORS relaxation.
+PUBLIC_READONLY_API_ROUTES_EXACT = new Set(["/api/health"]);
 
 PUBLIC_READONLY_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 ```
 
-Read-only prefixes are public **only** for safe methods. Note: `classifyRoute()` excludes `/api/v1/*` and `/api/v1beta/*` from the PUBLIC fall-through — those are always `CLIENT_API` so the Bearer-key policy still applies.
+Read-only routes are public **only** for safe methods. Note: `classifyRoute()` excludes `/api/v1/*` and `/api/v1beta/*` from the PUBLIC fall-through — those are always `CLIENT_API` so the Bearer-key policy still applies.
 
 ## Adding a New Route
 
@@ -142,7 +192,7 @@ export async function POST(request: Request) {
 
 ### Pattern 3 — Adding to the public allowlist
 
-Add the prefix to `PUBLIC_API_ROUTE_PREFIXES` (or `PUBLIC_READONLY_API_ROUTE_PREFIXES` for GET-only). Update unit tests at `tests/unit/public-api-routes.test.ts` and `tests/unit/authz/classify.test.ts`.
+Pick the set by shape, not by convenience. One route goes in `PUBLIC_API_ROUTES_EXACT` (or `PUBLIC_READONLY_CORS_API_ROUTES` for GET-only); only a genuine subtree goes in `PUBLIC_API_ROUTE_PREFIXES`, and it **must end in `/`**. Putting a single route in the prefix list also publishes every adjacent path that shares its leading characters — including dynamic-segment siblings added later (GHSA-74g9-q8f6-793h). Update unit tests at `tests/unit/public-api-routes.test.ts`, `tests/unit/authz/public-route-exact-match.test.ts` and `tests/unit/authz/classify.test.ts`.
 
 ## Scopes
 

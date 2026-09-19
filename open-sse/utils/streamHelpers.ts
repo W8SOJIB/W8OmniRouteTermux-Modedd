@@ -13,6 +13,7 @@
 
 import { FORMATS } from "../translator/formats.ts";
 import { hasAnyReasoningSignal } from "./reasoningFields.ts";
+import { getRegistryEntry } from "../config/providerRegistry.ts";
 
 type SSEPayloadOptions = {
   eventType?: string;
@@ -212,9 +213,15 @@ export function createSSEDataLineNormalizer(): SSEDataLineNormalizer {
   };
 }
 
-export function createSSEEventPrefixBuffer(): SSEEventPrefixBuffer {
+export function createSSEEventPrefixBuffer(options?: { forwardEvent?: boolean }): SSEEventPrefixBuffer {
   let lines: string[] = [];
   let emitted = false;
+  // The `event:` line is only part of the SSE framing for protocols that define
+  // it (OpenAI Responses API, Claude Messages API). For a plain OpenAI
+  // Chat-Completions-format client there is no `event:` field at all, so it must
+  // not be forwarded. Defaults to true to preserve prior behavior for client
+  // formats that declare no explicit preference (#10017).
+  const forwardEvent = options?.forwardEvent !== false;
   const hasUnemitted = () => lines.length > 0 && !emitted;
   const prefix = (output: string) => {
     if (!hasUnemitted()) return output;
@@ -240,6 +247,14 @@ export function createSSEEventPrefixBuffer(): SSEEventPrefixBuffer {
       return line.startsWith("data:") ? prefix(output) : output;
     },
     remember(line) {
+      const trimmed = line.trim();
+      // `id:`/`retry:` and bare `:` comment lines are not part of any of the
+      // OpenAI Chat-Completions, OpenAI Responses, or Claude Messages SSE
+      // protocols — never buffer (and thus never re-forward) them (#10017).
+      if (/^(?::|id:|retry:)/i.test(trimmed)) return;
+      // `event:` framing is only forwarded for protocols that define it; drop it
+      // for plain OpenAI Chat-Completions-format clients.
+      if (/^event:/i.test(trimmed) && !forwardEvent) return;
       lines.push(line);
       emitted = false;
     },
@@ -315,6 +330,22 @@ function hasGeminiCandidateStreamValue(parsed: Record<string, unknown>): boolean
       return isRecord(part.functionCall) || isRecord(part.executableCode);
     });
   });
+}
+
+// Issue #7285: an OpenAI-shape SSE stream that closes without ever emitting a
+// chunk carrying `finish_reason` (and without a `data: [DONE]` sentinel) is a
+// truncated response — combo failover needs to detect that shape independently
+// of `hasOpenAICompatibleStreamValue()` (which only looks for *content*, not
+// the terminal marker). Kept alongside the other shape-detection helpers so
+// callers can distinguish "OpenAI-shape chunk seen" from "OpenAI-shape stream
+// reached its terminal marker".
+export function isOpenAIChoicesPayload(parsed: Record<string, unknown>): boolean {
+  return Array.isArray(parsed.choices);
+}
+
+export function hasOpenAIFinishReason(parsed: Record<string, unknown>): boolean {
+  if (!Array.isArray(parsed.choices)) return false;
+  return parsed.choices.some((choice) => isRecord(choice) && choice.finish_reason != null);
 }
 
 export function isKnownNonClaudeStreamPayload(
@@ -432,8 +463,8 @@ export function fixInvalidId(parsed: Record<string, unknown>): boolean {
 // Remove null perf_metrics from usage (common across formats)
 function cleanPerfMetrics(data: unknown): unknown {
   if (isRecord(data) && isRecord(data.usage) && data.usage.perf_metrics === null) {
-    const { perf_metrics, ...usageWithoutPerf } = data.usage;
-    return { ...data, usage: usageWithoutPerf };
+    // Mutate in-place to avoid spread copy per chunk — data is ephemeral, used only for serialization.
+    delete data.usage.perf_metrics;
   }
   return data;
 }
@@ -457,4 +488,74 @@ export function formatSSE(data: unknown, sourceFormat: string): string {
   }
 
   return `data: ${JSON.stringify(data)}\n\n`;
+}
+
+/**
+ * Build a synthetic OpenAI-shaped chat completion chunk for a manually
+ * assembled SSE delta (end-of-stream flushes, textual tool-call fallback,
+ * think-tag reasoning flush, terminal finish_reason synthesis, etc). Reuses
+ * the same `id`/`created` fallback and `choices[0]` shape every passthrough
+ * flush site needs.
+ */
+export function buildSyntheticChatChunk(
+  responsesId: string | null | undefined,
+  model: string | null | undefined,
+  delta: Record<string, unknown>,
+  finishReason: string | null = null
+): Record<string, unknown> {
+  return {
+    id: responsesId || `chatcmpl-${Date.now()}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model: model || "unknown",
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  };
+}
+
+const STREAM_SUMMARY_TEXT_LIMIT = 64 * 1024;
+
+// Bounded accumulator for streamed content/reasoning text — caps memory on long streams
+// by keeping only the tail once the limit is reached, instead of growing unbounded.
+export function appendBoundedText(current: string, next: string): string {
+  if (!next) return current;
+  // Avoid allocating `current + next` when already at/above limit — slide the window instead.
+  if (current.length >= STREAM_SUMMARY_TEXT_LIMIT) {
+    const keep = STREAM_SUMMARY_TEXT_LIMIT - next.length;
+    if (keep <= 0) return next.slice(-STREAM_SUMMARY_TEXT_LIMIT);
+    return current.slice(-keep) + next;
+  }
+  const combined = current + next;
+  if (combined.length <= STREAM_SUMMARY_TEXT_LIMIT) return combined;
+  return combined.slice(-STREAM_SUMMARY_TEXT_LIMIT);
+}
+
+/** Per-chunk recursive check for meaningful delta content. Hoisted to avoid closure re-allocation in hot-path. */
+export function hasActiveDeltaValue(value: unknown): boolean {
+  if (typeof value === "string") return value.length > 0;
+  if (Array.isArray(value)) return value.some((entry) => hasActiveDeltaValue(entry));
+  if (value && typeof value === "object") {
+    return Object.values(value).some((entry) => hasActiveDeltaValue(entry));
+  }
+  return value !== null && value !== undefined;
+}
+
+// Claude SSE content_block_start normalization for providers (e.g. MiniMax) whose thinking
+// blocks omit `signature` on the opening event. Strict Anthropic Messages clients deserialize
+// this field before a later signature_delta arrives — inject only the empty envelope
+// placeholder, never synthesize/replace a provider-supplied signature.
+export function injectThinkingSignature(
+  parsed: { type?: string; content_block?: { type?: string; signature?: string } },
+  provider: string | null
+): boolean {
+  if (
+    provider !== null &&
+    getRegistryEntry(provider)?.ensureThinkingSignature === true &&
+    parsed.type === "content_block_start" &&
+    parsed.content_block?.type === "thinking" &&
+    parsed.content_block.signature === undefined
+  ) {
+    parsed.content_block.signature = "";
+    return true;
+  }
+  return false;
 }

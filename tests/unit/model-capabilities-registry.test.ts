@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { MODEL_SPECS } from "../../src/shared/constants/modelSpecs.ts";
 
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-model-capabilities-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
@@ -36,7 +37,7 @@ function buildCapability(overrides = {}) {
 
 function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -46,7 +47,7 @@ test.beforeEach(() => {
 
 test.after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("canonical model capability resolver lets exact synced metadata override global specs", () => {
@@ -68,9 +69,8 @@ test("canonical model capability resolver lets exact synced metadata override gl
       }),
     },
     antigravity: {
-      // Since #3229, ANTIGRAVITY_MODEL_ALIASES maps both "gemini-3.1-pro-high" and
-      // "gemini-3.1-pro-low" → "gemini-3.1-pro", so the capability resolver looks
-      // synced metadata up under the canonical "gemini-3.1-pro" key. Save it there.
+      // gemini-pro-agent is the callable High id and resolves to the shared
+      // Gemini 3.1 Pro capability family.
       "gemini-3.1-pro": buildCapability({
         tool_call: false,
         reasoning: false,
@@ -92,19 +92,14 @@ test("canonical model capability resolver lets exact synced metadata override gl
   assert.equal(modelCapabilities.getModelContextLimit("openai", "gpt-4o-2024-11-20"), 256000);
   assert.equal(modelCapabilities.capMaxOutputTokens("openai/gpt-4o-2024-11-20", 999999), 12345);
 
-  const geminiHigh = modelCapabilities.getResolvedModelCapabilities(
-    "antigravity/gemini-3.1-pro-high"
-  );
+  const geminiHigh = modelCapabilities.getResolvedModelCapabilities("antigravity/gemini-pro-agent");
   assert.equal(geminiHigh.toolCalling, false);
   assert.equal(geminiHigh.reasoning, false);
   assert.equal(geminiHigh.supportsThinking, false);
   assert.equal(geminiHigh.contextWindow, 1024);
   assert.equal(geminiHigh.maxOutputTokens, 9999);
   assert.equal(geminiHigh.defaultThinkingBudget, 24576);
-  assert.equal(
-    modelCapabilities.capThinkingBudget("antigravity/gemini-3.1-pro-high", 40000),
-    32768
-  );
+  assert.equal(modelCapabilities.capThinkingBudget("antigravity/gemini-pro-agent", 40000), 32768);
 
   const codexGpt55 = modelCapabilities.getResolvedModelCapabilities("codex/gpt-5.5");
   assert.equal(codexGpt55.contextWindow, 400000);
@@ -157,6 +152,34 @@ test("unknown models keep maxOutputTokens null instead of using a generic defaul
     modelCapabilities.capMaxOutputTokens("openai-compatible-local/custom-large-output-model"),
     null
   );
+});
+
+test("retired Gemini 3.5 Flash IDs have no provider-neutral model specs", () => {
+  for (const modelId of [
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-extra-low",
+    "gemini-3.5-flash-low",
+    "gemini-3-flash-agent",
+  ]) {
+    assert.equal(MODEL_SPECS[modelId], undefined, modelId);
+  }
+});
+
+test("Antigravity Gemini 3.7 tier IDs share the Flash capability profile", () => {
+  for (const modelId of [
+    "gemini-3.7-flash-high",
+    "gemini-3.7-flash-medium",
+    "gemini-3.7-flash-low",
+  ]) {
+    const spec = MODEL_SPECS[modelId];
+    assert.ok(spec, `missing exact MODEL_SPECS entry for ${modelId}`);
+    const capabilities = modelCapabilities.getResolvedModelCapabilities(`antigravity/${modelId}`);
+    assert.equal(capabilities.contextWindow, 1048576, modelId);
+    assert.equal(capabilities.maxOutputTokens, 65536, modelId);
+    assert.equal(capabilities.supportsThinking, true, modelId);
+    assert.equal(capabilities.supportsTools, true, modelId);
+    assert.equal(capabilities.supportsVision, true, modelId);
+  }
 });
 
 test("GPT OSS and DeepSeek Reasoner models support tool calling", () => {

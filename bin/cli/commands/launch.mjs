@@ -1,8 +1,9 @@
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { join } from "node:path";
 import os from "node:os";
 import { t } from "../i18n.mjs";
 import { resolveActiveContext } from "../contexts.mjs";
+import { quoteShellArgs } from "../utils/winShellArgs.mjs";
 
 function stripTrailingSlash(value) {
   let s = String(value);
@@ -91,6 +92,78 @@ export function resolveLaunchTarget(opts = {}) {
 }
 
 /**
+ * Probe PATH for a Windows executable via `where.exe`, preferring a `.exe` over
+ * a `.cmd`/`.bat` shim. Returns the absolute path to the preferred binary, or
+ * `null` when `where.exe` finds nothing (or cannot run).
+ *
+ * The native Anthropic installer (#9454) creates only `claude.exe` (no npm
+ * `.cmd` shim), so the launcher must look for the real PE and spawn it without
+ * a shell. Mirrors the existing `locateCommand()` probe in
+ * `src/shared/services/cliRuntime.ts`.
+ *
+ * @param {string} command  bare command name to look up
+ * @returns {Promise<string|null>} absolute path to the preferred match, or null
+ */
+function probeWindowsBinary(command) {
+  try {
+    const out = execFileSync("where.exe", [command], {
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8",
+      timeout: 3000,
+      windowsHide: true,
+    });
+    const lines = out
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length === 0) return null;
+    const winExt = /\.(exe|cmd|bat|com)$/i;
+    return lines.find((l) => winExt.test(l)) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * #8246 / #9454: on Windows, npm installs claude as a `.cmd` shim — spawn()
+ * without a shell cannot resolve PATHEXT shims (and Node refuses to exec `.cmd`
+ * directly since CVE-2024-27980), so the npm-shim path must go through cmd.exe.
+ * But the native installer creates only `claude.exe`, which is a real PE that
+ * must NOT go through a shell (cmd.exe would split an absolute path with spaces).
+ *
+ * So probe PATH for `claude` first: when `where.exe` resolves a `.exe`, spawn it
+ * directly (no shell); otherwise fall back to the npm `claude.cmd` + shell. Off
+ * Windows the bare binary is spawned unchanged (no shell, no probe).
+ *
+ * @param {NodeJS.Platform|string} platform
+ * @param {{ probe?: (command: string) => Promise<string|null> }} [opts]  injectable probe for tests
+ * @returns {Promise<{ command: string, shell: true|undefined }>}
+ */
+export async function resolveClaudeSpawn(platform, opts = {}) {
+  if (platform !== "win32") return { command: "claude", shell: undefined };
+  const probe = opts.probe ?? probeWindowsBinary;
+  const located = await probe("claude");
+  if (located && /\.exe$/i.test(located)) {
+    return { command: located, shell: undefined };
+  }
+  return { command: "claude.cmd", shell: true };
+}
+
+/**
+ * `shell: true` makes Node join argv with plain spaces and no escaping (the
+ * DEP0190 warning), so `-p "two words"` used to reach claude as `-p two` plus
+ * three stray positional arguments. Quote the args ourselves on that path.
+ * Off Windows there is no shell, so argv is passed through untouched.
+ *
+ * @param {string[]} args
+ * @param {NodeJS.Platform|string} platform
+ * @returns {string[]}
+ */
+export function quoteClaudeArgs(args, platform) {
+  return quoteShellArgs(args, platform);
+}
+
+/**
  * @param {{port?:string, remote?:string, token?:string, apiKey?:string, profile?:string, claudeHome?:string}} opts
  * @param {string[]} claudeArgs  pass-through args for the claude binary
  * @returns {Promise<number>} exit code
@@ -106,10 +179,10 @@ export async function runLaunchCommand(opts = {}, claudeArgs = []) {
     if (!res.ok) throw new Error(`status ${res.status}`);
   } catch {
     console.error(
-      (t("launch.notRunning") || "OmniRoute is not reachable at {port}. Start it with 'omniroute serve'.").replace(
-        "{port}",
-        baseUrl
-      )
+      (
+        t("launch.notRunning") ||
+        "OmniRoute is not reachable at {port}. Start it with 'omniroute serve'."
+      ).replace("{port}", baseUrl)
     );
     return 1;
   }
@@ -117,20 +190,57 @@ export async function runLaunchCommand(opts = {}, claudeArgs = []) {
   const configDir = opts.profile
     ? join(opts.claudeHome || join(os.homedir(), ".claude"), "profiles", opts.profile)
     : undefined;
-  const env = buildClaudeEnv(process.env, baseUrl, authToken, { configDir });
+  const env = buildClaudeEnv(process.env, baseUrl, authToken, {
+    configDir,
+    model: opts.model,
+  });
+
+  const { command, shell } = await resolveClaudeSpawn(process.platform);
 
   return await new Promise((resolve) => {
-    const child = spawn("claude", claudeArgs, { env, stdio: "inherit" });
+    const child = spawn(command, quoteClaudeArgs(claudeArgs, process.platform), {
+      env,
+      stdio: "inherit",
+      shell,
+      ...(process.platform === "win32" ? { windowsHide: true } : {}),
+    });
+    let settled = false;
+    const signalExitCode = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 };
+    const signalHandlers = {};
+    const cleanupSignalHandlers = () => {
+      for (const signal of Object.keys(signalExitCode)) {
+        process.removeListener(signal, signalHandlers[signal]);
+      }
+    };
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      cleanupSignalHandlers();
+      resolve(code);
+    };
+    for (const signal of Object.keys(signalExitCode)) {
+      signalHandlers[signal] = () => {
+        try {
+          child.kill(signal);
+        } catch {
+          // The child may have already exited between the signal and cleanup.
+        }
+        finish(signalExitCode[signal]);
+      };
+      process.once(signal, signalHandlers[signal]);
+    }
     child.on("error", (err) => {
       if (err && err.code === "ENOENT") {
         console.error(t("launch.notFound") || "The 'claude' CLI was not found in PATH.");
-        resolve(127);
+        finish(127);
       } else {
         console.error(String(err?.message || err));
-        resolve(1);
+        finish(1);
       }
     });
-    child.on("exit", (code) => resolve(code ?? 0));
+    child.on("exit", (code, signalName) => {
+      finish(code ?? signalExitCode[signalName] ?? 0);
+    });
   });
 }
 
@@ -142,14 +252,20 @@ export function registerLaunch(program) {
     )
     .option("--port <port>", t("serve.port") || "Proxy port", "20128")
     .option("--remote <url>", "Remote OmniRoute base URL (overrides --port and the active context)")
-    .option("--profile <name>", "Claude Code profile to use (CLAUDE_CONFIG_DIR ~/.claude/profiles/<name>)")
+    .option(
+      "--profile <name>",
+      "Claude Code profile to use (CLAUDE_CONFIG_DIR ~/.claude/profiles/<name>)"
+    )
     .option("--token <token>", t("launch.token") || "Token Claude sends (ANTHROPIC_AUTH_TOKEN)")
     .option("--api-key <key>", "Alias for --token (OmniRoute access token / API key)")
     .allowUnknownOption(true)
     .allowExcessArguments(true)
     .argument("[claudeArgs...]", "arguments passed through to the claude binary")
     .action(async (claudeArgs, opts) => {
-      const exitCode = await runLaunchCommand(opts, claudeArgs ?? []);
-      if (exitCode !== 0) process.exit(exitCode);
+      // process.exit() here aborted the process with a libuv assertion on
+      // Windows (`!(handle->flags & UV_HANDLE_CLOSING)`, async.c:94): it tears
+      // the loop down while the inherited stdio handles of the just-exited
+      // child are still closing. Setting exitCode lets the loop drain first.
+      process.exitCode = await runLaunchCommand(opts, claudeArgs ?? []);
     });
 }

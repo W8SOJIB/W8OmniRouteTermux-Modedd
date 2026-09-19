@@ -8,12 +8,13 @@ const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-command-c
 process.env.DATA_DIR = TEST_DATA_DIR;
 
 const { REGISTRY, getRegistryEntry } = await import("../../open-sse/config/providerRegistry.ts");
-const { CommandCodeExecutor, COMMAND_CODE_VERSION } =
-  await import("../../open-sse/executors/commandCode.ts");
+const { CommandCodeExecutor } = await import("../../open-sse/executors/commandCode.ts");
 const { getExecutor, hasSpecializedExecutor } = await import("../../open-sse/executors/index.ts");
 const core = await import("../../src/lib/db/core.ts");
 
 const originalFetch = globalThis.fetch;
+
+type FetchCall = { url: string; init: Record<string, unknown>; body?: Record<string, unknown> };
 
 const PINNED_COMMAND_CODE_MODELS = [
   "claude-opus-4-7",
@@ -36,20 +37,7 @@ const PINNED_COMMAND_CODE_MODELS = [
   "Qwen/Qwen3.6-Plus",
 ];
 
-function commandCodeStream(lines: unknown[], { sse = false } = {}) {
-  const text = lines
-    .map((line) => {
-      const json = JSON.stringify(line);
-      return sse ? `data: ${json}\n\n` : `${json}\n`;
-    })
-    .join("");
-  return new Response(text, { status: 200, headers: { "Content-Type": "application/x-ndjson" } });
-}
-
-function toPlainHeaders(headers: Headers | Record<string, string>) {
-  if (headers instanceof Headers) return Object.fromEntries(headers.entries());
-  return Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, String(value)]));
-}
+const CHAT_URL = "https://api.commandcode.ai/provider/v1/chat/completions";
 
 function parseSsePayloads(sse: string) {
   return sse
@@ -60,6 +48,23 @@ function parseSsePayloads(sse: string) {
     .map((line) => JSON.parse(line));
 }
 
+function openAiSse(obj: unknown): string {
+  return `data: ${JSON.stringify(obj)}\n\n`;
+}
+
+function captureFetch(body: Record<string, unknown>) {
+  const calls: FetchCall[] = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({
+      url: String(url),
+      init,
+      body: JSON.parse(String(init.body)),
+    });
+    return new Response(JSON.stringify(body), { status: 200 });
+  };
+  return calls;
+}
+
 test.afterEach(() => {
   globalThis.fetch = originalFetch;
 });
@@ -67,7 +72,7 @@ test.afterEach(() => {
 test.after(() => {
   globalThis.fetch = originalFetch;
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("Command Code provider catalog has pinned models and alias lookup", () => {
@@ -76,7 +81,9 @@ test("Command Code provider catalog has pinned models and alias lookup", () => {
   assert.equal(entry.alias, "cmd");
   assert.equal(entry.executor, "command-code");
   assert.equal(entry.baseUrl, "https://api.commandcode.ai");
-  assert.equal(entry.chatPath, "/alpha/generate");
+  // Chat targets the documented /provider/v1/chat/completions endpoint, NOT the
+  // CLI-only /alpha/generate endpoint (#10265).
+  assert.equal(entry.chatPath, "/provider/v1/chat/completions");
   assert.deepEqual(
     entry.models.map((model) => model.id),
     PINNED_COMMAND_CODE_MODELS
@@ -90,17 +97,10 @@ test("getExecutor returns the specialized Command Code executor", () => {
   assert.ok(getExecutor("cmd") instanceof CommandCodeExecutor);
 });
 
-type FetchCall = { url: string; init: Record<string, unknown>; body?: unknown };
-
-test("Command Code executor posts wrapped body and required headers to /alpha/generate", async () => {
-  const calls: FetchCall[] = [];
-  globalThis.fetch = async (url, init = {}) => {
-    calls.push({ url: String(url), init });
-    return commandCodeStream([{ type: "text-delta", text: "hello" }, { type: "finish" }]);
-  };
-
+test("Command Code executor posts a flat OpenAI body + standard headers to /provider/v1/chat/completions (#10265)", async () => {
+  const calls = captureFetch({});
   const executor = getExecutor("command-code");
-  const { response, url, headers, transformedBody } = await executor.execute({
+  const { response, url, headers } = await executor.execute({
     model: "gpt-5.4-mini",
     stream: false,
     credentials: { apiKey: "cc_test_key" },
@@ -115,41 +115,34 @@ test("Command Code executor posts wrapped body and required headers to /alpha/ge
     },
   });
 
-  assert.equal(url, "https://api.commandcode.ai/alpha/generate");
+  assert.equal(url, CHAT_URL);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, "https://api.commandcode.ai/alpha/generate");
+  assert.equal(calls[0].url, CHAT_URL);
   assert.equal(calls[0].init.method, "POST");
   assert.equal(headers.Authorization, "Bearer cc_test_key");
-  assert.equal(headers["x-command-code-version"], COMMAND_CODE_VERSION);
-  assert.equal(headers["x-cli-environment"], "external");
-  assert.equal(headers["x-project-slug"], "pi-cc");
-  assert.equal(headers["x-taste-learning"], "false");
-  assert.equal(headers["x-co-flag"], "false");
-  assert.equal(typeof headers["x-session-id"], "string");
+  // No CLI-impersonation headers.
+  assert.equal(headers["x-command-code-version"], undefined);
+  assert.equal(headers["x-cli-environment"], undefined);
+  assert.equal(headers["x-project-slug"], undefined);
 
-  const posted = JSON.parse(String(calls[0].init.body));
-  assert.deepEqual(posted, transformedBody);
-  for (const key of ["config", "memory", "taste", "skills", "permissionMode", "params"]) {
-    assert.ok(key in posted, `missing ${key}`);
-  }
-  assert.equal(posted.skills, "");
-  assert.equal(posted.params.model, "gpt-5.4-mini");
-  assert.equal(posted.params.stream, true);
-  assert.equal(posted.params.system, "You are concise.");
-  assert.equal(posted.params.messages[0].role, "user");
-  assert.equal(posted.params.tools[0].name, "lookup");
+  const posted = calls[0].body as Record<string, unknown>;
+  // No CLI envelope.
+  assert.equal(posted.config, undefined, "CLI envelope config must not be sent");
+  assert.equal(posted.params, undefined, "CLI envelope params wrapper must not be sent");
+  assert.equal(posted.model, "gpt-5.4-mini");
+  assert.equal(posted.stream, false);
+  assert.equal((posted.messages as Array<{ role: string }>)[0].role, "system");
+  const tool = (posted.tools as Array<{ function: { name: string } }>)[0];
+  assert.equal(tool.function.name, "lookup", "tools in OpenAI shape (function.name)");
+  assert.equal(posted.max_tokens, 42);
 
+  // The upstream OpenAI JSON passes through untouched.
   const json = await response.json();
-  assert.equal(json.choices[0].message.content, "hello");
+  assert.deepEqual(json, {});
 });
 
-test("Command Code executor passes reasoning/thinking fields through to params (#2986 follow-up)", async () => {
-  const calls: FetchCall[] = [];
-  globalThis.fetch = async (url, init = {}) => {
-    calls.push({ url: String(url), init });
-    return commandCodeStream([{ type: "text-delta", text: "ok" }, { type: "finish" }]);
-  };
-
+test("Command Code executor passes reasoning/thinking fields through at the top level of the OpenAI body", async () => {
+  const calls = captureFetch({});
   await getExecutor("command-code").execute({
     model: "deepseek/deepseek-v4-pro",
     stream: false,
@@ -160,30 +153,19 @@ test("Command Code executor passes reasoning/thinking fields through to params (
       reasoning_effort: "high",
       thinking: { type: "enabled" },
       effort: "high",
-      output_config: { effort: "high" },
       extra_body: { enable_thinking: true },
     },
   });
 
-  const posted = JSON.parse(String(calls[0].init.body));
-  assert.equal(posted.params.reasoning_effort, "high");
-  assert.deepEqual(posted.params.thinking, { type: "enabled" });
-  assert.equal(posted.params.effort, "high");
-  assert.deepEqual(posted.params.output_config, { effort: "high" });
-  assert.deepEqual(posted.params.extra_body, { enable_thinking: true });
+  const posted = calls[0].body as Record<string, unknown>;
+  assert.equal(posted.reasoning_effort, "high");
+  assert.deepEqual(posted.thinking, { type: "enabled" });
+  assert.equal(posted.effort, "high");
+  assert.deepEqual(posted.extra_body, { enable_thinking: true });
 });
 
 test("Command Code executor honors body.model rewrite from payload rules", async () => {
-  const calls: FetchCall[] = [];
-  globalThis.fetch = async (url, init = {}) => {
-    calls.push({ url: String(url), init });
-    return commandCodeStream([{ type: "text-delta", text: "ok" }, { type: "finish" }]);
-  };
-
-  // Simulate a payload-rule rewrite: combo resolves to "deepseek-v4-pro-max"
-  // (passed as the execute() model arg), but the payload rule overwrites
-  // body.model to "deepseek/deepseek-v4-pro" (the vendor-prefixed form
-  // Command Code's API expects).
+  const calls = captureFetch({});
   await getExecutor("command-code").execute({
     model: "deepseek-v4-pro-max",
     stream: false,
@@ -196,21 +178,58 @@ test("Command Code executor honors body.model rewrite from payload rules", async
     },
   });
 
-  const posted = JSON.parse(String(calls[0].init.body));
-  assert.equal(posted.params.model, "deepseek/deepseek-v4-pro");
-  assert.equal(posted.params.reasoning_effort, "max");
+  const posted = calls[0].body as Record<string, unknown>;
+  assert.equal(posted.model, "deepseek/deepseek-v4-pro");
+  assert.equal(posted.reasoning_effort, "max");
 });
 
-test("Command Code raw NDJSON stream becomes OpenAI chat SSE chunks", async () => {
-  const calls: FetchCall[] = [];
+test("Command Code executor maps unsupported minimal reasoning_effort to low (upstream 400 regression)", async () => {
+  const calls = captureFetch({});
+  // `minimal` (a Muse Spark catalog tier) must be downgraded to `low` before
+  // the wire body is built, on BOTH the combo and single-model paths.
+  await getExecutor("command-code").execute({
+    model: "poolside/laguna-s-2.1-free",
+    stream: false,
+    credentials: { apiKey: "cc_test_key" },
+    body: {
+      stream: false,
+      messages: [{ role: "user", content: "Hi" }],
+      reasoning_effort: "minimal",
+    },
+  });
+
+  const posted = calls[0].body as Record<string, unknown>;
+  assert.equal(posted.reasoning_effort, "low", "minimal must map to low");
+});
+
+test("Command Code executor passes the upstream OpenAI SSE stream through untouched", async () => {
+  const sse =
+    openAiSse({
+      id: "c1",
+      object: "chat.completion.chunk",
+      model: "gpt-5.4",
+      choices: [{ index: 0, delta: { role: "assistant" } }],
+    }) +
+    openAiSse({
+      id: "c1",
+      object: "chat.completion.chunk",
+      model: "gpt-5.4",
+      choices: [{ index: 0, delta: { content: "Hello" } }],
+    }) +
+    openAiSse({
+      id: "c1",
+      object: "chat.completion.chunk",
+      model: "gpt-5.4",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    }) +
+    "data: [DONE]\n\n";
+  let capturedStreamFlag: unknown = null;
   globalThis.fetch = async (url, init = {}) => {
-    calls.push({ url: String(url), init, body: JSON.parse(String(init.body)) });
-    return commandCodeStream([
-      { type: "text-delta", text: "Hello" },
-      { type: "reasoning-delta", text: "thinking" },
-      { type: "tool-call", toolCallId: "call_1", toolName: "search", input: { q: "docs" } },
-      { type: "finish", finishReason: "tool-calls" },
-    ]);
+    capturedStreamFlag = JSON.parse(String(init.body)).stream;
+    return new Response(sse, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    });
   };
 
   const { response } = await getExecutor("command-code").execute({
@@ -220,39 +239,32 @@ test("Command Code raw NDJSON stream becomes OpenAI chat SSE chunks", async () =
     body: { messages: [{ role: "user", content: "Hi" }] },
   });
 
-  assert.equal(calls[0].body.params.stream, true);
-  assert.equal(response.headers.get("Content-Type"), "text/event-stream; charset=utf-8");
-  const sse = await response.text();
-  assert.match(sse, /data: \[DONE\]/);
-  const chunks = parseSsePayloads(sse);
-  assert.equal(chunks[0].object, "chat.completion.chunk");
-  assert.deepEqual(chunks[0].choices[0].delta, { role: "assistant" });
+  assert.equal(capturedStreamFlag, true, "stream flag forwarded to upstream");
+  const text = await response.text();
+  assert.equal(text, sse, "OpenAI SSE stream passed through byte-for-byte");
+  assert.ok(text.includes("data: [DONE]"));
+  const chunks = parseSsePayloads(text);
+  assert.equal(chunks[0].choices[0].delta.role, "assistant");
   assert.equal(chunks[1].choices[0].delta.content, "Hello");
-  assert.equal(chunks[2].choices[0].delta.reasoning_content, "thinking");
-  assert.equal(chunks[3].choices[0].delta.tool_calls[0].function.name, "search");
-  assert.equal(chunks.at(-1).choices[0].finish_reason, "tool_calls");
+  assert.equal(chunks[2].choices[0].finish_reason, "stop");
 });
 
-test("Command Code data: SSE lines aggregate into non-stream ChatCompletion JSON", async () => {
-  globalThis.fetch = async () =>
-    commandCodeStream(
-      [
-        { type: "text-delta", text: "Hel" },
-        { type: "text-delta", text: "lo" },
-        { type: "reasoning-delta", text: "because" },
-        { type: "tool-call", id: "call_2", name: "lookup", arguments: { id: 7 } },
-        {
-          type: "finish",
-          finishReason: "max_tokens",
-          totalUsage: {
-            inputTokens: 3,
-            inputTokenDetails: { cacheReadTokens: 2 },
-            outputTokens: 5,
-          },
-        },
-      ],
-      { sse: true }
-    );
+test("Command Code executor passes the upstream OpenAI JSON through untouched (non-stream)", async () => {
+  const upstreamJson = {
+    id: "chatcmpl-1",
+    object: "chat.completion",
+    model: "gpt-5.4-mini",
+    choices: [{ index: 0, message: { role: "assistant", content: "Hello" }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+  };
+  let capturedStreamFlag: unknown = null;
+  globalThis.fetch = async (url, init = {}) => {
+    capturedStreamFlag = JSON.parse(String(init.body)).stream;
+    return new Response(JSON.stringify(upstreamJson), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
 
   const { response } = await getExecutor("command-code").execute({
     model: "gpt-5.4-mini",
@@ -261,19 +273,12 @@ test("Command Code data: SSE lines aggregate into non-stream ChatCompletion JSON
     body: { messages: [{ role: "user", content: "Hi" }] },
   });
 
-  assert.equal(response.headers.get("Content-Type"), "application/json");
-  const json = await response.json();
-  assert.equal(json.object, "chat.completion");
-  assert.equal(json.choices[0].message.content, "Hello");
-  assert.equal(json.choices[0].message.reasoning_content, "because");
-  assert.equal(json.choices[0].message.tool_calls[0].function.arguments, JSON.stringify({ id: 7 }));
-  assert.equal(json.choices[0].finish_reason, "length");
-  assert.deepEqual(json.usage, { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 });
+  assert.equal(capturedStreamFlag, false, "stream flag forwarded as false for non-stream");
+  assert.deepEqual(await response.json(), upstreamJson);
 });
 
-test("Command Code executor surfaces upstream and streamed errors", async () => {
-  globalThis.fetch = async () =>
-    new Response("bad key", { status: 401, statusText: "Unauthorized" });
+test("Command Code executor surfaces upstream errors", async () => {
+  globalThis.fetch = async () => new Response("bad key", { status: 401, statusText: "Unauthorized" });
   const upstreamFailure = await getExecutor("command-code").execute({
     model: "gpt-5.4-mini",
     stream: false,
@@ -282,106 +287,81 @@ test("Command Code executor surfaces upstream and streamed errors", async () => 
   });
   assert.equal(upstreamFailure.response.status, 401);
   assert.equal(await upstreamFailure.response.text(), "bad key");
-
-  globalThis.fetch = async () => commandCodeStream([{ type: "error", error: { message: "boom" } }]);
-  await assert.rejects(async () => {
-    await getExecutor("command-code").execute({
-      model: "gpt-5.4-mini",
-      stream: false,
-      credentials: { apiKey: "cc_test_key" },
-      body: { messages: [{ role: "user", content: "Hi" }] },
-    });
-  }, /boom/);
 });
 
-test("Command Code executor omits max_tokens when the client does not supply one (GLM-5.x)", async () => {
-  const calls: FetchCall[] = [];
-  globalThis.fetch = async (url, init = {}) => {
-    calls.push({ url: String(url), init, body: JSON.parse(String(init.body)) });
-    return commandCodeStream([{ type: "text-delta", text: "ok" }, { type: "finish" }]);
-  };
-
-  // No client max_tokens: we must NOT fabricate one. Omitting the field lets
-  // Command Code's upstream apply the model's own native default.
+test("Command Code executor omits max_tokens when the client does not supply one", async () => {
+  const calls = captureFetch({});
   await getExecutor("command-code").execute({
     model: "zai-org/GLM-5.1",
     stream: false,
     credentials: { apiKey: "cc_test_key" },
     body: { messages: [{ role: "user", content: "Hi" }] },
   });
-  assert.ok(!("max_tokens" in calls[0].body.params));
-});
-
-test("Command Code executor omits max_tokens for DeepSeek v4 when the client does not supply one", async () => {
-  const calls: FetchCall[] = [];
-  globalThis.fetch = async (url, init = {}) => {
-    calls.push({ url: String(url), init, body: JSON.parse(String(init.body)) });
-    return commandCodeStream([{ type: "text-delta", text: "ok" }, { type: "finish" }]);
-  };
-
-  // Regression: previously the executor invented max_tokens from the registry
-  // (384000), which /alpha/generate rejects with a 400
-  // "Too big: expected number to be <=200000". With no client value we now omit
-  // the field entirely, so the request succeeds and upstream picks the default.
-  await getExecutor("command-code").execute({
-    model: "deepseek/deepseek-v4-pro",
-    stream: false,
-    credentials: { apiKey: "cc_test_key" },
-    body: { messages: [{ role: "user", content: "Hi" }] },
-  });
-  assert.ok(!("max_tokens" in calls[0].body.params));
+  const posted = calls[0].body as Record<string, unknown>;
+  assert.ok(!("max_tokens" in posted), "must not fabricate max_tokens");
+  assert.ok(!("max_completion_tokens" in posted), "must not fabricate max_completion_tokens");
 });
 
 test("Command Code executor clamps an oversized client-supplied max_tokens to the endpoint ceiling", async () => {
-  const calls: FetchCall[] = [];
-  globalThis.fetch = async (url, init = {}) => {
-    calls.push({ url: String(url), init, body: JSON.parse(String(init.body)) });
-    return commandCodeStream([{ type: "text-delta", text: "ok" }, { type: "finish" }]);
-  };
-
-  // A client asking for more than the 200000 endpoint ceiling is clamped down
-  // (not 400'd), mirroring the provider-driven clamp in antigravity.ts.
+  const calls = captureFetch({});
+  // A client asking for more than the 200000 endpoint ceiling is clamped down.
   await getExecutor("command-code").execute({
     model: "deepseek/deepseek-v4-pro",
     stream: false,
     credentials: { apiKey: "cc_test_key" },
     body: { messages: [{ role: "user", content: "Hi" }], max_tokens: 500000 },
   });
-  assert.equal(calls[0].body.params.max_tokens, 200000);
+  assert.equal((calls[0].body as Record<string, unknown>).max_tokens, 200000);
 });
 
-test("Command Code executor honors a smaller client-provided max_tokens under the per-model cap", async () => {
-  const calls: FetchCall[] = [];
-  globalThis.fetch = async (url, init = {}) => {
-    calls.push({ url: String(url), init, body: JSON.parse(String(init.body)) });
-    return commandCodeStream([{ type: "text-delta", text: "ok" }, { type: "finish" }]);
-  };
-
+test("Command Code executor honors a smaller client-provided max_tokens", async () => {
+  const calls = captureFetch({});
   await getExecutor("command-code").execute({
     model: "zai-org/GLM-5.1",
     stream: false,
     credentials: { apiKey: "cc_test_key" },
     body: { messages: [{ role: "user", content: "Hi" }], max_tokens: 2048 },
   });
-  assert.equal(calls[0].body.params.max_tokens, 2048);
+  assert.equal((calls[0].body as Record<string, unknown>).max_tokens, 2048);
 });
 
-test("Command Code non-stream aggregation throws when the final error event lacks a trailing newline", async () => {
-  globalThis.fetch = async () =>
-    new Response(
-      `${JSON.stringify({ type: "text-delta", text: "Hello" })}\n${JSON.stringify({
-        type: "error",
-        error: { message: "boom" },
-      })}`,
-      { status: 200, headers: { "Content-Type": "application/x-ndjson" } }
-    );
-
-  await assert.rejects(async () => {
-    await getExecutor("command-code").execute({
+test("Command Code stream preserves the upstream OpenAI usage chunk (passthrough)", async () => {
+  const sse =
+    openAiSse({
+      id: "c1",
+      object: "chat.completion.chunk",
       model: "gpt-5.4-mini",
-      stream: false,
-      credentials: { apiKey: "cc_test_key" },
-      body: { messages: [{ role: "user", content: "Hi" }] },
-    });
-  }, /boom/);
+      choices: [{ index: 0, delta: { content: "Hi" } }],
+    }) +
+    openAiSse({
+      id: "c1",
+      object: "chat.completion.chunk",
+      model: "gpt-5.4-mini",
+      choices: [],
+      usage: {
+        prompt_tokens: 10,
+        prompt_tokens_details: { cached_tokens: 4 },
+        completion_tokens: 6,
+        completion_tokens_details: { reasoning_tokens: 1 },
+        total_tokens: 16,
+      },
+    }) +
+    "data: [DONE]\n\n";
+  globalThis.fetch = async () =>
+    new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+
+  const { response } = await getExecutor("command-code").execute({
+    model: "gpt-5.4-mini",
+    stream: true,
+    credentials: { apiKey: "cc_test_key" },
+    body: { messages: [{ role: "user", content: "Hi" }] },
+  });
+
+  const text = await response.text();
+  // The upstream OpenAI usage chunk passes through unchanged, including the
+  // standard OpenAI usage shape the stream pipeline already understands.
+  assert.ok(text.includes('"prompt_tokens":10'));
+  assert.ok(text.includes('"cached_tokens":4'));
+  assert.ok(text.includes('"reasoning_tokens":1'));
+  assert.ok(text.includes("data: [DONE]"));
 });

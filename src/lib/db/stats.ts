@@ -24,9 +24,29 @@ export interface DatabaseStats {
   cacheSize: number;
 }
 
-export function getDatabaseStats(): DatabaseStats {
-  const db = getDbInstance();
+/**
+ * `dbstat` is a compile-time-optional SQLite virtual table (ENABLE_DBSTAT_VTAB).
+ * Builds without it — sql.js/WASM among them — reject the query with either
+ * "no such module: dbstat" or "no such table: dbstat" depending on the build,
+ * and drivers prefix their error class onto the message, so match loosely.
+ *
+ * Per-table byte sizes are a nice-to-have, so probe once and degrade to 0
+ * rather than failing the whole stats call — and with it every caller,
+ * including the database settings API.
+ */
+function isDbstatAvailable(db: SqliteAdapter): boolean {
+  try {
+    db.prepare(`SELECT SUM(pgsize) as size FROM dbstat WHERE name = ?`).get("sqlite_master");
+    return true;
+  } catch (error) {
+    if (error instanceof Error && /no such (module|table): dbstat/i.test(error.message)) {
+      return false;
+    }
+    throw error;
+  }
+}
 
+export function getDatabaseStats(db: SqliteAdapter = getDbInstance()): DatabaseStats {
   const pageSize = db.pragma("page_size", { simple: true }) as number;
   const pageCount = db.pragma("page_count", { simple: true }) as number;
   const cacheSize = db.pragma("cache_size", { simple: true }) as number;
@@ -38,19 +58,35 @@ export function getDatabaseStats(): DatabaseStats {
     )
     .all() as Array<{ name: string }>;
 
-  const tableStats = tables.map((table) => {
-    const rowCount = db.prepare(`SELECT COUNT(*) as count FROM ${table.name}`).get() as {
-      count: number;
-    };
+  const dbstatAvailable = isDbstatAvailable(db);
 
-    const tableSize = db
-      .prepare(`SELECT SUM(pgsize) as size FROM dbstat WHERE name = ?`)
-      .get(table.name) as { size: number | null };
+  const tableStats = tables.map((table) => {
+    let rowCount = 0;
+    try {
+      const quotedName = `"${table.name.replaceAll('"', '""')}"`;
+      const row = db.prepare(`SELECT COUNT(*) as count FROM ${quotedName}`).get() as
+        | { count: number }
+        | undefined;
+      rowCount = row?.count ?? 0;
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith("no such module:")) {
+        throw error;
+      }
+      // Optional virtual-table modules may be unavailable on this connection.
+    }
+
+    let size = 0;
+    if (dbstatAvailable) {
+      const tableSize = db
+        .prepare(`SELECT SUM(pgsize) as size FROM dbstat WHERE name = ?`)
+        .get(table.name) as { size: number | null } | undefined;
+      size = tableSize?.size || 0;
+    }
 
     return {
       name: table.name,
-      rowCount: rowCount.count,
-      size: tableSize?.size || 0,
+      rowCount,
+      size,
     };
   });
 

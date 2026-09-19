@@ -105,6 +105,22 @@ function getMemoryCache() {
   return memoryCache;
 }
 
+/**
+ * In-memory LRU stats for the semantic cache.
+ *
+ * Exposed for `/api/cache/stats`, which used to report `getPromptCache()` — an
+ * LRU that nothing writes to, so it always answered 0 hit / 0 miss. Same shape
+ * as `LRUCache.getStats()`, so callers do not have to change.
+ */
+export function getMemoryCacheStats(): ReturnType<LRUCache["getStats"]> {
+  return getMemoryCache().getStats();
+}
+
+/** Drop the in-memory LRU without touching the `semantic_cache` table. */
+export function clearMemoryCache(): void {
+  getMemoryCache().clear();
+}
+
 // ─── Signature Generation ─────────────────
 
 /**

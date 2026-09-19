@@ -11,6 +11,7 @@ import {
   isForbiddenCustomHeaderName,
 } from "@/shared/constants/upstreamHeaders";
 import { MAX_TIMER_TIMEOUT_MS } from "@/shared/utils/runtimeTimeouts";
+import { AUTO_DISABLE_BANNED_SCOPES } from "@/shared/utils/autoDisableBanned";
 
 // Single source of truth: ../settingsSchemas (the schema the runtime settings route validates
 // against). Re-exported here so this modular barrel stays in exact lockstep — a divergent local
@@ -41,6 +42,7 @@ export const requestQueueSettingsSchema = z
     minTimeBetweenRequestsMs: z.number().int().min(0).optional(),
     concurrentRequests: z.number().int().min(1).optional(),
     maxWaitMs: z.number().int().min(1).optional(),
+    maxQueueDepth: z.number().int().min(0).max(100_000).optional(),
   })
   .strict();
 
@@ -157,6 +159,21 @@ export const updateResilienceSchema = z
       .strict()
       .optional(),
     defaults: legacyResilienceDefaultsSchema.optional(),
+    // #6846 Phase 2: per-provider operator overrides for the header-less
+    // "provider default" static budget (open-sse/services/providerDefaultRateLimit.ts)
+    // and its companion per-connection concurrency cap. Mirrors
+    // ProviderQuotaOverrideSettings in src/lib/resilience/settings/types.ts.
+    providerQuotaOverrides: z
+      .record(
+        z.string().min(1),
+        z
+          .object({
+            rpm: z.number().int().min(1).optional(),
+            concurrency: z.number().int().min(1).optional(),
+          })
+          .strict()
+      )
+      .optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -169,7 +186,8 @@ export const updateResilienceSchema = z
       !value.quotaShareConcurrencyLimit &&
       !value.providerCooldown &&
       !value.profiles &&
-      !value.defaults
+      !value.defaults &&
+      !value.providerQuotaOverrides
     ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -263,5 +281,6 @@ export const updateAutoDisableAccountsSchema = z
   .object({
     enabled: z.boolean(),
     threshold: z.number().int().min(1).max(10).optional(),
+    scope: z.enum(AUTO_DISABLE_BANNED_SCOPES).optional(),
   })
   .strict();

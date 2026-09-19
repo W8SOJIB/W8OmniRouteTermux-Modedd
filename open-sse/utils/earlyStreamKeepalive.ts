@@ -1,13 +1,18 @@
 /**
- * Early SSE keepalive wrapper for streaming route handlers.
+ * @file earlyStreamKeepalive.ts
+ * @description Early SSE keepalive wrapper so short idle-read clients stay connected
+ * while the handler waits on upstream first-byte (reasoning models, combo failover).
+ *
+ * @changes
+ * - [2026-07-28] [Cursor Grok 4.5] - Scrub omniroute from client-facing keepalive id/model/comment frames
+ * - [2026-07-28] [Cursor Grok 4.5] - Neutralize Responses startup thinking text (no OmniRoute brand leak)
  *
  * Strict HTTP clients (notably Codex CLI's `reqwest`, which has a ~5s idle-read
  * timeout) drop the connection if no bytes arrive shortly after the request.
- * OmniRoute, however, holds the streaming response until `ensureStreamReadiness`
- * observes the upstream's first useful byte — which can exceed 5s for reasoning
- * models that "think" before emitting any token (#2544). `curl` has no such
- * idle timeout, so it was never affected, which is why the bug looked
- * client-specific.
+ * The proxy holds the streaming response until `ensureStreamReadiness` observes
+ * the upstream's first useful byte — which can exceed 5s for reasoning models
+ * that "think" before emitting any token (#2544). `curl` has no such idle
+ * timeout, so it was never affected, which is why the bug looked client-specific.
  *
  * This wrapper keeps the connection warm without disturbing the handler's
  * internal logic (combo failover, stream readiness, account cooldown all still
@@ -26,17 +31,61 @@
  *     to 200, so the HTTP status can no longer change).
  */
 
+import { recordEarlyKeepaliveBytes } from "./earlyKeepaliveByteBuffer.ts";
+
 const ENCODER = new TextEncoder();
-const KEEPALIVE_FRAME = ENCODER.encode(": omniroute-keepalive\n\n");
+const KEEPALIVE_FRAME = ENCODER.encode(": keepalive\n\n");
+// OpenAI-compatible keepalive: a syntactically valid empty streaming chunk.
+// Some OpenAI-compatible clients parse every non-empty SSE line as JSON and
+// reject legal SSE comments before their first provider chunk arrives.
+// id/model stay brand-neutral — these frames go to the client, not upstream.
+export const OPENAI_KEEPALIVE_FRAME = ENCODER.encode(
+  'data: {"id":"chatcmpl-keepalive","object":"chat.completion.chunk","created":0,"model":"keepalive","choices":[{"index":0,"delta":{},"finish_reason":null}]}\n\n'
+);
+// The first slow-path frame must be a valid OpenAI chunk without creating
+// visible reasoning that clients persist into the conversation.
+export const OPENAI_STARTUP_FRAME = OPENAI_KEEPALIVE_FRAME;
 // Anthropic Messages-format keepalive: a REAL `ping` SSE event, not a comment.
 // Anthropic clients (Claude Code, the Anthropic SDK) reset their stream/first-token
 // watchdog on real SSE events but ignore SSE comments (`: ...`), so on a slow first
 // token the comment frame lets the client abort and retry the stream. Anthropic's own
 // API emits `event: ping` for exactly this reason; the /v1/messages route mirrors it.
 export const ANTHROPIC_PING_FRAME = ENCODER.encode('event: ping\ndata: {"type":"ping"}\n\n');
+// Anthropic Messages API default — Anthropic's own spec really does use a named
+// `event: error` SSE frame, so this is correct there. It is WRONG for the OpenAI-
+// format routes below: Chat Completions and Responses streaming never use the SSE
+// `event:` field at all, only bare `data: {...}` lines — a naive line-based parser
+// (the kind most OpenAI-compatible clients use, not a full EventSource) can silently
+// drop an unrecognized `event:` line and/or desync on the `data:` line that follows,
+// so this error would never surface to the client at all (log ids
+// 1784465227489-a2cbc0 / 1784457764961-73 territory: a client that gives up with no
+// visible reason). See OPENAI_CHAT_ERROR_FRAME / OPENAI_RESPONSES_ERROR_FRAME below
+// for the per-format-correct alternatives.
 const ERROR_FRAME = ENCODER.encode(
   `event: error\ndata: ${JSON.stringify({
     error: { message: "Upstream stream failed before completion.", type: "stream_error" },
+  })}\n\n`
+);
+// Chat Completions convention: a plain `data:` line, no `event:` field. This
+// matches what the openai-node SDK's stream iterator actually checks for — it
+// inspects each parsed chunk for a top-level `error` key regardless of any SSE
+// event name (there isn't one to check, since real OpenAI chat completions
+// streams never send `event:` lines).
+export const OPENAI_CHAT_ERROR_FRAME = ENCODER.encode(
+  `data: ${JSON.stringify({
+    error: { message: "Upstream stream failed before completion.", type: "stream_error" },
+  })}\n\n`
+);
+// Responses API convention: also a plain `data:` line, but the discriminator is
+// the `type` field INSIDE the JSON payload (matching every other Responses API
+// event — response.output_text.delta, response.completed, etc.), not an SSE
+// `event:` field.
+export const OPENAI_RESPONSES_ERROR_FRAME = ENCODER.encode(
+  `data: ${JSON.stringify({
+    type: "error",
+    code: null,
+    message: "Upstream stream failed before completion.",
+    param: null,
   })}\n\n`
 );
 
@@ -49,16 +98,57 @@ export type EarlyStreamKeepaliveOptions = {
   signal?: AbortSignal | null;
   /**
    * Frame emitted on each keepalive tick. Defaults to an SSE comment
-   * (`: omniroute-keepalive`). Anthropic-format routes (/v1/messages) must pass
+   * (`: keepalive`). Anthropic-format routes (/v1/messages) must pass
    * `ANTHROPIC_PING_FRAME` instead, because Anthropic clients ignore SSE comments
    * for their stream watchdog and only a real `event: ping` keeps them from aborting.
    */
   keepaliveFrame?: Uint8Array;
+  /**
+   * Frame emitted ONCE, immediately, as the very first byte of the slow path —
+   * before the recurring `keepaliveFrame` ticks start. Defaults to
+   * `keepaliveFrame` when omitted (today's behavior, unchanged).
+   */
+  startupFrame?: Uint8Array;
+  /**
+   * Optional parser-visible frame emitted at a slower cadence than the transport
+   * heartbeat. A due application frame replaces that interval's keepalive frame,
+   * so both cadences share one timer and never burst after an event-loop stall.
+   */
+  applicationKeepalive?: { frame: Uint8Array; intervalMs: number };
   /** Extra headers to include in the keepalive response (e.g. X-Correlation-Id). */
   extraHeaders?: Record<string, string>;
+  /**
+   * Frame emitted if the handler ultimately fails (or the upstream stream dies
+   * mid-flight with zero bytes forwarded) after the slow path has already
+   * committed to HTTP 200. Defaults to the Anthropic-style `event: error` frame
+   * (correct for /v1/messages). OpenAI-format routes (/v1/chat/completions,
+   * /v1/responses) MUST pass OPENAI_CHAT_ERROR_FRAME / OPENAI_RESPONSES_ERROR_FRAME
+   * instead — see the doc comment on the default ERROR_FRAME above for why.
+   */
+  errorFrame?: Uint8Array;
+  /**
+   * Request correlation id, threaded from the route's own handleChat(...,
+   * correlationId) call. When set, every byte this wrapper writes to the
+   * client directly (startup frame, periodic keepalive ticks, and any
+   * in-band error frame) — everything except the verbatim-forwarded real
+   * response body, which the handler's own reqLogger already captures — is
+   * recorded via earlyKeepaliveByteBuffer and merged into this same
+   * request's call-log streamChunks.client by
+   * chatCore/attemptLogging.ts, so the persisted artifact reflects what
+   * actually went out on the wire instead of only what the inner handler
+   * produced. Omit to leave today's behavior unchanged (no recording).
+   */
+  correlationId?: string;
 };
 
-type SettledHandler = { ok: true; response: Response } | { ok: false; error: unknown };
+/**
+ * Tagged with a string rather than an `ok: true | false` boolean: this workspace compiles
+ * with `strictNullChecks: false`, where a boolean-literal discriminant narrows the positive
+ * branch but not the negative one — so reading `.error` off the rejected arm did not
+ * type-check. A string discriminant narrows both branches under the same settings.
+ */
+type SettledHandler =
+  { status: "fulfilled"; response: Response } | { status: "rejected"; error: unknown };
 
 export async function withEarlyStreamKeepalive(
   handlerPromise: Promise<Response>,
@@ -68,13 +158,36 @@ export async function withEarlyStreamKeepalive(
   const intervalMs = Math.max(250, options.intervalMs ?? 2_500);
   const signal = options.signal ?? null;
   const keepaliveFrame = options.keepaliveFrame ?? KEEPALIVE_FRAME;
+  const startupFrame = options.startupFrame ?? keepaliveFrame;
+  const applicationKeepalive =
+    options.applicationKeepalive && options.applicationKeepalive.intervalMs > 0
+      ? {
+          frame: options.applicationKeepalive.frame,
+          intervalMs: Math.max(intervalMs, options.applicationKeepalive.intervalMs),
+        }
+      : null;
   const extraHeaders = options.extraHeaders ?? {};
+  const errorFrame = options.errorFrame ?? ERROR_FRAME;
+  // Single source of truth for whether THIS route's error framing uses a named SSE
+  // `event: error` line (Anthropic) or a plain `data:` line (OpenAI Chat Completions /
+  // Responses) — derived from errorFrame itself so the dynamic real-upstream-body case
+  // below stays consistent with the static default-message case without a second option.
+  const errorFrameUsesNamedEvent = new TextDecoder().decode(errorFrame).startsWith("event:");
+  const correlationId = options.correlationId;
+  const frameDecoder = correlationId ? new TextDecoder() : null;
+  // Records every direct-to-client write EXCEPT the forwarded real response
+  // body — that one is already captured by the handler's own reqLogger, so
+  // recording it again here would duplicate it in the persisted artifact.
+  const recordClientBytes = (chunk: Uint8Array): void => {
+    if (!correlationId || !frameDecoder) return;
+    recordEarlyKeepaliveBytes(correlationId, frameDecoder.decode(chunk));
+  };
 
   // Settle into a tagged result so neither race branch leaves an unhandled
   // rejection when the threshold timer wins.
   const settled: Promise<SettledHandler> = handlerPromise.then(
-    (response) => ({ ok: true as const, response }),
-    (error) => ({ ok: false as const, error })
+    (response) => ({ status: "fulfilled" as const, response }),
+    (error) => ({ status: "rejected" as const, error })
   );
 
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -88,8 +201,9 @@ export async function withEarlyStreamKeepalive(
 
   if (raced.kind === "settled") {
     // Fast path — return verbatim, or rethrow so the route's normal error handling runs.
-    if (raced.result.ok) return raced.result.response;
-    throw raced.result.error;
+    const result = raced.result;
+    if (result.status === "fulfilled") return result.response;
+    throw result.error;
   }
 
   // Slow path — open the SSE stream now and keep it warm until the handler resolves.
@@ -102,24 +216,34 @@ export async function withEarlyStreamKeepalive(
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       let stopped = false;
+      let nextApplicationKeepaliveAt = applicationKeepalive
+        ? performance.now() + applicationKeepalive.intervalMs
+        : Number.POSITIVE_INFINITY;
       const interval = setInterval(() => {
         if (stopped) return;
         try {
-          controller.enqueue(keepaliveFrame);
+          const now = performance.now();
+          let frame = keepaliveFrame;
+          if (applicationKeepalive && now >= nextApplicationKeepaliveAt) {
+            frame = applicationKeepalive.frame;
+            nextApplicationKeepaliveAt = now + applicationKeepalive.intervalMs;
+          }
+          controller.enqueue(frame);
+          recordClientBytes(frame);
         } catch {
           stopped = true;
           clearInterval(interval);
         }
       }, intervalMs);
-      if (interval && typeof interval === "object" && "unref" in interval) {
+      if (typeof interval === "object" && interval !== null && "unref" in interval) {
         interval.unref?.();
       }
-      // First keepalive immediately on commit so the client sees a byte right away.
-      // Use the configured frame (e.g. ANTHROPIC_PING_FRAME) — an SSE comment here
-      // would be ignored by Anthropic clients' watchdog on a sub-interval gap,
-      // defeating the keepalive for exactly the case it targets.
+      // First frame immediately on commit so the client sees a byte right away.
+      // An SSE comment here would be ignored by Anthropic clients' watchdog on a
+      // sub-interval gap, defeating the keepalive for exactly the case it targets.
       try {
-        controller.enqueue(keepaliveFrame);
+        controller.enqueue(startupFrame);
+        recordClientBytes(startupFrame);
       } catch {
         /* consumer already gone */
       }
@@ -130,6 +254,7 @@ export async function withEarlyStreamKeepalive(
       };
 
       const onAbort = () => {
+        if (aborted) return;
         aborted = true;
         stopKeepalive();
         upstreamReader?.cancel().catch(() => {});
@@ -140,15 +265,26 @@ export async function withEarlyStreamKeepalive(
         }
       };
       signal?.addEventListener("abort", onAbort, { once: true });
+      // addEventListener does not replay an abort that happened before registration.
+      // Checking after registration closes that gap without missing a concurrent abort.
+      if (signal?.aborted) onAbort();
 
       try {
         const result = await settled;
         stopKeepalive();
-        if (aborted) return; // client disconnected while we were waiting
+        if (aborted) {
+          // The synthetic keepalive response can be cancelled before the handler resolves.
+          // Cancel the eventual real response so its upstream work and lifecycle hooks finish.
+          if (result.status === "fulfilled" && result.response.body) {
+            await result.response.body.cancel().catch(() => undefined);
+          }
+          return;
+        }
 
-        if (!result.ok) {
+        if (result.status === "rejected") {
           // Handler rejected — emit a generic error frame (never the raw error/stack).
-          controller.enqueue(ERROR_FRAME);
+          controller.enqueue(errorFrame);
+          recordClientBytes(errorFrame);
         } else {
           const response = result.response;
           const contentType = (response.headers.get("content-type") || "").toLowerCase();
@@ -174,7 +310,8 @@ export async function withEarlyStreamKeepalive(
               // the SSE stream. Silently close instead; the client will see
               // the stream end naturally.
               if (bytesForwarded === 0) {
-                controller.enqueue(ERROR_FRAME);
+                controller.enqueue(errorFrame);
+                recordClientBytes(errorFrame);
               }
             }
           } else {
@@ -186,14 +323,20 @@ export async function withEarlyStreamKeepalive(
             const dataLine =
               text.trim() ||
               JSON.stringify({ error: { message: "stream_error", type: "stream_error" } });
-            controller.enqueue(ENCODER.encode(`event: error\ndata: ${dataLine}\n\n`));
+            const framed = errorFrameUsesNamedEvent
+              ? `event: error\ndata: ${dataLine}\n\n`
+              : `data: ${dataLine}\n\n`;
+            const framedBytes = ENCODER.encode(framed);
+            controller.enqueue(framedBytes);
+            recordClientBytes(framedBytes);
           }
         }
       } catch {
         // Defensive: never surface a raw error/stack to the client.
         if (!aborted) {
           try {
-            controller.enqueue(ERROR_FRAME);
+            controller.enqueue(errorFrame);
+            recordClientBytes(errorFrame);
           } catch {
             /* consumer gone */
           }

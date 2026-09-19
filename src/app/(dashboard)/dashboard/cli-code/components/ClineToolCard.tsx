@@ -223,8 +223,10 @@ export default function ClineToolCard({
 
   const handleManualConfig = (config) => {
     if (config.model) setSelectedModel(config.model);
-    // (#523) Match apiKey string to key id if possible
-    if (config.apiKey && apiKeys?.length > 0) {
+    // (#523) Match apiKey string to key id if possible.
+    // apiKey may be a structured secret reference (object) rather than a
+    // plaintext string. Only match on strings.
+    if (typeof config.apiKey === "string" && config.apiKey && apiKeys?.length > 0) {
       const prefix = config.apiKey.slice(0, 8);
       const suffix = config.apiKey.slice(-4);
       const matchedKey = apiKeys.find(

@@ -1,14 +1,17 @@
 // CLI Tools configuration
 import { getClaudeCodeDefaultModels } from "@omniroute/open-sse/config/providerRegistry";
 import type { CliCatalogEntry } from "@/shared/schemas/cliCatalog";
+import { GROK_BUILD_CLI_TOOL } from "@/shared/constants/cliToolsGrokBuild";
 
 const _cc = getClaudeCodeDefaultModels();
+type CliModel = NonNullable<CliCatalogEntry["defaultModels"]>[number];
+const createCliModel = (id: string, name: string): CliModel => ({ id, name, alias: id });
 
 export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
   claude: {
     id: "claude",
     name: "Claude Code",
-    icon: "terminal",
+    image: "/providers/claude.svg",
     color: "#D97757",
     description: "Anthropic Claude Code CLI — ANTHROPIC_BASE_URL points to OmniRoute",
     docsUrl: "https://docs.anthropic.com/en/docs/claude-code/overview",
@@ -20,11 +23,12 @@ export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
     envVars: {
       baseUrl: "ANTHROPIC_BASE_URL",
       model: "ANTHROPIC_MODEL",
+      fableModel: "ANTHROPIC_DEFAULT_FABLE_MODEL",
       opusModel: "ANTHROPIC_DEFAULT_OPUS_MODEL",
       sonnetModel: "ANTHROPIC_DEFAULT_SONNET_MODEL",
       haikuModel: "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     },
-    modelAliases: ["default", "sonnet", "opus", "haiku", "opusplan"],
+    modelAliases: ["default", "fable", "sonnet", "opus", "haiku", "opusplan"],
     settingsFile: "~/.claude/settings.json",
     defaultCommand: "claude",
     defaultModels: [
@@ -37,11 +41,11 @@ export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
         isTopLevel: true,
       },
       {
-        id: "smallFast",
-        name: "Small Fast Model",
-        alias: "smallFast",
-        envKey: "ANTHROPIC_SMALL_FAST_MODEL",
-        defaultValue: _cc.haiku ? `cc/${_cc.haiku}` : "cc/claude-haiku-4-5-20251001",
+        id: "fable",
+        name: "Claude Fable",
+        alias: "fable",
+        envKey: "ANTHROPIC_DEFAULT_FABLE_MODEL",
+        defaultValue: _cc.fable ? `cc/${_cc.fable}` : "cc/claude-fable-5",
         isTopLevel: true,
       },
       {
@@ -70,6 +74,7 @@ export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
   codex: {
     id: "codex",
     name: "OpenAI Codex CLI",
+    image: "/providers/codex.svg",
     color: "#10A37F",
     description: "OpenAI Codex CLI — OpenAI-compatible base URL targets OmniRoute",
     docsUrl: "https://github.com/openai/codex",
@@ -79,6 +84,28 @@ export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
     acpSpawnable: true,
     baseUrlSupport: "full",
     defaultCommand: "codex",
+  },
+  zcode: {
+    id: "zcode",
+    name: "ZCode (GLM Coding Plan)",
+    color: "#3B82F6",
+    description: "Local ZCode app-server backend; auth remains in the user's ZCode profile",
+    docsUrl: "https://zcode.z.ai",
+    configType: "custom",
+    category: "code",
+    vendor: "Z.ai",
+    // ZCode's app-server is a native length-prefixed protocol, not ACP. The
+    // zcode provider executor owns its lifecycle instead of ACP spawning it.
+    acpSpawnable: false,
+    baseUrlSupport: "none",
+    defaultCommand: "zcode",
+    notes: [
+      {
+        type: "info",
+        text: "Uses the local ZCode app-server and its existing builtin:zai-coding-plan login.",
+      },
+      { type: "warning", text: "The response is buffered until the ZCode turn completes." },
+    ],
   },
   droid: {
     id: "droid",
@@ -97,7 +124,7 @@ export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
   openclaw: {
     id: "openclaw",
     name: "Open Claw",
-    image: "/providers/openclaw.png",
+    image: "/providers/openclaw.svg",
     color: "#FF6B35",
     description: "Open Claw — open-source multi-backend agent CLI (OSS, P. Steinberger)",
     docsUrl: "/docs?section=cli-tools&tool=openclaw",
@@ -111,7 +138,7 @@ export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
   cursor: {
     id: "cursor",
     name: "Cursor",
-    image: "/providers/cursor.png",
+    image: "/providers/cursor.svg",
     color: "#000000",
     // Cursor App routes via its own cloud server — local base URL not supported.
     // Use cursor-cli entry for headless/agent CLI mode with custom endpoint.
@@ -143,6 +170,7 @@ export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
   cline: {
     id: "cline",
     name: "Cline",
+    image: "/providers/cline.svg",
     color: "#00D1B2",
     description: "Cline — open-source VS Code coding agent with OpenAI-compatible base URL",
     docsUrl: "https://docs.cline.bot/",
@@ -170,7 +198,7 @@ export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
   continue: {
     id: "continue",
     name: "Continue",
-    image: "/providers/continue.png",
+    image: "/providers/continue.svg",
     color: "#7C3AED",
     description: "Continue — open-source AI coding assistant with full provider config",
     docsUrl: "https://docs.continue.dev/",
@@ -214,34 +242,30 @@ export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
     acpSpawnable: false,
     baseUrlSupport: "none",
     modelAliases: [
+      "gemini-3.7-flash-high",
+      "gemini-3.7-flash-medium",
+      "gemini-3.7-flash-low",
       "claude-opus-4-6-thinking",
       "claude-sonnet-4-6",
-      "gemini-3-flash",
-      "gpt-oss-120b-medium",
-      "gemini-3.1-pro-high",
+      "gemini-pro-agent",
       "gemini-3.1-pro-low",
+      "gpt-oss-120b-medium",
     ],
     defaultModels: [
-      { id: "gemini-3.1-pro-high", name: "Gemini 3.1 Pro High", alias: "gemini-3.1-pro-high" },
-      { id: "gemini-3.1-pro-low", name: "Gemini 3.1 Pro Low", alias: "gemini-3.1-pro-low" },
-      { id: "gemini-3-flash", name: "Gemini 3 Flash", alias: "gemini-3-flash" },
-      {
-        id: "claude-sonnet-4-6",
-        name: "Claude Sonnet 4.6",
-        alias: "claude-sonnet-4-6",
-      },
-      {
-        id: "claude-opus-4-6-thinking",
-        name: "Claude Opus 4.6 Thinking",
-        alias: "claude-opus-4-6-thinking",
-      },
-      { id: "gpt-oss-120b-medium", name: "GPT OSS 120B Medium", alias: "gpt-oss-120b-medium" },
+      createCliModel("gemini-3.7-flash-high", "Gemini 3.7 Flash High"),
+      createCliModel("gemini-3.7-flash-medium", "Gemini 3.7 Flash Medium"),
+      createCliModel("gemini-3.7-flash-low", "Gemini 3.7 Flash Low"),
+      createCliModel("gemini-pro-agent", "Gemini 3.1 Pro High"),
+      createCliModel("gemini-3.1-pro-low", "Gemini 3.1 Pro Low"),
+      createCliModel("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+      createCliModel("claude-opus-4-6-thinking", "Claude Opus 4.6 Thinking"),
+      createCliModel("gpt-oss-120b-medium", "GPT OSS 120B Medium"),
     ],
   },
   copilot: {
     id: "copilot",
     name: "GitHub Copilot",
-    image: "/providers/copilot.png",
+    image: "/providers/copilot.svg",
     color: "#1F6FEB",
     // D-nota: copilot suporta COPILOT_PROVIDER_BASE_URL desde v1.0.19+
     description: "GitHub Copilot Chat — VS Code extension with COPILOT_PROVIDER_BASE_URL support",
@@ -273,7 +297,7 @@ export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
     notes: [
       {
         type: "warning",
-        text: "Config path: ~/.config/opencode/opencode.json on all platforms (Windows: %USERPROFILE%\\\\.config\\\\opencode\\\\opencode.json)",
+        text: "Config paths: ~/.config/opencode/opencode.jsonc (preferred when present) or opencode.json on all platforms (Windows: %USERPROFILE%\\\\.config\\\\opencode\\\\opencode.jsonc or opencode.json)",
       },
       {
         type: "warning",
@@ -401,10 +425,9 @@ export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
   qwen: {
     id: "qwen",
     name: "Qwen Code",
-    icon: "psychology",
+    image: "/providers/qwen.svg",
     color: "#10B981",
-    description:
-      "Alibaba Qwen Code CLI — supports OpenAI, Anthropic & Gemini providers via OmniRoute",
+    description: "Qwen Code CLI — current V4 OpenAI-compatible model provider via OmniRoute",
     docsUrl: "https://qwenlm.github.io/qwen-code-docs/en/users/configuration/model-providers/",
     configType: "guide",
     category: "code",
@@ -412,91 +435,15 @@ export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
     acpSpawnable: true,
     baseUrlSupport: "full",
     defaultCommand: "qwen",
+    previewConfigMode: "qwen",
     notes: [
       {
         type: "info",
-        text: "Qwen Code supports multiple provider types (openai, anthropic, gemini) via modelProviders in settings.json. OmniRoute works as an OpenAI-compatible endpoint.",
+        text: "OmniRoute is registered under modelProviders.openai using Qwen Code's current bare-array V4 format.",
       },
       {
         type: "info",
-        text: "Any model available in OmniRoute can be used — not just Qwen models. Select from Qwen, Claude, Gemini, GPT, and more.",
-      },
-      {
-        type: "warning",
-        text: "Config path: Linux/macOS ~/.qwen/settings.json • Windows %USERPROFILE%\\.qwen\\settings.json",
-      },
-      {
-        type: "error",
-        text: "Qwen OAuth free tier was discontinued on 2026-04-15. Use OmniRoute with bailian-coding-plan/alibaba/alibaba-cn/openrouter/anthropic/gemini providers instead.",
-      },
-    ],
-    modelAliases: [
-      "coder-model",
-      "qwen3-coder-plus",
-      "qwen3-coder-flash",
-      "vision-model",
-      "claude-sonnet-4-6",
-      "claude-opus-4-6-thinking",
-      "gemini-3-flash",
-      "gemini-3.1-pro-high",
-    ],
-    defaultModels: [
-      {
-        id: "coder-model",
-        name: "Coder Model (Qwen 3.6 Plus)",
-        alias: "coder-model",
-        envKey: "OPENAI_MODEL",
-        defaultValue: "coder-model",
-        isTopLevel: true,
-      },
-      {
-        id: "qwen3-coder-plus",
-        name: "Qwen 3 Coder Plus",
-        alias: "qwen3-coder-plus",
-        envKey: "OPENAI_MODEL",
-        defaultValue: "qwen3-coder-plus",
-      },
-      {
-        id: "qwen3-coder-flash",
-        name: "Qwen 3 Coder Flash",
-        alias: "qwen3-coder-flash",
-        envKey: "OPENAI_MODEL",
-        defaultValue: "qwen3-coder-flash",
-      },
-      {
-        id: "vision-model",
-        name: "Vision Model (Multimodal)",
-        alias: "vision-model",
-        envKey: "OPENAI_MODEL",
-        defaultValue: "vision-model",
-      },
-      {
-        id: "claude-sonnet-4-6",
-        name: "Claude Sonnet 4.6",
-        alias: "claude-sonnet-4-6",
-        envKey: "OPENAI_MODEL",
-        defaultValue: "claude-sonnet-4-6",
-      },
-      {
-        id: "claude-opus-4-6-thinking",
-        name: "Claude Opus 4.6 Thinking",
-        alias: "claude-opus-4-6-thinking",
-        envKey: "OPENAI_MODEL",
-        defaultValue: "claude-opus-4-6-thinking",
-      },
-      {
-        id: "gemini-3.1-pro-high",
-        name: "Gemini 3.1 Pro High",
-        alias: "gemini-3.1-pro-high",
-        envKey: "OPENAI_MODEL",
-        defaultValue: "gemini-3.1-pro-high",
-      },
-      {
-        id: "gemini-3-flash",
-        name: "Gemini 3 Flash",
-        alias: "gemini-3-flash",
-        envKey: "OPENAI_MODEL",
-        defaultValue: "gemini-3-flash",
+        text: "The API key is stored only as OMNIROUTE_API_KEY in ~/.qwen/.env, leaving your existing provider credentials untouched.",
       },
     ],
     guideSteps: [
@@ -507,23 +454,24 @@ export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
       {
         step: 5,
         title: "Save Config",
-        desc: "Click Save Config below to write your settings.json automatically.",
+        desc: "Write the modelProviders entry and dedicated .env key without replacing other Qwen Code settings.",
       },
     ],
     codeBlock: {
       language: "json",
-      code: `# ~/.qwen/settings.json — OmniRoute via security.auth
-{
-  "security": {
-    "auth": {
-      "selectedType": "openai",
-      "apiKey": "{{apiKey}}",
-      "baseUrl": "{{baseUrl}}"
-    }
+      code: `{
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "{{model}}",
+        "name": "{{model}} (OmniRoute)",
+        "envKey": "OMNIROUTE_API_KEY",
+        "baseUrl": "{{baseUrl}}"
+      }
+    ]
   },
-  "model": {
-    "name": "{{model}}"
-  }
+  "security": { "auth": { "selectedType": "openai" } },
+  "model": { "name": "{{model}}", "baseUrl": "{{baseUrl}}" }
 }`,
     },
   },
@@ -540,7 +488,6 @@ export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
     acpSpawnable: false,
     baseUrlSupport: "full",
   },
-
   // ── Code entries — aider ──────────────────────────────────────────────────
   aider: {
     id: "aider",
@@ -567,7 +514,6 @@ export const CLI_TOOLS: Record<string, CliCatalogEntry> = {
 aider --openai-api-base "{{baseUrl}}" --model "{{model}}"`,
     },
   },
-
   // ── Code entries — forge ──────────────────────────────────────────────────
   forge: {
     id: "forge",
@@ -584,11 +530,12 @@ aider --openai-api-base "{{baseUrl}}" --model "{{model}}"`,
     defaultCommand: "forge",
   },
 
+  "grok-build": GROK_BUILD_CLI_TOOL,
   // ── Code entries — cursor-cli ─────────────────────────────────────────────
   "cursor-cli": {
     id: "cursor-cli",
     name: "Cursor Agent CLI",
-    icon: "terminal",
+    image: "/providers/cursor.svg",
     color: "#000000",
     description: "Cursor Agent CLI — headless agent mode with custom provider endpoint",
     docsUrl: "https://docs.cursor.com/advanced/api",
@@ -612,7 +559,7 @@ aider --openai-api-base "{{baseUrl}}" --model "{{model}}"`,
   roo: {
     id: "roo",
     name: "Roo Code",
-    icon: "terminal",
+    image: "/providers/roocode.svg",
     color: "#7C3AED",
     description: "Roo Code AI Assistant — VS Code extension with OpenAI-compatible custom base URL",
     docsUrl: "https://docs.roocode.com/",
@@ -646,6 +593,31 @@ aider --openai-api-base "{{baseUrl}}" --model "{{model}}"`,
   },
 
   /**
+   * ★ Added 2026-08-22 — Prime Agent (PrimeIntellect-ai/prime-agent).
+   * A self-improving RLM coding harness (TypeScript) whose LLM toolkit
+   * (prime-agent-ai) supports "any OpenAI-compatible API" + a dedicated
+   * "OpenAI Codex (ChatGPT Plus/Pro OAuth)" provider, so it can point at
+   * OmniRoute's OpenAI-compatible base URL like codex/forge. Installed via
+   * `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh`;
+   * provider chosen at first run via `/login`.
+   */
+  "prime-agent": {
+    id: "prime-agent",
+    name: "Prime Agent",
+    icon: "terminal",
+    color: "#6366F1",
+    description:
+      "Prime Agent — self-improving RLM coding harness with OpenAI-compatible provider support",
+    docsUrl: "https://github.com/PrimeIntellect-ai/prime-agent",
+    configType: "custom",
+    category: "agent",
+    vendor: "Prime Intellect (OSS)",
+    acpSpawnable: false,
+    baseUrlSupport: "full",
+    defaultCommand: "prime-agent",
+  },
+
+  /**
    * ★ Added by plan 14 (CLI Pages Redesign) — 2026-05-27
    * Kept as a legacy/dual entry after CodeWhale (see below) took over as the
    * actively-maintained successor. Existing users who still have DeepSeek
@@ -655,7 +627,7 @@ aider --openai-api-base "{{baseUrl}}" --model "{{model}}"`,
   "deepseek-tui": {
     id: "deepseek-tui",
     name: "DeepSeek TUI",
-    icon: "terminal",
+    image: "/providers/deepseek.svg",
     color: "#4F46E5",
     description: "DeepSeek TUI — Rust-based coding agent CLI with OPENAI_BASE_URL support",
     docsUrl: "https://github.com/hunterbown/deepseek-tui",
@@ -794,6 +766,59 @@ OPENAI_API_KEY: "{{apiKey}}"`,
       language: "bash",
       code: `interpreter --api_base "{{baseUrl}}" --api_key "{{apiKey}}" --model "{{model}}"`,
     },
+  },
+
+  omp: {
+    id: "omp",
+    name: "Oh My Pi",
+    image: "/providers/omp.png",
+    color: "#111111",
+    docsUrl: "https://github.com/can1357/oh-my-pi",
+    description: "Oh My Pi terminal coding agent via OmniRoute",
+    configType: "custom",
+    category: "agent",
+    vendor: "OSS",
+    acpSpawnable: true,
+    baseUrlSupport: "full",
+    defaultCommand: "omp",
+    notes: [
+      {
+        type: "info",
+        text: "Oh My Pi reads custom OpenAI-compatible providers from ~/.omp/agent/models.yml. OmniRoute adds itself as a provider with auto-discovery — models appear automatically in omp's /model menu.",
+      },
+      {
+        type: "warning",
+        text: "Config path: Linux/macOS ~/.omp/agent/models.yml • Windows %USERPROFILE%\\.omp\\.omp\\agent\\models.yml",
+      },
+    ],
+  },
+
+  letta: {
+    id: "letta",
+    name: "Letta CLI",
+    image: "/providers/letta.png",
+    color: "#FF6B35",
+    description: "Letta CLI — AI agent with persistent memory and tool use",
+    configType: "custom",
+    category: "agent",
+    vendor: "Letta",
+    acpSpawnable: false,
+    baseUrlSupport: "full",
+    docsUrl: "https://docs.letta.com",
+    notes: [
+      {
+        type: "info",
+        text: "Letta CLI uses pi-ai which sends OpenAI-compatible requests. OmniRoute configures it as an OpenAI provider with custom base URL.",
+      },
+      {
+        type: "info",
+        text: "CLI (Local Mode): OmniRoute auto-configures ~/.letta/lc-local-backend/providers/auth.json. Use 'letta --info' to check if local mode is enabled.",
+      },
+      {
+        type: "warning",
+        text: "Local mode config path: ~/.letta/lc-local-backend/providers/auth.json (CLI only)",
+      },
+    ],
   },
 
   /** ★ Added by plan 14 (CLI Pages Redesign) — 2026-05-27 */

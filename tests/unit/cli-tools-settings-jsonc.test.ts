@@ -65,7 +65,7 @@ test("readJsoncConfig parses a JSONC file with trailing commas (regression)", as
     assert.equal(parsed.apiKey, "sk-test");
     assert.equal(parsed.model, "claude-sonnet-4-5");
   } finally {
-    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -79,7 +79,7 @@ test("readJsoncConfig returns fallback on corrupted config instead of throwing",
     assert.equal(await readJsoncConfig(file), null);
     assert.deepEqual(await readJsoncConfig(file, {}), {});
   } finally {
-    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 

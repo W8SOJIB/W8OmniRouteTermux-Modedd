@@ -140,7 +140,7 @@ import SenseNovaColorIcon from "@lobehub/icons/es/SenseNova/components/Color";
 import SenseNovaMonoIcon from "@lobehub/icons/es/SenseNova/components/Mono";
 import StabilityColorIcon from "@lobehub/icons/es/Stability/components/Color";
 import StabilityMonoIcon from "@lobehub/icons/es/Stability/components/Mono";
-import StepfunColorIcon from "@lobehub/icons/es/Stepfun/components/Color";
+// Stepfun has no Color component in the installed @lobehub/icons version; use Mono as fallback
 import StepfunMonoIcon from "@lobehub/icons/es/Stepfun/components/Mono";
 import SunoMonoIcon from "@lobehub/icons/es/Suno/components/Mono";
 import TavilyColorIcon from "@lobehub/icons/es/Tavily/components/Color";
@@ -281,7 +281,7 @@ const LOBE_ICON_COMPONENTS = {
   SenseNova: { mono: SenseNovaMonoIcon, color: SenseNovaColorIcon },
   Snowflake: { mono: SnowflakeMonoIcon, color: SnowflakeColorIcon },
   Stability: { mono: StabilityMonoIcon, color: StabilityColorIcon },
-  Stepfun: { mono: StepfunMonoIcon, color: StepfunColorIcon },
+  Stepfun: { mono: StepfunMonoIcon, color: StepfunMonoIcon },
   Suno: { mono: SunoMonoIcon },
   Tavily: { mono: TavilyMonoIcon, color: TavilyColorIcon },
   Tencent: { mono: TencentMonoIcon, color: TencentColorIcon },
@@ -320,6 +320,7 @@ const LOBE_PROVIDER_ALIASES = {
   azure: "Azure",
   "azure-ai": "AzureAI",
   "azure-openai": "AzureAI",
+  bai: "Baichuan",
   baidu: "Baidu",
   "bailian-coding-plan": "Bailian",
   baseten: "Baseten",
@@ -328,9 +329,11 @@ const LOBE_PROVIDER_ALIASES = {
   "black-forest-labs": "Bfl",
   cerebras: "Cerebras",
   "chatgpt-web": "OpenAI",
+  "chatgpt-web-codex": "OpenAI",
   claude: "ClaudeCode",
   "claude-web": "Claude",
   cline: "Cline",
+  clinepass: "Cline",
   cloudflare: "Cloudflare",
   "cloudflare-ai": "WorkersAI",
   codestral: "Mistral",
@@ -339,6 +342,7 @@ const LOBE_PROVIDER_ALIASES = {
   cohere: "Cohere",
   comfyui: "ComfyUI",
   copilot: "GithubCopilot",
+  "copilot-m365-web": "Copilot",
   "copilot-web": "Copilot",
   coze: "Coze",
   cursor: "Cursor",
@@ -366,8 +370,8 @@ const LOBE_PROVIDER_ALIASES = {
   "gemini-web": "Gemini",
   "gemini-business": "Gemini",
   github: "GithubCopilot",
-  "github-models": "Github",
   "github-copilot": "GithubCopilot",
+  "ghe-copilot": "GithubCopilot",
   glm: "Zhipu",
   "glm-cn": "Zhipu",
   glmt: "Zhipu",
@@ -398,7 +402,6 @@ const LOBE_PROVIDER_ALIASES = {
   "meta-llama": "Meta",
   minimax: "Minimax",
   "minimax-cn": "Minimax",
-  mimocode: "XiaomiMiMo",
   mistral: "Mistral",
   mistralai: "Mistral",
   moonshot: "Moonshot",
@@ -464,10 +467,13 @@ const LOBE_PROVIDER_ALIASES = {
   voyage: "Voyage",
   "voyage-ai": "Voyage",
   watsonx: "IBM",
-  windsurf: "Windsurf",
+  "devin-desktop": "Devin",
   "workers-ai": "WorkersAI",
   workersai: "WorkersAI",
   xai: "XAI",
+  "xai-oauth": "XAI",
+  xao: "XAI",
+  "x-search": "XAI",
   "xiaomi-mimo": "XiaomiMiMo",
   xiaomimimo: "XiaomiMiMo",
   xinference: "Xinference",

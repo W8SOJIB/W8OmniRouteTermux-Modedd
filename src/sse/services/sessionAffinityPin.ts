@@ -17,6 +17,9 @@
  * connection, so the existing 429-driven `deleteSessionAccountAffinity`
  * failover still owns rotating away from a pin that stops working.
  *
+ * @changes
+ * - [2026-07-24] [Composer] - Drop forcedConnectionId when excluded or ineligible (429 loop fix)
+ *
  * This module stays decoupled from auth.ts internals: the three predicates that
  * live in (or would cause a cycle back into) auth.ts —
  * `isTerminalConnectionStatus`, `isCodexScopeUnavailable`, and the quota-policy
@@ -28,14 +31,16 @@ import {
   upsertSessionAccountAffinity,
   touchSessionAccountAffinity,
   deleteSessionAccountAffinity,
+  evictSessionAccountAffinityForConnection,
 } from "@/lib/db/sessionAccountAffinity";
-import { updateProviderConnection } from "@/lib/db/providers";
+import { touchConnectionLastUsed } from "@/lib/db/providers";
 import { isModelExcludedByConnection } from "@/domain/connectionModelRules";
 import { isAccountQuotaExhausted } from "@/domain/quotaCache";
 import {
   isAccountUnavailable,
   isModelLocked,
 } from "@omniroute/open-sse/services/accountFallback.ts";
+import { isComboPerModelTimeoutAbort } from "@omniroute/open-sse/services/combo/comboAbortReasons.ts";
 import * as log from "../utils/logger";
 
 /** Minimal structural view of a provider connection this module reads. */
@@ -52,6 +57,16 @@ export interface SessionAffinityConnection {
   lastUsedAt?: string | null;
   consecutiveUseCount?: number | null;
   priority?: number | null;
+}
+
+export function syncSessionAffinityRuntimeFields(
+  connections: SessionAffinityConnection[],
+  selected: SessionAffinityConnection
+): void {
+  const cached = connections.find((connection) => connection.id === selected.id);
+  if (!cached) return;
+  cached.lastUsedAt = selected.lastUsedAt;
+  cached.consecutiveUseCount = selected.consecutiveUseCount;
 }
 
 export function formatSessionKeyForLog(sessionKey: string): string {
@@ -89,10 +104,10 @@ export async function selectSessionAffinityConnection<T extends SessionAffinityC
     const connection = connections.find((candidate) => candidate.id === existing.connectionId);
     if (connection) {
       touchSessionAccountAffinity(sessionKey, provider, Date.now(), ttlMs);
-      await updateProviderConnection(connection.id, {
-        lastUsedAt: new Date().toISOString(),
-        consecutiveUseCount: (connection.consecutiveUseCount || 0) + 1,
-      });
+      const nextCount = (connection.consecutiveUseCount || 0) + 1;
+      await touchConnectionLastUsed(connection.id, nextCount);
+      connection.lastUsedAt = new Date().toISOString();
+      connection.consecutiveUseCount = nextCount;
       log.info(
         "AUTH",
         `session_key=${formatSessionKeyForLog(sessionKey)} -> connection ${connection.id.slice(
@@ -114,10 +129,9 @@ export async function selectSessionAffinityConnection<T extends SessionAffinityC
   if (!connection) return null;
 
   upsertSessionAccountAffinity(sessionKey, provider, connection.id, Date.now(), ttlMs);
-  await updateProviderConnection(connection.id, {
-    lastUsedAt: new Date().toISOString(),
-    consecutiveUseCount: 1,
-  });
+  await touchConnectionLastUsed(connection.id, 1);
+  connection.lastUsedAt = new Date().toISOString();
+  connection.consecutiveUseCount = 1;
   log.info(
     "AUTH",
     `new affinity created for session_key=${formatSessionKeyForLog(
@@ -125,6 +139,98 @@ export async function selectSessionAffinityConnection<T extends SessionAffinityC
     )} -> connection ${connection.id.slice(0, 8)}`
   );
   return connection;
+}
+
+/**
+ * Read-only affinity selection used when another durable authority must claim
+ * the candidate before any affinity/LRU state is changed.
+ */
+export function planSessionAffinityConnection<T extends SessionAffinityConnection>(
+  provider: string,
+  sessionKey: string | null | undefined,
+  connections: T[],
+  ttlMs = 0
+) {
+  if (!sessionKey || connections.length === 0 || ttlMs <= 0) return null;
+  const existing = getSessionAccountAffinity(sessionKey, provider, ttlMs);
+  const existingConnection =
+    existing && connections.find((candidate) => candidate.id === existing.connectionId);
+  const connection = existingConnection ?? [...connections].sort(compareLruConnections)[0] ?? null;
+  if (!connection) return null;
+
+  return {
+    connection,
+    commit: async () => {
+      if (existingConnection) {
+        touchSessionAccountAffinity(sessionKey, provider, Date.now(), ttlMs);
+        const nextCount = (connection.consecutiveUseCount || 0) + 1;
+        await touchConnectionLastUsed(connection.id, nextCount);
+        connection.lastUsedAt = new Date().toISOString();
+        connection.consecutiveUseCount = nextCount;
+        return;
+      }
+      if (existing) deleteSessionAccountAffinity(sessionKey, provider);
+      upsertSessionAccountAffinity(sessionKey, provider, connection.id, Date.now(), ttlMs);
+      await touchConnectionLastUsed(connection.id, 1);
+      connection.lastUsedAt = new Date().toISOString();
+      connection.consecutiveUseCount = 1;
+    },
+  };
+}
+
+/** Inputs the combo-timeout eviction needs from the dispatch site. */
+export interface ComboTimeoutAffinityEvictionParams {
+  sessionKey?: string | null;
+  provider: string;
+  connectionId?: string | null;
+  /** Per-target abort signal handed down by the combo timeout runner. */
+  modelAbortSignal?: AbortSignal | null;
+}
+
+/**
+ * #6219 follow-up — evict the sticky pin when a COMBO per-model timeout abandons
+ * the pinned account.
+ *
+ * The #6219 eviction only fires on the generic `markAccountUnavailable` →
+ * `shouldFallback` path in chat.ts. A combo target timeout never reaches it: the
+ * combo runner aborts the dispatch, the abort propagates out of
+ * `executeChatWithBreaker` as a rejection, and `buildTargetTimeoutRunner`
+ * swallows it behind the synthetic 524. Nothing marks the account unavailable
+ * (correctly — a stall is not a quota/auth failure), so the pin survived its full
+ * TTL and every following request in that session was handed straight back to the
+ * stalled account.
+ *
+ * Only a genuine per-model timeout evicts. A client disconnect or a hedge
+ * cancellation says nothing about the account's health and must leave the pin
+ * intact. The eviction is connection-matched, so a pin pointing at a different
+ * (healthy) account is never touched. Best-effort: never throws into the dispatch
+ * path.
+ *
+ * @returns true when a pin was actually evicted.
+ */
+export function evictSessionAffinityOnComboTimeout(
+  params: ComboTimeoutAffinityEvictionParams
+): boolean {
+  const { sessionKey, provider, connectionId, modelAbortSignal } = params;
+  if (!sessionKey || !provider || !connectionId) return false;
+  if (!isComboPerModelTimeoutAbort(modelAbortSignal)) return false;
+
+  try {
+    const evicted = evictSessionAccountAffinityForConnection(sessionKey, provider, connectionId);
+    if (evicted) {
+      log.warn(
+        "AUTH",
+        `session_key=${formatSessionKeyForLog(sessionKey)} pin on ${connectionId.slice(
+          0,
+          8
+        )} evicted — ${provider} stalled past the combo target timeout`
+      );
+    }
+    return evicted;
+  } catch {
+    // Best-effort: a failed eviction must never break the dispatch path.
+    return false;
+  }
 }
 
 /** Subset of credential-selection options the pin resolution consults. */
@@ -136,26 +242,34 @@ export interface AffinityPinOptions {
   sessionAffinityTtlMs?: number | null;
 }
 
-/** Settings subset needed to resolve the codex session-affinity TTL. */
+/**
+ * Settings subset needed to resolve the session-affinity TTL. `sessionAffinityTtlMs`
+ * is the generic (#7274) key; `codexSessionAffinityTtlMs` is kept as a read-only
+ * legacy fallback for the (unlikely) case a caller hands in raw pre-migration
+ * settings that were never round-tripped through `getSettings()` (which already
+ * carries the value over — see migration 124_generic_session_affinity_ttl.sql).
+ */
 export interface AffinityPinSettings {
+  sessionAffinityTtlMs?: number | null;
   codexSessionAffinityTtlMs?: number | null;
 }
 
 /**
- * Resolve the effective session-affinity TTL. Only codex opts in today: an
- * explicit per-request override wins, else the persisted codex setting, else 0
- * (disabled). Kept here so auth.ts can reuse it at both the pin-override site
- * and the downstream `selectSessionAffinityConnection` site with one call.
+ * Resolve the effective session-affinity TTL for any provider (#7274 — previously
+ * hardcoded to codex only): an explicit per-request override wins, else the
+ * persisted generic setting (falling back to the legacy codex-only key for
+ * pre-migration callers), else 0 (disabled). Kept here so auth.ts can reuse it at
+ * both the pin-override site and the downstream `selectSessionAffinityConnection`
+ * site with one call.
  */
 export function resolveSessionAffinityTtlMs(
-  provider: string,
+  _provider: string,
   options: AffinityPinOptions,
   settings: AffinityPinSettings
 ): number {
-  if (provider !== "codex") return 0;
   const override = Number(options.sessionAffinityTtlMs);
   if (Number.isFinite(override) && override > 0) return override;
-  const configured = Number(settings.codexSessionAffinityTtlMs);
+  const configured = Number(settings.sessionAffinityTtlMs ?? settings.codexSessionAffinityTtlMs);
   if (Number.isFinite(configured) && configured > 0) return configured;
   return 0;
 }
@@ -244,4 +358,42 @@ export function applySessionAffinityPin(params: ApplySessionAffinityPinParams): 
     `session affinity pin ${pinned.connectionId.slice(0, 8)}... overrides forcedConnectionId ${forcedConnectionId.slice(0, 8)}... (#5903)`
   );
   return pinned.connectionId;
+}
+
+export interface ResolveForcedConnectionForPoolParams {
+  forcedConnectionId: string | null;
+  excludedConnectionIds: ReadonlySet<string>;
+  connections: AffinityPinConnection[];
+  allowRateLimitedConnections: boolean;
+  bypassQuotaPolicy: boolean;
+  isQuotaExhausted: (connectionId: string) => boolean;
+  isQuotaPolicyBlocked: (connection: AffinityPinConnection) => boolean;
+}
+
+/**
+ * Reset-aware combo routing pins a single `forcedConnectionId` per target. When
+ * that account 429s (quota exhausted / cooldown), the chat retry loop excludes
+ * it — but keeping the force would narrow the pool back to the same dead
+ * account. Drop the pin whenever the forced id is excluded or no longer eligible.
+ */
+export function resolveForcedConnectionForCredentialPool(
+  params: ResolveForcedConnectionForPoolParams
+): string | null {
+  const forced = params.forcedConnectionId?.trim() || null;
+  if (!forced || params.excludedConnectionIds.has(forced)) return null;
+
+  if (params.connections.length === 0) {
+    return forced;
+  }
+
+  const forcedConn = params.connections.find((conn) => conn.id === forced);
+  if (!forcedConn) return null;
+
+  if (!params.allowRateLimitedConnections && isAccountUnavailable(forcedConn.rateLimitedUntil)) {
+    return null;
+  }
+  if (params.isQuotaExhausted(forced)) return null;
+  if (!params.bypassQuotaPolicy && params.isQuotaPolicyBlocked(forcedConn)) return null;
+
+  return forced;
 }

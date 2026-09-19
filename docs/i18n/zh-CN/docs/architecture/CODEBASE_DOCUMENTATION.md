@@ -467,7 +467,7 @@ open-sse/
 `antigravity`、`azure-openai`、`blackbox-web`、`chatgpt-web`、`cliproxyapi`、
 `cloudflare-ai`、`codex`、`commandCode`、`cursor`、`default`、`devin-cli`、
 `muse-spark-web`、`nlpcloud`、`opencode`、`perplexity-web`、`petals`、
-`pollinations`、`puter`、`qoder`、`vertex`、`windsurf`，以及 `claudeIdentity.ts`
+`pollinations`、`qoder`、`vertex`、`windsurf`，以及 `claudeIdentity.ts`
 （共享身份标识辅助）和 `index.ts`（注册表）。
 
 > 注意：未在此列出的服务商由 `default.ts` 通过通用 OpenAI 兼容执行器提供服务。完整的服务商目录（237 条目）位于 `src/shared/constants/providers.ts`。
@@ -610,17 +610,17 @@ bin/
 
 ## 7. `tests/`
 
-| 目录                                                                             | 类型                                                         |
-| -------------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| `tests/unit/`                                                                    | Node 原生测试运行器的单元测试（1821 个文件，含 `api/`、`auth/`、`authz/` 子目录）|
-| `tests/integration/`                                                             | 跨模块 + DB 状态测试                                         |
-| `tests/e2e/`                                                                     | Playwright UI 测试                                           |
-| `tests/protocols-e2e/`                                                           | MCP/A2A 协议端到端                                           |
-| `tests/translator/`                                                              | 翻译器专用测试                                               |
-| `tests/security/`                                                                | 安全回归测试                                                 |
-| `tests/load/`                                                                    | 负载 / 压力测试                                              |
-| `tests/golden-set/`                                                              | 翻译器回归参考输出                                           |
-| `tests/helpers/`、`tests/fixtures/`、`tests/manual/`、`tests/scratch_test.mjs`   | 支撑                                                         |
+| 目录                                                 | 类型                                                                              |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `tests/unit/`                                        | Node 原生测试运行器的单元测试（1821 个文件，含 `api/`、`auth/`、`authz/` 子目录） |
+| `tests/integration/`                                 | 跨模块 + DB 状态测试                                                              |
+| `tests/e2e/`                                         | Playwright UI 测试                                                                |
+| `tests/protocols-e2e/`                               | MCP/A2A 协议端到端                                                                |
+| `tests/translator/`                                  | 翻译器专用测试                                                                    |
+| `tests/security/`                                    | 安全回归测试                                                                      |
+| `tests/load/`                                        | 负载 / 压力测试                                                                   |
+| `tests/golden-set/`                                  | 翻译器回归参考输出                                                                |
+| `tests/helpers/`、`tests/fixtures/`、`tests/manual/` | 支撑                                                                              |
 
 常用命令：
 

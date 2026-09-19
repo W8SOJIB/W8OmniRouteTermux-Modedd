@@ -3,16 +3,10 @@
 import { useTranslations } from "next-intl";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useProviderNodeMap, resolveProviderName } from "@/lib/display/useProviderNodeMap";
-import {
-  CartesianGrid,
-  Legend,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
+import { getAccountDisplayName } from "@/lib/display/names";
+import dynamic from "next/dynamic";
+
+const ProviderCharts = dynamic(() => import("./components/ProviderCharts"), { ssr: false });
 import Card from "@/shared/components/Card";
 import ProviderIcon from "@/shared/components/ProviderIcon";
 import TimeRangeSelector from "@/shared/components/analytics/TimeRangeSelector";
@@ -21,13 +15,6 @@ import type {
   ProviderUtilizationResponse,
   UtilizationTimeRange,
 } from "@/shared/types/utilization";
-
-const RANGE_LABELS: Record<UtilizationTimeRange, string> = {
-  "1h": "Last hour",
-  "24h": "Last 24 hours",
-  "7d": "Last 7 days",
-  "30d": "Last 30 days",
-};
 
 const PROVIDER_COLORS = [
   "var(--color-primary)",
@@ -196,7 +183,7 @@ export default function ProviderUtilizationTab() {
     <div className="flex flex-col gap-6">
       <Card
         title={t("providerUtilizationTitle")}
-        subtitle={RANGE_LABELS[range]}
+        subtitle={t(`utilizationRange.${range}`)}
         icon="monitoring"
         action={
           <div className="flex items-center gap-4">
@@ -210,7 +197,7 @@ export default function ProviderUtilizationTab() {
                 }`}
               >
                 <span className="material-symbols-outlined text-[14px]">dns</span>
-                Global View
+                {t("providerUtilizationGlobalView")}
               </button>
               <button
                 onClick={() => setAggregateBy("connection")}
@@ -221,7 +208,7 @@ export default function ProviderUtilizationTab() {
                 }`}
               >
                 <span className="material-symbols-outlined text-[14px]">account_tree</span>
-                Account Split
+                {t("providerUtilizationAccountSplit")}
               </button>
             </div>
             <TimeRangeSelector value={range} onChange={setRange} />
@@ -234,7 +221,7 @@ export default function ProviderUtilizationTab() {
             <span className="material-symbols-outlined mr-2 animate-spin text-[18px]">
               progress_activity
             </span>
-            Loading utilization data…
+            {t("providerUtilizationLoading")}
           </div>
         ) : error ? (
           <div className="flex min-h-80 flex-col items-center justify-center gap-4 text-center">
@@ -256,12 +243,12 @@ export default function ProviderUtilizationTab() {
                   <span className="material-symbols-outlined animate-spin text-[18px]">
                     progress_activity
                   </span>
-                  Retrying…
+                  {t("retrying")}
                 </>
               ) : (
                 <>
                   <span className="material-symbols-outlined text-[18px]">refresh</span>
-                  Retry
+                  {t("retry")}
                 </>
               )}
             </button>
@@ -274,7 +261,7 @@ export default function ProviderUtilizationTab() {
             <div className="flex flex-col gap-2">
               <p className="text-sm font-medium text-text-main">{t("providerUtilizationNoData")}</p>
               <p className="max-w-md text-sm text-text-muted">
-                Provider quota snapshots will appear here after utilization data is collected.
+                {t("providerUtilizationNoDataDescription")}
               </p>
             </div>
             <div className="rounded-lg border border-black/5 bg-black/[0.02] p-4 dark:border-white/5 dark:bg-white/[0.02]">
@@ -287,100 +274,77 @@ export default function ProviderUtilizationTab() {
                     check_circle
                   </span>
                   <span>
-                    Connect providers via OAuth or API keys in <strong>Providers</strong>
+                    {t.rich("providerUtilizationStepConnect", {
+                      strong: (chunks) => <strong>{chunks}</strong>,
+                    })}
                   </span>
                 </li>
                 <li className="mt-1 flex items-start gap-2">
                   <span className="material-symbols-outlined text-[14px] text-primary">
                     check_circle
                   </span>
-                  <span>
-                    Enable quota tracking by using the provider in a combo or direct request
-                  </span>
+                  <span>{t("providerUtilizationStepEnable")}</span>
                 </li>
                 <li className="mt-1 flex items-start gap-2">
                   <span className="material-symbols-outlined text-[14px] text-primary">
                     check_circle
                   </span>
-                  <span>Data will appear automatically as quota snapshots are collected</span>
+                  <span>{t("providerUtilizationStepAutomatic")}</span>
                 </li>
               </ul>
             </div>
           </div>
         ) : (
           <div className="flex flex-col gap-5">
-            <div className="h-80 w-full rounded-xl border border-black/5 bg-black/[0.02] px-3 py-4 dark:border-white/5 dark:bg-white/[0.02]">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={chartData} margin={{ top: 8, right: 16, bottom: 0, left: 0 }}>
-                  <CartesianGrid
-                    stroke="var(--color-border)"
-                    strokeDasharray="3 3"
-                    vertical={false}
-                  />
-                  <XAxis
-                    dataKey="timestamp"
-                    tickFormatter={(value) => formatTimestamp(String(value), range)}
-                    tick={{ fill: "var(--color-text-muted)", fontSize: 12 }}
-                    axisLine={{ stroke: "var(--color-border)" }}
-                    tickLine={{ stroke: "var(--color-border)" }}
-                    minTickGap={24}
-                  />
-                  <YAxis
-                    domain={[0, 100]}
-                    tickFormatter={formatPercent}
-                    tick={{ fill: "var(--color-text-muted)", fontSize: 12 }}
-                    axisLine={{ stroke: "var(--color-border)" }}
-                    tickLine={{ stroke: "var(--color-border)" }}
-                    width={44}
-                  />
-                  <Tooltip
-                    labelFormatter={(value) => formatTooltipTimestamp(String(value), range)}
-                    formatter={(value: number, name: string) => [formatPercent(value), name]}
-                    contentStyle={{
-                      backgroundColor: "var(--color-surface)",
-                      borderColor: "var(--color-border)",
-                      borderRadius: 12,
-                      color: "var(--color-text-main)",
-                      boxShadow: "var(--shadow-soft)",
-                    }}
-                    itemStyle={{ color: "var(--color-text-main)" }}
-                    labelStyle={{ color: "var(--color-text-main)", fontWeight: 600 }}
-                  />
-                  <Legend />
-                  {data?.providers.map((provider) => (
-                    <Line
-                      key={provider}
-                      type="monotone"
-                      dataKey={provider}
-                      name={resolveProviderName(provider, nodeMap)}
-                      stroke={providerColors.get(provider) ?? "var(--color-primary)"}
-                      strokeWidth={2.5}
-                      dot={false}
-                      activeDot={{ r: 4, strokeWidth: 0 }}
-                      connectNulls
-                    />
-                  ))}
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
+            <ProviderCharts
+              chartData={chartData}
+              providers={data?.providers ?? []}
+              providerColors={providerColors}
+              range={range}
+              resolveProviderName={resolveProviderName}
+              nodeMap={nodeMap}
+              formatTimestamp={formatTimestamp}
+              formatPercent={formatPercent}
+              formatTooltipTimestamp={formatTooltipTimestamp}
+            />
 
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
               {latestPoints.map((point) => {
                 const isLow = point.remainingPct <= 20;
+
+                // For Account Split, parse "provider:connectionId" and resolve display name
+                const colonIdx = point.provider.indexOf(":");
+                const isConnectionKey = aggregateBy === "connection" && colonIdx !== -1;
+                const providerPart = isConnectionKey
+                  ? point.provider.slice(0, colonIdx)
+                  : point.provider;
+                const connectionId = isConnectionKey ? point.provider.slice(colonIdx + 1) : null;
+                const connMeta = connectionId ? data?.connectionMeta?.[connectionId] : null;
+                const cardTitle = isConnectionKey
+                  ? getAccountDisplayName({
+                      id: connectionId ?? undefined,
+                      email: connMeta?.email,
+                      name: connMeta?.name,
+                      displayName: connMeta?.displayName,
+                    })
+                  : resolveProviderName(point.provider, nodeMap);
+                const cardSubtitle = isConnectionKey
+                  ? `${providerPart} · account ${(connectionId ?? "").slice(0, 8)}…`
+                  : t("providerUtilizationLatestSnapshot");
 
                 return (
                   <Card.Section key={point.provider} className="flex h-full flex-col gap-4">
                     <div className="flex items-start justify-between gap-3">
                       <div className="flex items-center gap-3">
                         <div className="flex h-11 w-11 items-center justify-center rounded-xl border border-black/5 bg-surface text-text-main dark:border-white/5">
-                          <ProviderIcon providerId={point.provider} size={22} />
+                          <ProviderIcon providerId={providerPart} size={22} />
                         </div>
                         <div>
                           <p className="text-sm font-semibold text-text-main">
-                            {resolveProviderName(point.provider, nodeMap)}
+                            {cardTitle}
                           </p>
                           <p className="text-xs text-text-muted">
-                            {t("providerUtilizationLatestSnapshot")}
+                            {cardSubtitle}
                           </p>
                         </div>
                       </div>
@@ -393,7 +357,11 @@ export default function ProviderUtilizationTab() {
                               : "bg-success/10 text-success"
                         }`}
                       >
-                        {point.isExhausted ? "Exhausted" : isLow ? "Low" : "Healthy"}
+                        {point.isExhausted
+                          ? t("statusExhausted")
+                          : isLow
+                            ? t("statusLow")
+                            : t("statusHealthy")}
                       </span>
                     </div>
 
@@ -423,7 +391,7 @@ export default function ProviderUtilizationTab() {
                       </div>
                       <div className="flex items-center justify-between text-xs text-text-muted">
                         <span>0%</span>
-                        <span>Remaining quota</span>
+                        <span>{t("remainingQuota")}</span>
                         <span>100%</span>
                       </div>
                     </div>

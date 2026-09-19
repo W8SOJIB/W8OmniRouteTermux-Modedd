@@ -13,7 +13,7 @@ const { isRetryableProxyTarget } = await import("../../src/lib/providers/validat
 const { isPrivateHost } = await import("../../src/shared/network/outboundUrlGuard.ts");
 
 test.after(() => {
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 /**

@@ -13,7 +13,7 @@ const mappingsDb = await import("../../src/lib/db/modelComboMappings.ts");
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -23,7 +23,7 @@ test.beforeEach(async () => {
 
 test.after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 async function createCombo(name, model, overrides = {}) {
@@ -53,7 +53,7 @@ test("model combo mappings CRUD joins combo names and preserves ordering", async
     enabled: false,
   });
 
-  const all = await mappingsDb.getModelComboMappings();
+  const { items: all } = await mappingsDb.getModelComboMappings();
 
   assert.equal(all.length, 2);
   assert.equal(all[0].id, first.id);

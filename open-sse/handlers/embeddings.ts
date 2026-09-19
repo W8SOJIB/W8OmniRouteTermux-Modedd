@@ -16,7 +16,9 @@
 import {
   getEmbeddingProvider,
   getEmbeddingModelDefaultParams,
+  getEmbeddingModelModalities,
   parseEmbeddingModel,
+  type EmbeddingModality,
   type EmbeddingProvider,
 } from "../config/embeddingRegistry.ts";
 import { saveCallLog } from "@/lib/usageDb";
@@ -26,11 +28,54 @@ import { getCallLogPipelineCaptureStreamChunks } from "@/lib/logEnv";
 import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
 import { stripStaleEncodingHeaders } from "../utils/upstreamResponseHeaders.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
+import { stripTrailingSlashes } from "../utils/urlSanitize.ts";
+import { fetchRemoteImage } from "@/shared/network/remoteImageFetch";
+import {
+  hasStructuredEmbeddingInput,
+  prepareJinaMixedEmbeddingInput,
+  prepareStructuredEmbeddingRequest,
+} from "./embeddingStructuredInput.ts";
+import { MAX_EMBEDDING_INLINE_ITEM_BYTES } from "@/shared/validation/schemas/apiV1";
+import { markAccountUnavailable } from "../../src/sse/services/auth.ts";
+import {
+  collectJinaNativeModalities,
+  isJinaNativeEmbeddingInput,
+} from "@/shared/validation/jinaNativeEmbeddingInput";
+import {
+  collectGeminiNativeModalities,
+  isGeminiEmbedding2Family,
+  isGeminiNativeEmbeddingInput,
+} from "@/shared/validation/geminiNativeEmbeddingInput";
 
 interface ClientRawRequest {
   endpoint: string;
   body: Record<string, unknown>;
   headers: Record<string, string>;
+}
+
+/**
+ * Flatten a single embedding item's vector to the OpenAI-spec `number[]` shape.
+ *
+ * Some OpenAI-compatible embedding backends — notably a llama.cpp
+ * `llama-server --embedding --pooling ...` instance — return each vector wrapped in one
+ * extra array level: `[[...floats]]` instead of `[...floats]` for a single input. That
+ * extra level is silently spec-breaking, since a standard OpenAI-SDK consumer reading
+ * `response.data[i].embedding` gets a length-1 array holding the real vector instead of
+ * the vector itself. Unwrap only that single redundant level; vectors that are already
+ * flat (or genuinely multi-row) are left untouched. See issue #9089.
+ */
+function flattenSingleRowEmbedding(item: unknown): void {
+  if (!item || typeof item !== "object" || !("embedding" in item)) return;
+  const record = item as { embedding: unknown };
+  const embedding = record.embedding;
+  if (
+    Array.isArray(embedding) &&
+    embedding.length === 1 &&
+    Array.isArray(embedding[0]) &&
+    typeof embedding[0][0] === "number"
+  ) {
+    record.embedding = embedding[0];
+  }
 }
 
 /**
@@ -51,7 +96,11 @@ export async function handleEmbedding({
   connectionId = null,
 }: {
   body: Record<string, unknown>;
-  credentials: { apiKey?: string | null; accessToken?: string | null } | null;
+  credentials: {
+    apiKey?: string | null;
+    accessToken?: string | null;
+    providerSpecificData?: Record<string, unknown> | null;
+  } | null;
   log?: { info: (...args: unknown[]) => void; error: (...args: unknown[]) => void };
   resolvedProvider?: EmbeddingProvider | null;
   resolvedModel?: string | null;
@@ -89,7 +138,7 @@ export async function handleEmbedding({
       enabled: detailedLoggingEnabled,
       captureStreamChunks,
       connectionId: connectionId || undefined,
-      model: model || body.model as string,
+      model: model || (body.model as string),
       provider: provider || undefined,
     }
   );
@@ -126,11 +175,52 @@ export async function handleEmbedding({
     };
   }
 
+  const structuredItems = Array.isArray(body.input)
+    ? body.input.filter(
+        (item): item is { type: EmbeddingModality } =>
+          typeof item === "object" && item !== null && "type" in item
+      )
+    : [];
+  const nativeModalities = [
+    ...(isJinaNativeEmbeddingInput(body.input) ? collectJinaNativeModalities(body.input) : []),
+    ...(isGeminiNativeEmbeddingInput(body.input) ? collectGeminiNativeModalities(body.input) : []),
+  ].filter((modality) => modality !== "text");
+  if (structuredItems.length > 0 || nativeModalities.length > 0) {
+    const supportedModalities = getEmbeddingModelModalities(providerConfig, model);
+    if (!supportedModalities) {
+      return {
+        success: false,
+        status: 400,
+        error: `Embedding model ${body.model} does not advertise structured embedding input support`,
+      };
+    }
+    const unsupportedCanonical = structuredItems.find(
+      (item) => !supportedModalities.includes(item.type)
+    );
+    if (unsupportedCanonical) {
+      return {
+        success: false,
+        status: 400,
+        error: `Embedding model ${body.model} does not support ${unsupportedCanonical.type} input`,
+      };
+    }
+    const unsupportedNative = nativeModalities.find(
+      (modality) => !supportedModalities.includes(modality)
+    );
+    if (unsupportedNative) {
+      return {
+        success: false,
+        status: 400,
+        error: `Embedding model ${body.model} does not support ${unsupportedNative} input`,
+      };
+    }
+  }
+
   // Build upstream request — start with standard fields, then forward extra fields
   // the client sent (e.g. input_type, user, truncate for NVIDIA NIM asymmetric models).
   const KNOWN_FIELDS = new Set(["model", "input", "dimensions", "encoding_format"]);
 
-  const upstreamBody: Record<string, unknown> = {
+  let upstreamBody: Record<string, unknown> = {
     model: model,
     input: body.input,
   };
@@ -171,6 +261,30 @@ export async function handleEmbedding({
     }
   }
 
+  let upstreamUrl = providerConfig.baseUrl;
+  if (provider === "ollama-local" || provider === "lmstudio") {
+    // Keyless local servers (#2824 ollama-local, #11233 lmstudio): honor the
+    // configured connection's baseUrl when one was hydrated, and fall back to
+    // the static localhost registry default otherwise.
+    const configuredBaseUrl = credentials?.providerSpecificData?.baseUrl;
+    const rawBaseUrl =
+      typeof configuredBaseUrl === "string" && configuredBaseUrl.trim().length > 0
+        ? configuredBaseUrl
+        : providerConfig.baseUrl;
+    // Use the shared O(n) helper instead of `/\/+$/` — that regex is
+    // vulnerable to polynomial backtracking on adversarial input
+    // (CodeQL js/polynomial-redos) since baseUrl is operator-configured
+    // per-connection data. See open-sse/utils/urlSanitize.ts.
+    const normalizedBaseUrl = stripTrailingSlashes(rawBaseUrl.trim());
+    const localServerHost = normalizedBaseUrl
+      .replace(/\/v1\/(?:chat\/completions|embeddings)$/i, "")
+      .replace(/\/api\/chat$/i, "")
+      .replace(/\/v1$/i, "");
+    upstreamUrl = `${localServerHost}/v1/embeddings`;
+  }
+  let normalizeProviderResponse:
+    ((data: Record<string, unknown>) => Record<string, unknown>) | null = null;
+
   // Build headers
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -191,6 +305,73 @@ export async function handleEmbedding({
       status: 401,
       error: `No valid authentication token for provider ${provider}. Check provider credentials.`,
     };
+  }
+
+  // Jina v5 Omni native docs ({ text }, { image: url|base64 }, { content: [...] })
+  // must reach api.jina.ai unchanged. Do not fetch those image URLs or collapse
+  // to string[]. Canonical { type, source } items still go through the translator.
+  const jinaNative = isJinaNativeEmbeddingInput(body.input);
+  const geminiNative = isGeminiNativeEmbeddingInput(body.input);
+  const canonicalStructured = hasStructuredEmbeddingInput(body.input);
+  const passThroughJinaNative =
+    providerConfig.structuredInputProtocol === "jina-v1" && jinaNative && !canonicalStructured;
+  // gemini-embedding-2 aggregates a string[] on Google's OpenAI shim into one
+  // vector. Always use embedContent / batchEmbedContents so N input items
+  // become N embeddings. Native multimodal parts take the same path.
+  const useGeminiNativeTransport =
+    providerConfig.structuredInputProtocol === "gemini-embed-content" &&
+    (isGeminiEmbedding2Family(model) || canonicalStructured || geminiNative || jinaNative);
+
+  if (providerConfig.structuredInputProtocol === "jina-v1" && jinaNative && canonicalStructured) {
+    try {
+      const mixed = Array.isArray(body.input) ? body.input : [body.input];
+      upstreamBody.input = await prepareJinaMixedEmbeddingInput(mixed, async (url) => {
+        const result = await fetchRemoteImage(url, {
+          guard: "public-only",
+          maxBytes: MAX_EMBEDDING_INLINE_ITEM_BYTES,
+          pinDns: true,
+        });
+        return { buffer: result.buffer, contentType: result.contentType || null };
+      });
+    } catch (error) {
+      return { success: false, status: 400, error: sanitizeErrorMessage(error) };
+    }
+  } else if (useGeminiNativeTransport || (!passThroughJinaNative && canonicalStructured)) {
+    if (!model) {
+      return {
+        success: false,
+        status: 400,
+        error: `Invalid embedding model: ${body.model}. Use format: provider/model`,
+      };
+    }
+    try {
+      const prepared = await prepareStructuredEmbeddingRequest(
+        providerConfig,
+        model,
+        body,
+        token ?? "",
+        {
+          fetchMedia: async (url) => {
+            const result = await fetchRemoteImage(url, {
+              guard: "public-only",
+              maxBytes: MAX_EMBEDDING_INLINE_ITEM_BYTES,
+              pinDns: true,
+            });
+            return { buffer: result.buffer, contentType: result.contentType || null };
+          },
+        }
+      );
+      upstreamBody = prepared.body;
+      upstreamUrl = prepared.url;
+      normalizeProviderResponse = prepared.normalizeResponse ?? null;
+      if (prepared.authHeader) {
+        delete headers.Authorization;
+        delete headers["x-api-key"];
+        headers[prepared.authHeader.name] = prepared.authHeader.value;
+      }
+    } catch (error) {
+      return { success: false, status: 400, error: sanitizeErrorMessage(error) };
+    }
   }
 
   if (log) {
@@ -225,9 +406,9 @@ export async function handleEmbedding({
     }
 
     // Log provider request
-    reqLogger.logTargetRequest(providerConfig.baseUrl, headers, upstreamBody);
+    reqLogger.logTargetRequest(upstreamUrl, headers, upstreamBody);
 
-    const response = await fetch(providerConfig.baseUrl, {
+    const response = await fetch(upstreamUrl, {
       method: "POST",
       headers,
       body: JSON.stringify(upstreamBody),
@@ -267,6 +448,22 @@ export async function handleEmbedding({
         connectionId,
       }).catch(() => {});
 
+      // #10347 — persist a connection-level failure marker on a hard upstream failure so
+      // the dead account is not re-selected and re-hit on the next embed request (chat
+      // parity). markAccountUnavailable classifies the status via checkFallbackError: a
+      // payment-required 402 becomes the TERMINAL state credits_exhausted (the terminal
+      // marker excludes the account from selection until an operator resets it), benign
+      // 4xx are a no-op, and terminal statuses are never overwritten. honors per-connection
+      // disableCooling. The write must never break the error response path, so it is
+      // best-effort.
+      if (connectionId) {
+        try {
+          await markAccountUnavailable(connectionId, response.status, errorText, provider, model);
+        } catch {
+          // swallow — the upstream error response takes priority
+        }
+      }
+
       return {
         success: false,
         status: response.status,
@@ -275,10 +472,27 @@ export async function handleEmbedding({
       };
     }
 
-    const data = await response.json();
+    const rawData = (await response.json()) as Record<string, unknown>;
+    const data = (normalizeProviderResponse ? normalizeProviderResponse(rawData) : rawData) as {
+      data?: unknown[] | unknown;
+      usage?: { prompt_tokens?: number; total_tokens?: number };
+    };
 
     // Log provider response
     reqLogger.logProviderResponse(response.status, "", response.headers, data);
+
+    // OpenAI-spec compliance (#9089): each item's `embedding` must be a flat number[].
+    // Some OpenAI-compatible backends (e.g. a llama.cpp `llama-server --embedding`
+    // instance) return the vector wrapped in one extra array level — `[[...floats]]`
+    // instead of `[...floats]` — for a single input, which silently breaks any standard
+    // OpenAI-SDK consumer doing `response.data[i].embedding`. Flatten that one redundant
+    // level without touching providers that already return flat vectors.
+    const responseItems = data.data || data;
+    if (Array.isArray(responseItems)) {
+      for (const item of responseItems) {
+        flattenSingleRowEmbedding(item);
+      }
+    }
 
     // Normalize response to OpenAI format
     const normalizedResponse = {
@@ -310,7 +524,7 @@ export async function handleEmbedding({
       responseBody: {
         usage: data.usage || null,
         object: "list",
-        data_count: data.data?.length || 0,
+        data_count: Array.isArray(data.data) ? data.data.length : 0,
       },
       pipelinePayloads,
       apiKeyId,

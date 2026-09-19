@@ -10,18 +10,18 @@ import {
   getMcpHttpStatus,
   isMcpHttpTransportReady,
 } from "../../../../../open-sse/mcp-server/httpTransport";
-import { getSettings } from "@/lib/db/settings";
+import { getCachedSettings } from "@/lib/db/settings";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
 export async function GET(request: Request) {
-  const authError = await requireManagementAuth(request);
+  const authError = await requireManagementAuth(request, { acceptMcpConnectScope: true });
   if (authError) return authError;
   try {
     const [heartbeat, stats, lastCallPage, settings] = await Promise.all([
       readMcpHeartbeat(),
       getAuditStats(),
       queryAuditEntries({ limit: 1, offset: 0 }),
-      getSettings(),
+      getCachedSettings(),
     ]);
 
     const mcpEnabled = !!settings.mcpEnabled;
