@@ -75,7 +75,34 @@ test("applyTermuxPatches modifies chunks, serve.mjs, and ensures cache", () => {
 
     const patchedServe = readFileSync(serveMjs, "utf8");
     assert.ok(patchedServe.includes('platform() !== "android"'));
+
+    // Execute the patched helper and verify named parameters object binding
+    const helperMatch = patchedSqljs.match(/function __w8bindParams\([\s\S]*?\n\}/);
+    assert.ok(helperMatch, "BIND_HELPER must be present in patched file");
+    const fn = new Function(`${helperMatch[0]}; return __w8bindParams;`)();
+
+    // 1. Direct object (e.g. from toBindValue)
+    const directObj = { "@id": "node-1", "@type": "openai-compatible", name: "Test" };
+    const directRes = fn(directObj);
+    assert.equal(typeof directRes, "object");
+    assert.equal(directRes["@type"], "openai-compatible");
+    assert.equal(directRes["type"], "openai-compatible");
+    assert.equal(directRes[":type"], "openai-compatible");
+    assert.equal(directRes["$type"], "openai-compatible");
+
+    // 2. Wrapped in single-element array
+    const arrObj = [{ id: "node-2", type: "anthropic-compatible" }];
+    const arrRes = fn(arrObj);
+    assert.equal(typeof arrRes, "object");
+    assert.equal(arrRes["@type"], "anthropic-compatible");
+    assert.equal(arrRes["type"], "anthropic-compatible");
+
+    // 3. Positional array with boolean and date
+    const posArr = ["test", true, undefined];
+    const posRes = fn(posArr);
+    assert.deepEqual(posRes, ["test", 1, null]);
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
 });
+

@@ -25,21 +25,28 @@ function __w8bindParams(p) {
     return v;
   }
   if (!p) return p;
+  function processObject(obj) {
+    const o = {};
+    for (const [k, v] of Object.entries(obj)) {
+      const sv = sanitize(v);
+      const px = k[0];
+      const isNamed = px === '@' || px === '$' || px === ':';
+      const bare = isNamed ? k.slice(1) : k;
+      o['@' + bare] = sv;
+      o['$' + bare] = sv;
+      o[':' + bare] = sv;
+      o[bare] = sv;
+    }
+    return o;
+  }
   if (Array.isArray(p)) {
     if (p.length === 1 && typeof p[0] === "object" && p[0] !== null && !Array.isArray(p[0]) && !(p[0] instanceof Uint8Array) && !Buffer.isBuffer(p[0])) {
-      const o = {};
-      for (const [k, v] of Object.entries(p[0])) {
-        const sv = sanitize(v);
-        const px = k[0];
-        const isNamed = px === '@' || px === '$' || px === ':';
-        o[isNamed ? k : '@' + k] = sv;
-        o[isNamed ? k : '$' + k] = sv;
-        o[isNamed ? k : ':' + k] = sv;
-        o[k] = sv;
-      }
-      return o;
+      return processObject(p[0]);
     }
     return p.map(sanitize);
+  }
+  if (typeof p === "object" && !(p instanceof Uint8Array) && !Buffer.isBuffer(p)) {
+    return processObject(p);
   }
   return sanitize(p);
 }
@@ -105,7 +112,14 @@ export function applyTermuxPatches(baseDir: string): TermuxPatchStats {
     if (fileName.includes("sql-wasm") || fileName.startsWith("node_modules_sql_js")) return;
     let c = fs.readFileSync(fp, "utf8");
     if (c.includes("__w8bindParams")) {
-      stats.skipped++;
+      const bindRegex = /(?:^|\n)function __w8bindParams\s*\([\s\S]*?\n\}\n/;
+      if (bindRegex.test(c)) {
+        c = c.replace(bindRegex, () => "\n" + BIND_HELPER.trim() + "\n");
+        fs.writeFileSync(fp, c);
+        stats.bind++;
+      } else {
+        stats.skipped++;
+      }
       return;
     }
 

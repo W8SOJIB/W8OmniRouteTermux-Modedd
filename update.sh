@@ -142,21 +142,28 @@ function __w8bindParams(p){
     return v;
   }
   if (!p) return p;
+  function processObject(obj) {
+    const o = {};
+    for (const [k, v] of Object.entries(obj)) {
+      const sv = sanitize(v);
+      const px = k[0];
+      const isNamed = px === '@' || px === '$' || px === ':';
+      const bare = isNamed ? k.slice(1) : k;
+      o['@' + bare] = sv;
+      o['$' + bare] = sv;
+      o[':' + bare] = sv;
+      o[bare] = sv;
+    }
+    return o;
+  }
   if (Array.isArray(p)) {
     if (p.length === 1 && typeof p[0] === "object" && p[0] !== null && !Array.isArray(p[0]) && !(p[0] instanceof Uint8Array) && !Buffer.isBuffer(p[0])) {
-      const o = {};
-      for (const [k, v] of Object.entries(p[0])) {
-        const sv = sanitize(v);
-        const px = k[0];
-        const isNamed = px === '@' || px === '$' || px === ':';
-        o[isNamed ? k : '@' + k] = sv;
-        o[isNamed ? k : '$' + k] = sv;
-        o[isNamed ? k : ':' + k] = sv;
-        o[k] = sv;
-      }
-      return o;
+      return processObject(p[0]);
     }
     return p.map(sanitize);
+  }
+  if (typeof p === "object" && !(p instanceof Uint8Array) && !Buffer.isBuffer(p)) {
+    return processObject(p);
   }
   return sanitize(p);
 }
@@ -174,12 +181,20 @@ function __w8bindParams(p){
             c = c.replace(/await (\w+)\.y\(["'](playwright(?:-core)?)["']\)/g, "(process.platform==='android'?{}:await $1.y('$2'))");
             m = true;
           }
-          if ((c.includes('sqljsAdapter') || c.includes('SqlJsAdapter')) && c.includes('.prepare(') && !c.includes('__w8bindParams')) {
-            c = BIND_HELPER + c;
-            c = c.replace(/\.bind\((\w+)\)/g, '.bind(__w8bindParams($1))');
-            const closeRegex = /close\s*\(\)\s*\{\s*if\s*\(\s*clearInterval\([\w$]+\)\s*,\s*[\w$]+\s*&&\s*clearTimeout\([\w$]+\)\s*,\s*[\w$]+\s*\)\s*try\s*\{\s*[\w$]+\(\)\s*\}\s*catch(?:\([\w$]+\))?\s*\{\s*\}\s*try\s*\{\s*[\w$]+\.close\(\)\s*\}\s*catch(?:\([\w$]+\))?\s*\{\s*\}\s*[\w$]+\s*=\s*\!1\s*\}/g;
-            c = c.replace(closeRegex, 'close(){}');
-            m = true;
+          if ((c.includes('sqljsAdapter') || c.includes('SqlJsAdapter')) && c.includes('.prepare(')) {
+            if (c.includes('__w8bindParams')) {
+              const bindRegex = /(?:^|\n)function __w8bindParams\s*\([\s\S]*?\n\}\n/;
+              if (bindRegex.test(c)) {
+                c = c.replace(bindRegex, () => "\n" + BIND_HELPER.trim() + "\n");
+                m = true;
+              }
+            } else {
+              c = BIND_HELPER + c;
+              c = c.replace(/\.bind\((\w+)\)/g, '.bind(__w8bindParams($1))');
+              const closeRegex = /close\s*\(\)\s*\{\s*if\s*\(\s*clearInterval\([\w$]+\)\s*,\s*[\w$]+\s*&&\s*clearTimeout\([\w$]+\)\s*,\s*[\w$]+\s*\)\s*try\s*\{\s*[\w$]+\(\)\s*\}\s*catch(?:\([\w$]+\))?\s*\{\s*\}\s*try\s*\{\s*[\w$]+\.close\(\)\s*\}\s*catch(?:\([\w$]+\))?\s*\{\s*\}\s*[\w$]+\s*=\s*\!1\s*\}/g;
+              c = c.replace(closeRegex, 'close(){}');
+              m = true;
+            }
           }
           if (c.includes('registerNodejs') && c.includes('ensureDbInitialized') && !c.includes('__w8dbPreInit')) {
             c = c.replace(/(async function registerNodejs\s*\(\s*\)\s*\{)/, "$1if(process.platform==='android'){try{Object.defineProperty(process,'platform',{value:'linux',configurable:true});}catch(e){}}try{await ensureDbInitialized();}catch(__w8dbPreInit){console.warn('[w8-init]',__w8dbPreInit?.message);}");

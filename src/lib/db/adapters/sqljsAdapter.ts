@@ -75,13 +75,11 @@ function resolveSqlJsWasmPath(): string {
 function withNamedParamPrefixes(obj: Record<string, unknown>): Record<string, unknown> {
   const expanded: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(obj)) {
-    if (/^[:@$]/.test(key)) {
-      expanded[key] = value;
-      continue;
-    }
-    expanded[`@${key}`] = value;
-    expanded[`:${key}`] = value;
-    expanded[`$${key}`] = value;
+    const bare = /^[:@$]/.test(key) ? key.slice(1) : key;
+    expanded[`@${bare}`] = value;
+    expanded[`:${bare}`] = value;
+    expanded[`$${bare}`] = value;
+    expanded[bare] = value;
   }
   return expanded;
 }
