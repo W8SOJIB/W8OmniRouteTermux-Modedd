@@ -102,6 +102,14 @@ export function applyTermuxPatches(baseDir) {
     c = BIND_HELPER + c;
     c = c.replace(/\.bind\((\w+)\)/g, ".bind(__w8bindParams($1))");
 
+    // Also ensure candidate wasm paths check parent node_modules
+    if (c.includes('join(process.cwd(),"node_modules","sql.js"') && !c.includes('join(process.cwd(),"..","node_modules"')) {
+      c = c.replace(
+        /join\(process\.cwd\(\),"node_modules","sql\.js","dist","sql-wasm\.wasm"\)/g,
+        'join(process.cwd(),"node_modules","sql.js","dist","sql-wasm.wasm"),path.join(process.cwd(),"..","node_modules","sql.js","dist","sql-wasm.wasm")'
+      );
+    }
+
     const closeRegex =
       /close\s*\(\)\s*\{\s*if\s*\(\s*clearInterval\([\w$]+\)\s*,\s*[\w$]+\s*&&\s*clearTimeout\([\w$]+\)\s*,\s*[\w$]+\s*\)\s*try\s*\{\s*[\w$]+\(\)\s*\}\s*catch(?:\([\w$]+\))?\s*\{\s*\}\s*try\s*\{\s*[\w$]+\.close\(\)\s*\}\s*catch(?:\([\w$]+\))?\s*\{\s*\}\s*[\w$]+\s*=\s*\!1\s*\}/g;
     c = c.replace(closeRegex, "close(){}");
@@ -169,6 +177,27 @@ export function applyTermuxPatches(baseDir) {
       );
       fs.writeFileSync(serveMjs, c);
       stats.serve++;
+    }
+  }
+
+  // 5. Ensure sql.js and its WASM are available inside dist/node_modules
+  const distNodeModules = path.join(base, "dist", "node_modules");
+  const sqlJsSrc = path.join(base, "node_modules", "sql.js");
+  const sqlJsDest = path.join(distNodeModules, "sql.js");
+  if (fs.existsSync(sqlJsSrc)) {
+    if (!fs.existsSync(distNodeModules)) {
+      try {
+        fs.mkdirSync(distNodeModules, { recursive: true });
+      } catch {}
+    }
+    if (!fs.existsSync(sqlJsDest)) {
+      try {
+        fs.symlinkSync(sqlJsSrc, sqlJsDest, "junction");
+      } catch {
+        try {
+          fs.cpSync(sqlJsSrc, sqlJsDest, { recursive: true });
+        } catch {}
+      }
     }
   }
 

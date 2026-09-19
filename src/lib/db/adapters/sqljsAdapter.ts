@@ -38,7 +38,16 @@ function resolveSqlJsWasmPath(): string {
       "dist",
       "sql-wasm.wasm"
     ),
+    path.join(process.cwd(), "..", "node_modules", "sql.js", "dist", "sql-wasm.wasm"),
+    path.join(process.cwd(), "..", "..", "node_modules", "sql.js", "dist", "sql-wasm.wasm"),
   ];
+
+  try {
+    const resolvedPkg = require.resolve("sql.js/package.json");
+    if (resolvedPkg) {
+      candidatePaths.unshift(path.join(path.dirname(resolvedPkg), "dist", "sql-wasm.wasm"));
+    }
+  } catch {}
 
   for (const candidatePath of candidatePaths) {
     if (fs.existsSync(candidatePath)) {

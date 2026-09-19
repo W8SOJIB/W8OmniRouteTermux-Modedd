@@ -177,6 +177,12 @@ function __w8bindParams(p){
           if ((c.includes('sqljsAdapter') || c.includes('SqlJsAdapter')) && c.includes('.prepare(') && !c.includes('__w8bindParams')) {
             c = BIND_HELPER + c;
             c = c.replace(/\.bind\((\w+)\)/g, '.bind(__w8bindParams($1))');
+            if (c.includes('join(process.cwd(),"node_modules","sql.js"') && !c.includes('join(process.cwd(),"..","node_modules"')) {
+              c = c.replace(
+                /join\(process\.cwd\(\),"node_modules","sql\.js","dist","sql-wasm\.wasm"\)/g,
+                'join(process.cwd(),"node_modules","sql.js","dist","sql-wasm.wasm"),path.join(process.cwd(),"..","node_modules","sql.js","dist","sql-wasm.wasm")'
+              );
+            }
             const closeRegex = /close\s*\(\)\s*\{\s*if\s*\(\s*clearInterval\([\w$]+\)\s*,\s*[\w$]+\s*&&\s*clearTimeout\([\w$]+\)\s*,\s*[\w$]+\s*\)\s*try\s*\{\s*[\w$]+\(\)\s*\}\s*catch(?:\([\w$]+\))?\s*\{\s*\}\s*try\s*\{\s*[\w$]+\.close\(\)\s*\}\s*catch(?:\([\w$]+\))?\s*\{\s*\}\s*[\w$]+\s*=\s*\!1\s*\}/g;
             c = c.replace(closeRegex, 'close(){}');
             m = true;
@@ -199,6 +205,23 @@ function __w8bindParams(p){
         c = c.replace(/if\s*\((\s*existsSync\(sqliteBinary\)\s*&&\s*!isNativeBinaryCompatible\(sqliteBinary\)\s*)\)/, 'if (platform() !== "android" && $1)');
         c = c.replace(/if\s*\(\s*!process\.versions\.bun\s*&&\s*existsSync\(sqliteBinary\)\s*&&\s*!isNativeBinaryCompatible\(sqliteBinary\)\s*\)/, 'if (platform() !== "android" && !process.versions.bun && existsSync(sqliteBinary) && !isNativeBinaryCompatible(sqliteBinary))');
         fs.writeFileSync(serveMjs, c);
+      }
+    }
+
+    // Ensure sql.js WASM is reachable inside dist/node_modules
+    const distNodeModules = path.join(base, 'dist', 'node_modules');
+    const sqlJsSrc = path.join(base, 'node_modules', 'sql.js');
+    const sqlJsDest = path.join(distNodeModules, 'sql.js');
+    if (fs.existsSync(sqlJsSrc)) {
+      if (!fs.existsSync(distNodeModules)) {
+        try { fs.mkdirSync(distNodeModules, { recursive: true }); } catch (e) {}
+      }
+      if (!fs.existsSync(sqlJsDest)) {
+        try {
+          fs.symlinkSync(sqlJsSrc, sqlJsDest, 'junction');
+        } catch {
+          try { fs.cpSync(sqlJsSrc, sqlJsDest, { recursive: true }); } catch (e) {}
+        }
       }
     }
 INLINE_PATCH
