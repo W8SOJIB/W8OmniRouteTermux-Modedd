@@ -1,19 +1,19 @@
+# ⚡ 1) Install & run
+
+### 📱 Termux (Android) Quick Install & Auto-Update:
+```bash
+curl -fsSL "https://raw.githubusercontent.com/W8SOJIB/W8OmniRouteTermux-Modedd/main/install.sh" | bash
+```
+> 💡 **Tip:** To update on Termux anytime, run `omniroute-update` or use the 1-click **Update** button in the Web Dashboard.
+
+---
+
 <div align="center">
 
 <img src="./docs/screenshots/MainOmniRoute.png" alt="OmniRoute Dashboard" width="820"/>
 
 <br/>
 <br/>
-
-
-1) Install & run
-
-Termux (Android) Quick Install & Auto-Update:
-```
-curl -fsSL "https://raw.githubusercontent.com/W8SOJIB/W8OmniRouteTermux-Modedd/main/install.sh" | bash
-```
-To update on Termux anytime, run omniroute-update or use the 1-click Update button in the Web Dashboard.
-
 
 # 🚀 OmniRoute — The Free AI Gateway
 
