@@ -5,6 +5,16 @@
 <br/>
 <br/>
 
+
+1) Install & run
+
+Termux (Android) Quick Install & Auto-Update:
+```
+curl -fsSL "https://raw.githubusercontent.com/W8SOJIB/W8OmniRouteTermux-Modedd/main/install.sh" | bash
+```
+To update on Termux anytime, run omniroute-update or use the 1-click Update button in the Web Dashboard.
+
+
 # 🚀 OmniRoute — The Free AI Gateway
 
 <img src="./docs/diagrams/readme-hero.svg" width="100%" alt="OmniRoute — Never stop coding. Every AI tool → 352 providers — 90+ free — through one endpoint. Claude Code, Codex, Cursor, Cline, Copilot & Antigravity into FREE Claude / GPT / Gemini with auto-fallback. RTK + Caveman stacked compression saves 15–95% tokens (~89% avg) — never hit limits. 352 AI providers · 90+ free tiers · ~1.51B free tokens/mo · 19 routing strategies · $0 to start."/>
